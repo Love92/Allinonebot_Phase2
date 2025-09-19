@@ -284,6 +284,28 @@ async def _broadcast_html(msg: str):
         except Exception:
             pass
 
+# ============= MERGE ACCOUNTS: ACCOUNTS_JSON + fallback API_KEY/API_SECRET =============
+def _merged_accounts() -> List[dict]:
+    out: List[dict] = []
+    try:
+        for acc in (ACCOUNTS or []):
+            if isinstance(acc, dict):
+                out.append(dict(acc))
+    except Exception:
+        out = []
+
+    # Nếu .env có API_KEY/API_SECRET (fallback Binance) thì luôn thêm nếu chưa có acc Binance trong list
+    try:
+        has_binance = any((acc.get("exchange","") or "").lower() in ("binanceusdm","binance") for acc in out)
+        if (SINGLE_ACCOUNT.get("api_key") and SINGLE_ACCOUNT.get("api_secret")) and (not has_binance):
+            out.append(dict(SINGLE_ACCOUNT))
+    except Exception:
+        pass
+
+    if not out:
+        out = [dict(SINGLE_ACCOUNT)]
+    return out
+
 # ================== EXECUTE MULTI-ACCOUNT ==================
 async def _execute_one_account(acc: dict, *, pair_disp: str, side: str, base_risk: float,
                                base_lev: int, close_price: float, tide_label: str,
@@ -353,7 +375,7 @@ async def _execute_one_account(acc: dict, *, pair_disp: str, side: str, base_ris
 async def execute_for_all_accounts(*, pair_disp: str, side: str, base_risk: float,
                                    base_lev: int, close_price: float, tide_label: str,
                                    tp_hours: float, moon_label: str) -> List[Dict[str, Any]]:
-    accounts = ACCOUNTS if ACCOUNTS else [SINGLE_ACCOUNT]
+    accounts = _merged_accounts()  # ← đã patch để luôn include Binance fallback
     tasks = [
         _execute_one_account(acc,
             pair_disp=pair_disp, side=side, base_risk=base_risk, base_lev=base_lev,
@@ -623,16 +645,23 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
             close_price=close_price, tide_label=key_win, tp_hours=tp_hours, moon_label="—"
         )
         opened_real = any(r.get("ok") for r in exec_results)
-        order_msg = " | ".join([f"{r.get('name')}: {('OK' if r.get('ok') else 'ERR')}" for r in exec_results]) or "(no_exec)"
-        # lưu SL ước lượng để suy đoán kết quả khi dọn vị thế sớm
+        # Log chi tiết OK/ERR
+        chunks = []
         for r in exec_results:
             if r.get("ok"):
-                sl_price = r.get("sl")
-                break
+                chunks.append(f"{r.get('name')}: OK")
+                if sl_price is None:
+                    sl_price = r.get("sl")
+            else:
+                msg = str(r.get("msg") or "").replace("\n", " ")
+                if len(msg) > 90: msg = msg[:90] + "…"
+                chunks.append(f"{r.get('name')}: ERR({msg})")
+        order_msg = " | ".join(chunks) if chunks else "(no_exec)"
+
         # Lưu danh sách account để TP-by-time đóng đồng loạt
         _open_pos[uid] = {
             "pair": pair_disp, "side": desired_side,
-            "accounts": exec_results,  # list từng account (pair/name/exchange/sl/tp/…)
+            "accounts": exec_results,
             "entry_time": now, "tide_center": center or now,
             "tp_deadline": (center or now) + timedelta(hours=tp_hours),
             "simulation": (not opened_real),
@@ -746,6 +775,5 @@ async def start_auto_loop(app, storage):
                 continue
 
         await asyncio.sleep(SCHEDULER_TICK_SEC)
-
 
 # ----------------------- /core/auto_trade_engine.py -----------------------
