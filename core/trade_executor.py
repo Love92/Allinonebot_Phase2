@@ -7,7 +7,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import ccxt  # type: ignore
 
-# Giữ import theo project của a
+# Giữ import theo project của a (fallback EXCHANGE_ID/API_KEY/API_SECRET nếu khởi tạo thiếu tham số)
 from config.settings import EXCHANGE_ID, API_KEY, API_SECRET, TESTNET
 
 load_dotenv()
@@ -24,7 +24,7 @@ def _to_thread(fn, *args, **kwargs):
 
 class ExchangeClient:
     """
-    Thin wrapper around ccxt to unify a few ops we need in the auto engine.
+    Thin wrapper around ccxt để unify các thao tác cơ bản.
     - Hỗ trợ khởi tạo theo từng account (exchange_id/api_key/api_secret/testnet)
       nhưng vẫn tương thích cũ nếu gọi không truyền tham số.
     - Chuẩn hóa symbol theo sàn: OKX/BingX perp USDT-M dùng 'BTC/USDT:USDT'.
@@ -49,6 +49,7 @@ class ExchangeClient:
             "secret": self.api_secret,
             "enableRateLimit": True,
         }
+
         # Binance futures default & testnet
         if self.exchange_id in ("binanceusdm", "binance"):
             params.setdefault("options", {})["defaultType"] = "future"
@@ -59,6 +60,23 @@ class ExchangeClient:
                         "fapiPrivate": "https://testnet.binancefuture.com/fapi/v1",
                     }
                 }
+
+        # OKX USDT-M Perp
+        if self.exchange_id == "okx":
+            params.setdefault("options", {})["defaultType"] = "swap"  # perp
+            # Lưu ý: OKX thường cần thêm "password" (passphrase) – chưa bật vì a chưa dùng OKX.
+
+        # BingX USDT-M Perp
+        if self.exchange_id == "bingx":
+            # ccxt BingX cần chọn thị trường swap (perp) + linear
+            opts = params.setdefault("options", {})
+            opts["defaultType"] = "swap"
+            # Một số môi trường ccxt hỗ trợ defaultSubType
+            try:
+                opts["defaultSubType"] = "linear"
+            except Exception:
+                pass
+
         self.client = ex_class(params)
 
     # ------------- symbol normalize -------------
@@ -87,9 +105,12 @@ class ExchangeClient:
             bal = await self._io(self.client.fetch_balance)
         except Exception:
             return 0.0
+        # Ưu tiên free nếu có
         for key in ("USDT", "usdt", "USDC", "BUSD"):
-            if key in (bal.get("total") or {}):
-                return float((bal.get("free") or {}).get(key, (bal["total"] or {})[key]))
+            total = (bal.get("total") or {})
+            free = (bal.get("free") or {})
+            if key in total or key in free:
+                return float(free.get(key, total.get(key, 0.0)))
         return float((bal.get("info") or {}).get("availableBalance", 0) or 0)
 
     # ---------------- Position helpers ----------------
