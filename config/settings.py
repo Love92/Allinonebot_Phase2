@@ -20,38 +20,58 @@ PAIR = os.getenv("PAIR", "BTC/USDT")
 MODE = os.getenv("MODE", "manual")              # manual | auto
 PRESET_MODE = os.getenv("PRESET_MODE", "auto")
 
-# --- compatibility exports for modules cũ ---
-# (tg/bot.py import DEFAULT_MODE; có thể import thêm DEFAULT_PAIR/PRESET)
+# --- compatibility exports for modules cũ (tg/bot.py, v.v.) ---
 DEFAULT_MODE = os.getenv("DEFAULT_MODE", MODE)
 DEFAULT_PAIR = os.getenv("DEFAULT_PAIR", PAIR)
 DEFAULT_PRESET_MODE = os.getenv("DEFAULT_PRESET_MODE", PRESET_MODE)
 
-# Risk & runtime
+# ====== Runtime / Strategy flags (bổ sung theo .env cũ) ======
 MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "8"))
 MAX_ORDERS_PER_TIDE_WINDOW = int(os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", "2"))
 
 TIDE_WINDOW_HOURS = float(os.getenv("TIDE_WINDOW_HOURS", "2.5"))
 SCHEDULER_TICK_SEC = int(os.getenv("SCHEDULER_TICK_SEC", "2"))
 
-# Telegram chính (bot tương tác)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+COOLDOWN_H4_CANDLES = int(os.getenv("COOLDOWN_H4_CANDLES", "3"))
+M5_BACKFILL_SLOTS = int(os.getenv("M5_BACKFILL_SLOTS", "2"))
+M5_CLOSE_GRACE_SEC = int(os.getenv("M5_CLOSE_GRACE_SEC", "12"))
+M5_MAX_DELAY_SEC = int(os.getenv("M5_MAX_DELAY_SEC", "60"))
+M5_STRICT_CLOSE = _bool(os.getenv("M5_STRICT_CLOSE"), False)
 
-# Telegram phát kèo (EXECUTE-only) — bot/tài khoản khác
+SONIC_MODE = os.getenv("SONIC_MODE", "weight")
+try:
+    SONIC_WEIGHT = float(os.getenv("SONIC_WEIGHT", "1.0"))
+except Exception:
+    SONIC_WEIGHT = 1.0
+
+# ====== Telegram tokens ======
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")      # có thể là số hoặc để trống
+
+# Bot/Channel phát kèo (EXECUTE-only)
 TELEGRAM_BROADCAST_BOT_TOKEN = os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN", "")
 TELEGRAM_BROADCAST_CHAT_ID = os.getenv("TELEGRAM_BROADCAST_CHAT_ID", "")
 
-# Moon/Tide/Geo
+# ====== Moon / Tide / Geo / Weather ======
 LAT = float(os.getenv("LAT", "32.7503"))
 LON = float(os.getenv("LON", "129.8777"))
 
-# Debug flags
+# <== các biến khiến ImportError ở moon_tide.py
+WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY", "")
+WORLDTIDES_KEY = os.getenv("WORLDTIDES_KEY", "")
+
+# ====== Webhook (nếu dùng) ======
+USE_WEBHOOK = _bool(os.getenv("USE_WEBHOOK"), False)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")
+
+# ====== Debug flags ======
 AUTO_DEBUG = _bool(os.getenv("AUTO_DEBUG"), False)
 AUTO_DEBUG_VERBOSE = _bool(os.getenv("AUTO_DEBUG_VERBOSE"), False)
 AUTO_DEBUG_ONLY_WHEN_SKIP = _bool(os.getenv("AUTO_DEBUG_ONLY_WHEN_SKIP"), False)
 
 # ====== MULTI-ACCOUNT ======
-# Nhận JSON 1 dòng trên Render hoặc nhiều dòng (dotenv sẽ bỏ nháy) ở local
+# Nhận JSON 1 dòng trên Render hoặc nhiều dòng (nếu .env local bọc bằng nháy đơn)
 ACCOUNTS_JSON = (os.getenv("ACCOUNTS_JSON", "") or "").strip()
 ACCOUNTS: list[dict] = []
 if ACCOUNTS_JSON:
