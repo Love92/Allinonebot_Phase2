@@ -1,4 +1,4 @@
-# ----------------------- settings.py (FULL) -----------------------
+# ----------------------- config/settings.py (FULL) -----------------------
 from __future__ import annotations
 import os, json
 from dotenv import load_dotenv
@@ -6,8 +6,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def _bool(v: str | None, default: bool = False) -> bool:
-    if v is None: return default
-    return str(v).strip().lower() in ("1","true","yes","y","on")
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 # ====== Cấu hình cũ (fallback đơn tài khoản) ======
 EXCHANGE_ID = os.getenv("EXCHANGE", "binanceusdm")
@@ -16,8 +17,14 @@ API_SECRET = os.getenv("API_SECRET", "")
 TESTNET = _bool(os.getenv("TESTNET"), False)
 
 PAIR = os.getenv("PAIR", "BTC/USDT")
-MODE = os.getenv("MODE", "manual")  # manual | auto
+MODE = os.getenv("MODE", "manual")              # manual | auto
 PRESET_MODE = os.getenv("PRESET_MODE", "auto")
+
+# --- compatibility exports for modules cũ ---
+# (tg/bot.py import DEFAULT_MODE; có thể import thêm DEFAULT_PAIR/PRESET)
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", MODE)
+DEFAULT_PAIR = os.getenv("DEFAULT_PAIR", PAIR)
+DEFAULT_PRESET_MODE = os.getenv("DEFAULT_PRESET_MODE", PRESET_MODE)
 
 # Risk & runtime
 MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "8"))
@@ -44,7 +51,8 @@ AUTO_DEBUG_VERBOSE = _bool(os.getenv("AUTO_DEBUG_VERBOSE"), False)
 AUTO_DEBUG_ONLY_WHEN_SKIP = _bool(os.getenv("AUTO_DEBUG_ONLY_WHEN_SKIP"), False)
 
 # ====== MULTI-ACCOUNT ======
-ACCOUNTS_JSON = os.getenv("ACCOUNTS_JSON", "").strip()
+# Nhận JSON 1 dòng trên Render hoặc nhiều dòng (dotenv sẽ bỏ nháy) ở local
+ACCOUNTS_JSON = (os.getenv("ACCOUNTS_JSON", "") or "").strip()
 ACCOUNTS: list[dict] = []
 if ACCOUNTS_JSON:
     try:
