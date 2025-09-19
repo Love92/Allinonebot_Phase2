@@ -1,0 +1,1482 @@
+# ----------------------- tg/bot.py -----------------------
+from __future__ import annotations
+import os, asyncio, html
+from datetime import datetime, timedelta
+from typing import Optional
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Application
+
+from config.settings import TELEGRAM_BOT_TOKEN, DEFAULT_MODE
+from utils.storage import Storage
+from utils.time_utils import now_vn, TOKYO_TZ
+from strategy.signal_generator import evaluate_signal, tide_window_now
+from strategy.m5_strategy import m5_snapshot, m5_entry_check
+from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
+from tg.formatter import format_signal_report, format_daily_moon_tide_report
+from core.approval_flow import create_pending
+
+# Vòng nền
+from core.auto_trade_engine import start_auto_loop
+from core.m5_reporter import m5_report_loop
+
+# NEW: dùng resolver P1–P4 theo %illum + hướng
+from data.moon_tide import resolve_preset_code
+
+# ================== Global state ==================
+storage = Storage()
+ex = ExchangeClient()
+
+# ================== Helpers ==================
+def _esc(s: str) -> str:
+    return html.escape(s or "", quote=False)
+
+def _beautify_report(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    s = s.replace("&lt;=", "≤").replace("&gt;=", "≥")
+    s = s.replace("&lt;", "＜").replace("&gt;", "＞")
+    s = s.replace("<=", "≤").replace(">=", "≥")
+    s = s.replace(" EMA34<EMA89", " EMA34＜EMA89")
+    s = s.replace(" Close<EMA34", " Close＜EMA34")
+    s = s.replace(" EMA34>EMA89", " EMA34＞EMA89")
+    s = s.replace(" Close>EMA34", " Close＞EMA34")
+    s = s.replace("zone Z1( <30)", "zone Z1 [<30]") \
+         .replace("zone Z2(30-45)", "zone Z2 [30–45]") \
+         .replace("zone Z3(45-55)", "zone Z3 [45–55]") \
+         .replace("zone Z4(55-70)", "zone Z4 [55–70]") \
+         .replace("zone Z5(>70 )", "zone Z5 [>70]") \
+         .replace("zone Z5(>70)", "zone Z5 [>70]")
+    s = s.replace("vol>=MA20", "vol ≥ MA20") \
+         .replace("vol<=MA20", "vol ≤ MA20") \
+         .replace("wick>=50%", "wick ≥ 50%") \
+         .replace("wick<=50%", "wick ≤ 50%")
+    return s
+
+def _uid(update: Update) -> int:
+    return update.effective_user.id
+
+def _admin_uid() -> Optional[int]:
+    val = (os.getenv("ADMIN_USER_ID") or "").strip()
+    if val.isdigit():
+        return int(val)
+    try:
+        a = storage.data.get("_admin_uid")
+        return int(a) if a else None
+    except Exception:
+        return None
+
+def _is_admin(uid: int) -> bool:
+    a = _admin_uid()
+    return (a is not None) and (uid == a)
+
+def _bool_str(v):
+    return "true" if (isinstance(v, bool) and v) or (isinstance(v, str) and v.strip().lower() in ("1","true","yes","on","y")) else "false"
+
+def _env_or_runtime(k: str, default: str = "—") -> str:
+    """
+    Dùng để HIỂN THỊ giá trị hiện tại trong /help:
+    - Ưu tiên ENV
+    - Fallback sang runtime trong core.auto_trade_engine nếu có
+    """
+    v = os.getenv(k)
+    if v is not None:
+        return v
+    try:
+        from core import auto_trade_engine as ae
+        if hasattr(ae, k):
+            val = getattr(ae, k)
+            if isinstance(val, bool): return "true" if val else "false"
+            return str(val)
+    except Exception:
+        pass
+    return default
+
+# ================== PRESETS (P1–P4 theo Moon — % độ rọi + hướng) ==================
+# P1: 0–25% (quanh New) | P2: 25–75% & waxing | P3: 75–100% (quanh Full) | P4: 25–75% & waning
+# Theo yêu cầu: P1=P3 (trend + Sonic on + late-only 0.5~2.5h, tide 2.5h, TP 5.5h)
+#               P2=P4 (Sonic off; các tham số còn lại giống nhau trong cặp)
+PRESETS = {
+    # P1 — 0–25%: quanh New — Waning Crescent ↔ New ↔ Waxing Crescent
+    # Trend/tiếp diễn + vào muộn để an toàn
+    "P1": {
+        "SONIC_MODE": "weight", "SONIC_WEIGHT": 1.0,
+
+        # Entry timing (thủy triều)
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,
+        # TP theo thời gian (rút ngắn)
+        "TP_TIME_HOURS": 5.5,
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+
+        # M5 gate (giữ logic mặc định, có thể vặn thêm bằng /setenv khi cần)
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+
+        # Các ngưỡng HTF mặc định (giữ nguyên như cũ)
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+
+    # P2 — 25–75% & waxing: Waxing Crescent ↔ First Quarter ↔ Waxing Gibbous
+    # Momentum/breakout — không ép late-only, Sonic OFF theo yêu cầu
+    "P2": {
+        "SONIC_MODE": "off",
+
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,     # để đồng bộ định dạng; không dùng nếu ONLY=false
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,       # cho thống nhất cặp P2=P4
+        "TP_TIME_HOURS": 5.5,           # cho thống nhất cặp P2=P4
+        
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center    
+
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        
+        
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+
+    # P3 — 75–100%: Waxing Gibbous ↔ Full ↔ Waning Gibbous
+    # Theo yêu cầu: giống P1 (trend + Sonic on + late-only 0.5~2.5h)
+    "P3": {
+        "SONIC_MODE": "weight", "SONIC_WEIGHT": 1.0,
+
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,
+        "TP_TIME_HOURS": 5.5,
+        
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+
+    # P4 — 25–75% & waning: Waning Gibbous ↔ Last Quarter ↔ Waning Crescent
+    # Theo yêu cầu: giống P2 (Sonic OFF; không ép late-only)
+    "P4": {
+        "SONIC_MODE": "off",
+
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,
+        "TP_TIME_HOURS": 5.5,
+        
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+}
+
+
+async def _apply_preset_and_reply(update: Update, preset_name: str, header: str = ""):
+    preset = PRESETS[preset_name]
+    for k, v in preset.items():
+        os.environ[k] = _bool_str(v) if isinstance(v, bool) else str(v)
+
+    applied_runtime = False
+    try:
+        from core import auto_trade_engine as ae
+        apply_fn = getattr(ae, "apply_runtime_overrides", None)
+        if callable(apply_fn):
+            apply_fn({k: os.environ[k] for k in preset.keys()})
+            applied_runtime = True
+        else:
+            for k, sval in os.environ.items():
+                if k in preset and hasattr(ae, k):
+                    typ = type(getattr(ae, k))
+                    try:
+                        if typ is bool:
+                            setattr(ae, k, sval.strip().lower() in ("1","true","yes","on"))
+                        elif typ is int:
+                            setattr(ae, k, int(float(sval)))
+                        elif typ is float:
+                            setattr(ae, k, float(sval))
+                        else:
+                            setattr(ae, k, sval)
+                        applied_runtime = True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    lines = [f"{k}={os.environ[k]}" for k in sorted(preset.keys())]
+    msg = (header + "\n" if header else "") + f"✅ Đã áp dụng preset <b>{preset_name}</b>:\n" + "\n".join(lines)
+    if applied_runtime:
+        msg += "\n(đã áp dụng runtime cho AUTO engine)."
+    else:
+        msg += "\n(có thể cần khởi động lại để áp dụng hoàn toàn)."
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# ================== Commands ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    if not st.settings.mode:
+        st.settings.mode = DEFAULT_MODE
+        storage.put_user(uid, st)
+    if _admin_uid() is None:
+        storage.data["_admin_uid"] = uid
+        storage.persist()
+
+    await update.message.reply_text(
+        "👋 Xin chào! Bot Moon & Tide đã sẵn sàng.\n"
+        "/aboutme — triết lý THÂN–TÂM–TRÍ & checklist hệ thống cá nhân\n"
+        "/journal — mở form nhật ký giao dịch\n"
+        "/recovery_checklist — checklist phục hồi sau thua lỗ\n"
+        "/mode — xem/đổi chế độ (manual/auto)\n"
+        "/settings — cài đặt: pair, % vốn, leverage\n"
+        "/tidewindow — xem/đổi ± giờ quanh thủy triều\n"
+        "/report — gửi report H4→M30 (+ M5 filter)\n"
+        "/status — trạng thái bot & vị thế\n"
+        "/order — vào lệnh thủ công (trong khung thủy triều)\n"
+        "/approve <id> /reject <id> — duyệt tín hiệu (manual)\n"
+        "/close [pct] — đóng vị thế hiện tại\n"
+        "/m5report start|stop|status — bật/tắt auto M5 snapshot (worker riêng)\n"
+        "/daily — báo cáo Moon & Tide trong ngày\n"
+        "/autolog — in log AUTO (tick M5 gần nhất)\n"
+        "/preset <name>|auto — áp dụng preset theo Moon Phase (P1–P4)\n"
+        "/setenv KEY VALUE — (admin) chỉnh ENV runtime (debug/tuning)\n"
+        "/setenv_status — (admin) xem cấu hình ENV/runtime hiện tại\n"
+        "\nGõ /help để xem hướng dẫn vận hành & DEBUG chi tiết."
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Helpers lấy giá trị hiện tại để show trong /help
+    def v(k, d="—"): return _env_or_runtime(k, d)
+
+    text = (
+        "<b>📘 Hướng dẫn vận hành & DEBUG</b>\n\n"
+        "<b>Command chính:</b>\n"
+        "/aboutme — triết lý THÂN–TÂM–TRÍ & checklist hệ thống cá nhân\n"
+        "/journal — mở form nhật ký giao dịch\n"
+        "/recovery_checklist — checklist phục hồi sau thua lỗ\n"
+        "/mode — xem/đổi chế độ (manual/auto)\n"
+        "/settings — cài đặt: pair, % vốn, leverage\n"
+        "/tidewindow — xem/đổi ± giờ quanh thủy triều\n"
+        "/report — gửi report H4→M30 (+ M5 filter)\n"
+        "/status — trạng thái bot & vị thế\n"
+        "/order — vào lệnh thủ công (trong khung thủy triều)\n"
+        "/approve &lt;id&gt; /reject &lt;id&gt; — duyệt tín hiệu (manual)\n"
+        "/close [pct] — đóng vị thế hiện tại\n"
+        "/m5report start|stop|status — bật/tắt auto M5 snapshot\n"
+        "/daily — báo cáo trăng + thủy triều hôm nay\n"
+        "/autolog — log AUTO tick gần nhất\n"
+        "/preset &lt;name&gt; | <b>auto</b> — áp dụng preset ENV theo Moon (P1–P4)\n"
+        "/setenv KEY VALUE — (admin) đổi ENV runtime\n"
+        "/setenv_status — (admin) xem nhanh toàn bộ ENV hiện tại\n\n"
+
+        "<b>Presets (theo Moon — <u>đặt tên mới</u>):</b>\n"
+        "• <code>P1</code> — 0–25% (quanh New): Waning Crescent ↔ New ↔ Waxing Crescent\n"
+        "• <code>P2</code> — 25–75% & waxing: Waxing Crescent ↔ First Quarter ↔ Waxing Gibbous\n"
+        "• <code>P3</code> — 75–100% (quanh Full): Waxing Gibbous ↔ Full ↔ Waning Gibbous\n"
+        "• <code>P4</code> — 25–75% & waning: Waning Gibbous ↔ Last Quarter ↔ Waning Crescent\n\n"
+
+        "<b>Auto theo Moon (P1–P4):</b>\n"
+        "• <code>/preset auto</code> → tự chọn P1..P4 dựa trên % độ rọi & hướng (waxing/waning).\n"
+        "• <code>/preset P1|P2|P3|P4</code> → chọn thủ công preset P-code.\n\n"
+
+        f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
+        f"<code>/setenv M30_STABLE_MIN_SEC 180</code> (hiện: {v('M30_STABLE_MIN_SEC','180')})\n"
+
+        "<b>Entry timing (thủy triều) — <i>giá trị hiện tại</i>:</b>\n"
+        f"<code>/setenv ENTRY_LATE_ONLY true|false</code> (hiện: {v('ENTRY_LATE_ONLY','false')})\n"
+        f"<code>/setenv ENTRY_LATE_PREF true|false</code> (hiện: {v('ENTRY_LATE_PREF','false')})\n"
+        f"<code>/setenv ENTRY_LATE_FROM_HRS 1.2</code> (hiện: {v('ENTRY_LATE_FROM_HRS','1.2')})\n"
+        f"<code>/setenv ENTRY_LATE_TO_HRS 2.5</code> (hiện: {v('ENTRY_LATE_TO_HRS','2.5')})\n"
+        f"<code>/setenv TIDE_WINDOW_HOURS 2.5</code> (hiện: {v('TIDE_WINDOW_HOURS','2.5')})\n\n"
+
+        "<b>M5 gate (logic mới A/B + strict tuần tự):</b>\n"
+        "• <b>A (Candle+Volume+zone cực trị)</b>: wick≥<code>M5_WICK_PCT</code> & volume≥(<code>M5_VOL_MULT_*</code>×MA20) & RSI ở Z1 (long) hoặc Z5 (short).\n"
+        "• <b>B (RSI vs EMA & Stoch D vs SlowD)</b>: (cross&amp;cross) hoặc (align&amp;align) cùng hướng.\n"
+        "• <b>RELAX</b>: pass nếu A <i>hoặc</i> B (tuỳ <code>M5_RELAX_KIND</code>).\n"
+        "• <b>STRICT tuần tự</b>: cần A <i>và</i> B trong ≤ <code>ENTRY_SEQ_WINDOW_MIN</code> phút, cùng hướng.\n\n"
+
+        "<b>ENV M5 — <i>giá trị hiện tại</i>:</b>\n"
+        f"<code>/setenv M5_STRICT true|false</code> (hiện: {v('M5_STRICT','false')})\n"
+        f"<code>/setenv M5_RELAX_KIND either|rsi_only|candle_only</code> (hiện: {v('M5_RELAX_KIND','either')})\n"
+        f"<code>/setenv M5_LOOKBACK_RELAX 1</code> (hiện: {v('M5_LOOKBACK_RELAX','1')})\n"
+        f"<code>/setenv M5_RELAX_NEED_CURRENT true|false</code> (hiện: {v('M5_RELAX_NEED_CURRENT','false')})\n"
+        f"<code>/setenv M5_LOOKBACK_STRICT 6</code> (hiện: {v('M5_LOOKBACK_STRICT','6')})\n"
+        f"<code>/setenv M5_WICK_PCT 0.50</code> (hiện: {v('M5_WICK_PCT','0.50')})\n"
+        f"<code>/setenv M5_VOL_MULT_RELAX 1.0</code> (hiện: {v('M5_VOL_MULT_RELAX','1.0')})\n"
+        f"<code>/setenv M5_VOL_MULT_STRICT 1.1</code> (hiện: {v('M5_VOL_MULT_STRICT','1.1')})\n"
+        f"<code>/setenv M5_REQUIRE_ZONE_STRICT true</code> (hiện: {v('M5_REQUIRE_ZONE_STRICT','true')})\n"
+        f"<code>/setenv M5_MIN_GAP_MIN 15</code> (hiện: {v('M5_MIN_GAP_MIN','15')})\n"
+        f"<code>/setenv M5_GAP_SCOPED_TO_WINDOW true|false</code> (hiện: {v('M5_GAP_SCOPED_TO_WINDOW','true')})\n"
+        f"<code>/setenv ALLOW_SECOND_ENTRY true|false</code> (hiện: {v('ALLOW_SECOND_ENTRY','true')})\n"
+        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n\n"
+
+        f"<code>/setenv ENTRY_SEQ_WINDOW_MIN 30</code> (hiện: {v('ENTRY_SEQ_WINDOW_MIN','30')})\n\n"
+
+        "<b>Scoring H4/M30 (tóm tắt, đã nới logic theo zone & hướng):</b>\n"
+        "• Z2/Z4 = +2 (ủng hộ hướng đi lên/xuống TÙY vị trí RSI vs EMA-RSI và hướng di chuyển vào zone).\n"
+        "• Z3 (45–55) = −1 (barrier, dễ sideway/đảo, cần cross để xác nhận).\n"
+        "• RSI×EMA(RSI) cross = +2; align ổn định = +1.\n"
+        "• Stoch RSI: bật ↑ từ &lt;20 / gãy ↓ từ &gt;80 = +2; bứt qua 50 = +1.\n"
+        f"• Sonic weight (nếu <code>SONIC_MODE=weight</code>) = +W khi cùng chiều (hiện: mode={v('SONIC_MODE','weight')}, W={v('SONIC_WEIGHT','1.0')}).\n\n"
+
+        "<b>Moon bonus (H4):</b>\n"
+        "• +0..1.5 điểm tùy preset P1–P4 & <i>stage</i> (pre/on/post) mốc N/FQ/F/LQ — chỉ <i>boost</i> độ tin cậy, không tự đảo bias.\n\n"
+
+        "<b>Map total → size (đòn bẩy theo điểm):</b>\n"
+        "• Total = H4_score + M30_score + Moon_bonus.\n"
+        "• ≥8.5 → ×1.0; 6.5–8.5 → ×0.7; thấp hơn / CT → ×0.4.\n\n"
+
+        "<b>AUTO execute & khối lượng:</b>\n"
+        "• Khi trong khung thủy triều và đạt điều kiện HTF (H4 ưu tiên, M30 không ngược): chọn LONG/SHORT.\n"
+        "• M5 Gate phải PASS (RELAX/STRICT tùy ENV) mới vào lệnh.\n"
+        "• Khối lượng: dùng <code>calc_qty(balance, risk_percent, leverage, price)</code>.\n"
+        "• SL/TP tự động theo <code>auto_sl_by_leverage</code>, có thu hẹp biên tùy preset/ENV.\n\n"
+
+        "<b>Gợi ý debug nhanh:</b>\n"
+        "• <code>/setenv_status</code> để xem toàn bộ ENV hiện tại.\n"
+        "• <code>/preset auto</code> để đổi nhanh theo Moon (P1–P4)."
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+# ========== /preset ==========
+async def preset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /preset <name>|auto | /preset list
+    """
+    uid = _uid(update)
+    if not _is_admin(uid):
+        await update.message.reply_text("🚫 Chỉ admin mới được phép dùng /preset.")
+        return
+
+    if not context.args or context.args[0].lower() in ("help","h"):
+        await update.message.reply_text(
+            "Dùng: /preset <name>|auto\n"
+            "• /preset list — liệt kê preset\n"
+            "• Ví dụ: /preset P1 | /preset P2 | /preset P3 | /preset P4\n"
+            "• Auto: /preset auto  (tự map theo Moon hôm nay — P1..P4)",
+        )
+        return
+
+    name = context.args[0].upper().strip()
+
+    if name == "LIST":
+        await update.message.reply_text(
+            "Preset khả dụng: P1, P2, P3, P4 (hoặc dùng: auto)\n"
+            "P1: 0–25% | P2: 25–75% (waxing) | P3: 75–100% | P4: 25–75% (waning)"
+        )
+        return
+
+    if name == "AUTO":
+        os.environ["PRESET_MODE"] = "AUTO"
+        pcode, meta = resolve_preset_code(None)
+        chosen = pcode  # P1..P4
+        if chosen not in PRESETS:
+            await update.message.reply_text(f"Không map được preset cho {pcode}.")
+            return
+        hdr = (
+            "🌕 Moon hôm nay: "
+            f"<b>{_esc(meta.get('phase') or '')}</b> | "
+            f"illum={meta.get('illum')}% | dir={meta.get('direction')}\n"
+            f"→ chọn preset: <b>{_esc(pcode)}</b> — {_esc(meta.get('label') or '')}"
+        )
+        await _apply_preset_and_reply(update, chosen, hdr)
+        return
+
+    # manual P-code
+    if name not in PRESETS:
+        await update.message.reply_text("❓ Không có preset. Dùng /preset list (P1..P4) hoặc 'auto'.")
+        return
+    os.environ["PRESET_MODE"] = name
+    await _apply_preset_and_reply(update, name)
+
+async def setenv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setenv KEY VALUE  (admin only)
+    - Whitelist KEY quan trọng để debug/tuning AUTO.
+    - Apply runtime nếu có thể; nếu không, set os.environ và thông báo có thể cần restart.
+    """
+    uid = _uid(update)
+    if not _is_admin(uid):
+        await update.message.reply_text("🚫 Chỉ admin mới được phép dùng /setenv. Đặt ADMIN_USER_ID trong ENV để chỉ định.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Dùng: /setenv KEY VALUE\nVD: /setenv AUTO_DEBUG true")
+        return
+
+    key = context.args[0].strip()
+    val = " ".join(context.args[1:]).strip()
+
+    # Whitelist + kiểu dữ liệu mong muốn (đã bổ sung STCH_*, HTF_*, SYNERGY_ON, M30_TAKEOVER_MIN)
+    key_types = {
+        # DEBUG
+        "AUTO_DEBUG": "bool",
+        "AUTO_DEBUG_VERBOSE": "bool",
+        "AUTO_DEBUG_ONLY_WHEN_SKIP": "bool",
+        "AUTO_DEBUG_CHAT_ID": "str",
+
+        # Thủy triều/entry timing
+        "ENTRY_LATE_PREF": "bool",
+        "ENTRY_LATE_ONLY": "bool",
+        "ENTRY_LATE_FROM_HRS": "float",
+        "ENTRY_LATE_TO_HRS": "float",
+        "TIDE_WINDOW_HOURS": "float",
+        "TP_TIME_HOURS": "float",
+        "PRESET_MODE": "str",  # auto|P1|P2|P3|P4
+        
+        # NEW — guard M30 quanh thủy triều
+        "M30_FLIP_GUARD": "bool",
+        "M30_STABLE_MIN_SEC": "int",
+
+        # M5 (logic mới)
+        "M5_STRICT": "bool",
+        "M5_RELAX_KIND": "str",               # either|rsi_only|candle_only
+        "M5_LOOKBACK": "int",                 # legacy
+        "M5_LOOKBACK_RELAX": "int",           # NEW
+        "M5_RELAX_NEED_CURRENT": "bool",      # NEW
+        "M5_LOOKBACK_STRICT": "int",          # NEW
+        "M5_WICK_PCT": "float",
+        "M5_VOL_MULT": "float",               # legacy
+        "M5_VOL_MULT_RELAX": "float",         # NEW
+        "M5_VOL_MULT_STRICT": "float",        # NEW
+        "M5_REQUIRE_ZONE_STRICT": "bool",
+        "ENTRY_SEQ_WINDOW_MIN": "int",
+        
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": "int",             # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": "bool",   # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": "bool",        # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": "float",  # retrace % tối thiểu để entry lần 2        
+        
+
+        # H4/M30 scoring & sizing (legacy – tương thích)
+        "M5_WICK_MIN": "float",
+        "M5_WICK_MIN_CT": "float",
+        "VOL_MA20_MULT": "float",
+        "DELTA_RSI30_MIN": "float",
+        "SIZE_MULT_STRONG": "float",
+        "SIZE_MULT_MID": "float",
+        "SIZE_MULT_CT": "float",
+        "RSI_OB": "float",
+        "RSI_OS": "float",
+
+        # Sonic
+        "SONIC_MODE": "str",      # off|weight|veto
+        "SONIC_WEIGHT": "float",  # 0.0 ~ 1.0
+
+        # ===== NEW knobs cho H4/M30 nới lỏng & đồng bộ =====
+        # Stoch RSI (align/slope/cross)
+        "STCH_GAP_MIN": "float",
+        "STCH_SLOPE_MIN": "float",
+        "STCH_RECENT_N": "int",
+
+        # Near-align & synergy
+        "HTF_NEAR_ALIGN": "bool",
+        "HTF_MIN_ALIGN_SCORE": "float",
+        "HTF_NEAR_ALIGN_GAP": "float",
+        "SYNERGY_ON": "bool",
+        "M30_TAKEOVER_MIN": "float",
+
+        # System limits
+        "MAX_TRADES_PER_WINDOW": "int",
+        "MAX_CONCURRENT_POS": "int",
+        "M5_MAX_DELAY_SEC": "int",
+        "SCHEDULER_TICK_SEC": "int",
+
+        # Quản trị
+        "ADMIN_USER_ID": "int",
+    }
+    if key not in key_types:
+        await update.message.reply_text(f"KEY không được phép: {key}\nGõ /help để xem danh sách KEY hỗ trợ.")
+        return
+
+    # Parse value theo đúng kiểu
+    t = key_types[key]
+    try:
+        if t == "bool":
+            v = val.lower() in ("1", "true", "yes", "on", "y")
+            os.environ[key] = "true" if v else "false"
+        elif t == "int":
+            v = int(float(val))
+            os.environ[key] = str(v)
+        elif t == "float":
+            v = float(val)
+            os.environ[key] = str(v)
+        else:
+            v = val
+            os.environ[key] = v
+    except Exception as e:
+        await update.message.reply_text(f"Giá trị không hợp lệ cho {key}: {val} — {e}")
+        return
+
+    # Thử áp dụng runtime cho engine nếu có
+    applied_runtime = False
+    try:
+        from core import auto_trade_engine as ae
+        apply_fn = getattr(ae, "apply_runtime_overrides", None)
+        if callable(apply_fn):
+            apply_fn({key: os.environ[key]})
+            applied_runtime = True
+        else:
+            if hasattr(ae, key):
+                typ = type(getattr(ae, key))
+                new_val = os.environ[key]
+                if typ is bool:
+                    setattr(ae, key, new_val.lower() in ("1","true","yes","on"))
+                elif typ is int:
+                    setattr(ae, key, int(float(new_val)))
+                elif typ is float:
+                    setattr(ae, key, float(new_val))
+                else:
+                    setattr(ae, key, new_val)
+                applied_runtime = True
+    except Exception:
+        pass
+
+    # Nếu set ADMIN_USER_ID thì cập nhật vào storage fallback
+    if key == "ADMIN_USER_ID":
+        try:
+            storage.data["_admin_uid"] = int(os.environ["ADMIN_USER_ID"])
+            storage.persist()
+        except Exception:
+            pass
+
+    msg = f"✅ Đã set {key} = {os.environ[key]}"
+    if applied_runtime:
+        msg += " (đã áp dụng runtime cho AUTO engine)."
+    else:
+        msg += " (có thể cần khởi động lại bot để áp dụng hoàn toàn)."
+    await update.message.reply_text(msg)
+
+# ========== /setenv_status ==========
+async def setenv_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setenv_status → In ra cấu hình ENV/runtime hiện tại + tóm tắt user settings.
+    """
+    uid = _uid(update)
+    if not _is_admin(uid):
+        await update.message.reply_text("🚫 Chỉ admin mới được phép dùng /setenv_status.")
+        return
+
+    keys = [
+        "PRESET_MODE",
+        # Debug
+        "AUTO_DEBUG", "AUTO_DEBUG_VERBOSE", "AUTO_DEBUG_ONLY_WHEN_SKIP", "AUTO_DEBUG_CHAT_ID",
+
+        # Timing
+        "ENTRY_LATE_PREF", "ENTRY_LATE_ONLY", "ENTRY_LATE_FROM_HRS", "ENTRY_LATE_TO_HRS",
+        "TIDE_WINDOW_HOURS", "TP_TIME_HOURS",
+
+        "M30_FLIP_GUARD", "M30_STABLE_MIN_SEC", # m30 check chuyển xu hướng M30, sau bao lâu mới cho m5 vào
+
+        # M5 (mới)
+        "M5_STRICT", "M5_RELAX_KIND",
+        "M5_LOOKBACK",                 # legacy
+        "M5_LOOKBACK_RELAX",           # NEW
+        "M5_RELAX_NEED_CURRENT",       # NEW
+        "M5_LOOKBACK_STRICT",          # NEW
+        "M5_WICK_PCT",
+        "M5_VOL_MULT",                 # legacy
+        "M5_VOL_MULT_RELAX",           # NEW
+        "M5_VOL_MULT_STRICT",          # NEW
+        "M5_REQUIRE_ZONE_STRICT",
+        "ENTRY_SEQ_WINDOW_MIN",
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN",
+        "M5_GAP_SCOPED_TO_WINDOW",
+        "ALLOW_SECOND_ENTRY",
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT",        
+        
+
+        # Legacy / scoring
+        "M5_WICK_MIN", "M5_WICK_MIN_CT", "VOL_MA20_MULT", "RSI_OB", "RSI_OS", "DELTA_RSI30_MIN",
+        "SIZE_MULT_STRONG", "SIZE_MULT_MID", "SIZE_MULT_CT",
+
+        # Sonic
+        "SONIC_MODE", "SONIC_WEIGHT",
+
+        # ===== NEW knobs cho H4/M30 nới lỏng & đồng bộ =====
+        "STCH_GAP_MIN", "STCH_SLOPE_MIN", "STCH_RECENT_N",
+        "HTF_NEAR_ALIGN", "HTF_MIN_ALIGN_SCORE", "HTF_NEAR_ALIGN_GAP",
+        "SYNERGY_ON", "M30_TAKEOVER_MIN",
+
+        # Limits
+        "MAX_TRADES_PER_WINDOW", "MAX_CONCURRENT_POS", "M5_MAX_DELAY_SEC", "SCHEDULER_TICK_SEC",
+
+        # Admin
+        "ADMIN_USER_ID",
+    ]
+
+    from core import auto_trade_engine as ae
+    def _get_val(k: str):
+        v = os.getenv(k)
+        if v is None and hasattr(ae, k):
+            try:
+                vv = getattr(ae, k)
+                if isinstance(vv, bool):
+                    return "true" if vv else "false"
+                return str(vv)
+            except Exception:
+                return "—"
+        return v if v is not None else "—"
+
+    lines = [f"{k} = {_get_val(k)}" for k in keys]
+
+    st = storage.get_user(uid)
+    user_lines = [
+        "",
+        "———————",
+        "User Settings:",
+        f"PAIR = {st.settings.pair}",
+        f"MODE = {st.settings.mode}",
+        f"RISK_PERCENT = {st.settings.risk_percent}",
+        f"LEVERAGE = x{st.settings.leverage}",
+        f"TIDE_WINDOW_HOURS = {st.settings.tide_window_hours}",
+        f"MAX_TRADES_PER_DAY = {st.settings.max_orders_per_day}",
+        f"MAX_TRADES_PER_TIDE_WINDOW = {st.settings.max_orders_per_tide_window}",
+        f"M5_REPORT_ENABLED = {st.settings.m5_report_enabled}",
+    ]
+
+    text = "<b>📊 ENV Status hiện tại:</b>\n" + "\n".join(lines + user_lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…(rút gọn)…"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    if context.args and context.args[0].lower() in ("manual","auto"):
+        st.settings.mode = context.args[0].lower()
+        storage.put_user(uid, st)
+        await update.message.reply_text(f"Đã chuyển chế độ: {st.settings.mode}")
+    else:
+        await update.message.reply_text(f"Chế độ hiện tại: {st.settings.mode}. Dùng: /mode manual|auto")
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    if context.args and len(context.args) >= 3:
+        st.settings.pair = context.args[0].upper()
+        try:
+            st.settings.risk_percent = float(context.args[1])
+            st.settings.leverage = int(float(context.args[2]))
+        except Exception:
+            await update.message.reply_text("Sai cú pháp. Dùng: /settings BTC/USDT 10 17"); return
+        storage.put_user(uid, st)
+        await update.message.reply_text(f"OK. Pair={st.settings.pair}, Risk={st.settings.risk_percent}%, Lev=x{st.settings.leverage}")
+    else:
+        await update.message.reply_text(
+            f"Hiện tại: Pair={st.settings.pair}, Risk={st.settings.risk_percent}%, Lev=x{st.settings.leverage}.\n"
+            f"Dùng: /settings BTC/USDT 10 17"
+        )
+
+async def tidewindow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    if context.args:
+        st.settings.tide_window_hours = float(context.args[0])
+        storage.put_user(uid, st)
+        await update.message.reply_text(f"Đã đặt ±{st.settings.tide_window_hours}h quanh mốc thủy triều.")
+    else:
+        await update.message.reply_text(f"Đang dùng ±{st.settings.tide_window_hours}h. Dùng: /tidewindow 2")
+
+# ======== TP-by-time (live) helper ========
+def _tp_eta_text(uid: int) -> Optional[str]:
+    try:
+        from core import auto_trade_engine as ae
+    except Exception:
+        return None
+
+    pos = ae._open_pos.get(uid)
+    if not isinstance(pos, dict):
+        return None
+
+    try:
+        tp_hours = float(os.getenv("TP_TIME_HOURS", os.getenv("TIDE_EXIT_HOURS", "4.5")))
+    except Exception:
+        tp_hours = 4.5
+
+    now = now_vn()
+    base = pos.get("tide_center") or pos.get("entry_time") or now
+    try:
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=now.tzinfo)
+    except Exception:
+        pass
+
+    deadline = base + timedelta(hours=tp_hours)
+    remain = deadline - now
+    rem_sec = int(remain.total_seconds())
+
+    base_tag = "tide_center" if pos.get("tide_center") else "entry_time"
+    if rem_sec <= 0:
+        return f"TP-by-time (live): {deadline.strftime('%Y-%m-%d %H:%M:%S')} — ⏰ đã quá hạn (base={base_tag}, H={tp_hours:g})"
+
+    hrs = rem_sec // 3600
+    mins = (rem_sec % 3600) // 60
+    return (
+        f"TP-by-time (live): {deadline.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"| còn ~ {hrs}h{mins:02d} (base={base_tag}, H={tp_hours:g})"
+    )
+
+# ================== Position formatter ==================
+async def _format_position_status(symbol: str, fallback_lev: Optional[int] = None) -> str:
+    try:
+        positions = None
+        try:
+            positions = await ex._io(ex.client.fetch_positions, [symbol])
+        except Exception:
+            try:
+                one = await ex._io(ex.client.fetch_position, symbol)
+                positions = [one] if one else []
+            except Exception:
+                positions = []
+
+        if not positions:
+            return "Position: (Không có vị thế mở)"
+
+        p_use = None
+        amt_signed = 0.0
+        for p in positions or []:
+            amt = 0.0
+            if isinstance(p, dict):
+                info = p.get("info", {}) or {}
+                if "positionAmt" in info:
+                    try: amt = float(info.get("positionAmt") or 0)
+                    except: amt = 0.0
+                elif "contracts" in p:
+                    try: amt = float(p.get("contracts") or 0)
+                    except: amt = 0.0
+                elif "amount" in p:
+                    try: amt = float(p.get("amount") or 0)
+                    except: amt = 0.0
+            if abs(amt) != 0:
+                p_use = p; amt_signed = amt; break
+
+        if p_use is None:
+            return "Position: (Không có vị thế mở)"
+
+        def _flt(x):
+            try: return float(x)
+            except: return None
+
+        info = {}
+        if isinstance(p_use, dict):
+            info = p_use.get("info", {}) or {}
+
+        side = "LONG" if amt_signed > 0 else ("SHORT" if amt_signed < 0 else "FLAT")
+        entry = _flt(info.get("entryPrice") or info.get("avgEntryPrice") or p_use.get("entryPrice") or p_use.get("avgPrice"))
+        contracts = _flt(info.get("positionAmt") or p_use.get("contracts") or p_use.get("amount")) or 0.0
+        u_pnl = _flt(info.get("unrealizedProfit") or p_use.get("unrealizedPnl"))
+        lev_val = _flt(info.get("leverage") or p_use.get("leverage"))
+
+        if (not lev_val) or lev_val <= 0:
+            try:
+                init_margin = _flt(info.get("positionInitialMargin") or p_use.get("initialMargin"))
+                notional = (entry or 0) * abs(contracts or 0)
+                if init_margin and init_margin > 0 and notional > 0:
+                    try: lev_val = max(1, int(round(notional / init_margin)))
+                    except Exception: lev_val = None
+            except Exception:
+                lev_val = None
+
+        lev_str = f"x{int(lev_val)}" if isinstance(lev_val, (int,float)) and lev_val>0 else (f"~x{int(fallback_lev)}" if fallback_lev else "—")
+
+        roe = None
+        init_margin = _flt(info.get("positionInitialMargin") or p_use.get("initialMargin"))
+        if init_margin and init_margin != 0:
+            roe = (u_pnl or 0.0) / init_margin * 100.0
+        else:
+            if entry and contracts and isinstance(lev_val, (int,float)) and lev_val>0:
+                denom = (entry * contracts / lev_val)
+                if denom:
+                    roe = (u_pnl or 0.0) / denom * 100.0
+
+        roe_str = "—"
+        if roe is not None:
+            arrow = "🟢" if roe >= 0 else "🔴"
+            roe_str = f"{roe:.2f}% {arrow}"
+        entry_str = f"{entry:.6f}" if entry is not None else "—"
+
+        return (
+            f"Position: {side} {symbol}\n"
+            f"Entry: {entry_str}\n"
+            f"Contracts: {contracts:.6f}\n"
+            f"Unrealized PnL: {0.0 if u_pnl is None else u_pnl:.8f}\n"
+            f"PnL% (ROE): {roe_str}\n"
+            f"Leverage: {lev_str}"
+        )
+    except Exception as e:
+        return f"Position: (Lỗi lấy vị thế) — {e}"
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    head = (
+        f"Pair: {st.settings.pair}\n"
+        f"Mode: {st.settings.mode}\n"
+        f"Risk: {st.settings.risk_percent}%\n"
+        f"Lev: x{st.settings.leverage}\n"
+        f"Đã dùng {st.today.count}/{st.settings.max_orders_per_day} lệnh hôm nay.\n"
+        f"Giới hạn mỗi cửa sổ thủy triều: {st.settings.max_orders_per_tide_window}\n"
+        f"M5 report: {'ON' if st.settings.m5_report_enabled else 'OFF'}\n"
+    )
+    tp_line = _tp_eta_text(uid)
+    if tp_line:
+        head += tp_line + "\n"
+    pos = await _format_position_status(st.settings.pair, fallback_lev=st.settings.leverage)
+    await update.message.reply_text(head + "\n" + pos)
+
+async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+
+    if not context.args or context.args[0].lower() not in ("long", "short"):
+        await update.message.reply_text("Cú pháp: /order <long|short> [entry] [tp] [sl]\nVD: /order long 64850"); return
+
+    side_long = (context.args[0].lower() == "long")
+
+    now = now_vn()
+    twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
+    if not twin:
+        await update.message.reply_text("⏳ Ngoài khung thủy triều — chưa cho phép /order.")
+        return
+    start, end = twin
+    tkey = (start + (end - start) / 2).strftime("%Y-%m-%d %H:%M")
+
+    if st.today.count >= st.settings.max_orders_per_day:
+        await update.message.reply_text(f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day})."); return
+    used = int(st.tide_window_trades.get(tkey, 0))
+    if used >= st.settings.max_orders_per_tide_window:
+        await update.message.reply_text(f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh."); return
+
+    if len(context.args) >= 2:
+        try: entry = float(context.args[1])
+        except Exception:
+            await update.message.reply_text("Entry không hợp lệ."); return
+    else:
+        try:
+            from data.market_data import get_klines
+            dfp = get_klines(symbol=st.settings.pair.replace("/",""), interval="5m", limit=2)
+            if dfp is None or len(dfp) == 0:
+                await update.message.reply_text("Không lấy được giá hiện tại."); return
+            entry = float(dfp.iloc[-1]["close"])
+        except Exception as e:
+            await update.message.reply_text(f"Lỗi lấy giá: {e}"); return
+
+    tp = sl = None
+    if len(context.args) >= 3:
+        try: tp = float(context.args[2])
+        except: tp = None
+    if len(context.args) >= 4:
+        try: sl = float(context.args[3])
+        except: sl = None
+
+    if tp is None or sl is None:
+        try:
+            base_sl, base_tp = auto_sl_by_leverage(entry, "LONG" if side_long else "SHORT", st.settings.leverage)
+        except Exception:
+            if side_long:
+                base_sl, base_tp = entry * 0.99, entry * 1.02
+            else:
+                base_sl, base_tp = entry * 1.01, entry * 0.98
+        if tp is None:
+            tp = entry + (base_tp - entry) * 0.5
+        if sl is None:
+            sl = entry - (entry - base_sl) * 0.5 if side_long else entry + (base_sl - entry) * 0.5
+
+    try:
+        bal = await ex.balance_usdt()
+        qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, entry)
+        await ex.set_leverage(st.settings.pair, st.settings.leverage)
+    except Exception as e:
+        await update.message.reply_text(f"Lỗi tính khối lượng/đặt leverage: {e}"); return
+
+    try:
+        res_exe = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl, tp)
+    except Exception as e:
+        await update.message.reply_text(f"Lỗi khớp lệnh: {e}"); return
+
+    st.today.count += 1
+    st.tide_window_trades[tkey] = used + 1
+    st.history.append({
+        "id": f"MANUAL-{datetime.now().strftime('%H%M%S')}",
+        "side": "LONG" if side_long else "SHORT",
+        "qty": qty, "entry": entry, "sl": sl, "tp": tp,
+        "ok": getattr(res_exe, "ok", True), "msg": getattr(res_exe, "message", "")
+    })
+    storage.put_user(uid, st)
+
+    await update.message.reply_text(
+        "✅ Đã vào lệnh thủ công trong <b>cửa sổ thủy triều</b> "
+        f"({start.strftime('%H:%M')}–{end.strftime('%H:%M')}):\n"
+        f"{st.settings.pair} {'LONG' if side_long else 'SHORT'} qty={qty:.6f} @~{entry:.2f}\n"
+        f"SL={sl:.2f} | TP={tp:.2f}\n"
+        f"({st.tide_window_trades[tkey]}/{st.settings.max_orders_per_tide_window} lệnh trong cửa sổ hiện tại)",
+        parse_mode="HTML"
+    )
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+
+    d = now_vn().date().isoformat()
+    daily = format_daily_moon_tide_report(d, float(st.settings.tide_window_hours))
+
+    sym = st.settings.pair.replace("/", "")
+    loop = asyncio.get_event_loop()
+    try:
+        try:
+            res = await loop.run_in_executor(
+                None, lambda: evaluate_signal(sym, tide_window_hours=float(st.settings.tide_window_hours))
+            )
+        except TypeError:
+            res = await loop.run_in_executor(None, lambda: evaluate_signal(sym))
+    except Exception as e:
+        await update.message.reply_text(_esc(daily) + f"\n\n⚠️ Lỗi /report: {_esc(str(e))}")
+        return
+
+    if not isinstance(res, dict) or not res.get("ok", False):
+        reason = (isinstance(res, dict) and (res.get("text") or res.get("reason"))) or "Không tạo được snapshot kỹ thuật."
+        await update.message.reply_text(_esc(daily) + f"\n\n⚠️ {_esc(reason)}")
+        return
+
+    ta_text = res.get("text") or format_signal_report(res)
+    ta_text = _beautify_report(ta_text)
+    safe_daily = _esc(daily)
+    safe_ta    = _esc(ta_text)
+
+    if res.get("skip", True):
+        await update.message.reply_text(
+            safe_daily + "\n\n⏸ <b>Ngoài điều kiện trade / chỉ quan sát</b>\n" + safe_ta,
+            parse_mode="HTML"
+        )
+        return
+
+    side = (res.get("signal") or "NONE").upper()
+    score = int(res.get("confidence", 0))
+
+    if st.settings.mode == "manual":
+        ps = create_pending(storage, uid, st.settings.pair, side, score, entry_hint=None, sl=None, tp=None)
+        safe_block = safe_ta + f"\nID: <code>{ps.id}</code>\nDùng /approve {ps.id} hoặc /reject {ps.id}"
+        await update.message.reply_text(safe_daily + "\n\n" + safe_block, parse_mode="HTML")
+    else:
+        try:
+            late_only = (os.getenv("ENTRY_LATE_ONLY", "false").lower() in ("1","true","yes","on","y"))
+            late_pref = (os.getenv("ENTRY_LATE_PREF", "false").lower() in ("1","true","yes","on","y"))
+            late_from = float(os.getenv("ENTRY_LATE_FROM_HRS", "1.5"))
+            late_to   = float(os.getenv("ENTRY_LATE_TO_HRS", "2.0"))
+
+            now = now_vn()
+            twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
+            if twin:
+                start, end = twin
+                center = start + (end - start) / 2
+                delta_hr = (now - center).total_seconds() / 3600.0
+                in_late = (delta_hr >= late_from and delta_hr <= late_to)
+
+                if late_only and not in_late:
+                    await update.message.reply_text(
+                        safe_daily + "\n\n(AUTO) " + _esc(
+                            f"ENTRY_LATE_ONLY=true → chỉ cho phép vào trong late window "
+                            f"[{(center + timedelta(hours=late_from)).strftime('%H:%M')}–{(center + timedelta(hours=late_to)).strftime('%H:%M')}] "
+                            f"(center={center.strftime('%H:%M')}, now={now.strftime('%H:%M')}).\n"
+                            "⏸ Bỏ qua vào lệnh lần này."
+                        ) + "\n" + safe_ta,
+                        parse_mode="HTML"
+                    )
+                    return
+
+                if (not late_only) and late_pref and (not in_late):
+                    try:
+                        conf = int(res.get("confidence", 0))
+                        if conf < 6:
+                            await update.message.reply_text(
+                                safe_daily + "\n\n(AUTO) " + _esc("ENTRY_LATE_PREF=true và ngoài late window → bỏ qua vì điểm chưa đủ mạnh.") + "\n" + safe_ta,
+                                parse_mode="HTML"
+                            )
+                            return
+                    except Exception:
+                        pass
+        except Exception as _e_enforce:
+            print(f"[AUTO][WARN] Late-window check error: {_e_enforce}")
+
+        try:
+            from data.market_data import get_klines
+            dfp = get_klines(symbol=st.settings.pair.replace("/",""), interval="5m", limit=2)
+            if dfp is None or len(dfp) == 0:
+                await update.message.reply_text(safe_daily + "\n\n(AUTO) " + _esc("Không lấy được giá hiện tại.") + "\n" + safe_ta, parse_mode="HTML")
+                return
+            close = float(dfp.iloc[-1]["close"])
+        except Exception as e:
+            await update.message.reply_text(safe_daily + f"\n\n(AUTO) Lỗi lấy giá: {_esc(str(e))}\n" + safe_ta, parse_mode="HTML")
+            return
+
+        try:
+            bal = await ex.balance_usdt()
+            qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, close)
+            await ex.set_leverage(st.settings.pair, st.settings.leverage)
+        except Exception as e:
+            await update.message.reply_text(safe_daily + f"\n\n(AUTO) Lỗi khối lượng/leverage: {_esc(str(e))}\n" + safe_ta, parse_mode="HTML")
+            return
+
+        side_long = (side == "LONG")
+        try:
+            sl_price, tp_price = auto_sl_by_leverage(close, side_long, st.settings.leverage)
+        except Exception:
+            if side_long:
+                sl_price, tp_price = close * 0.99, close * 1.02
+            else:
+                sl_price, tp_price = close * 1.01, close * 0.98
+
+        try:
+            res_exe = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl_price, tp_price)
+        except Exception as e:
+            await update.message.reply_text(safe_daily + f"\n\n(AUTO) Lỗi khớp lệnh: {_esc(str(e))}\n" + safe_ta, parse_mode="HTML")
+            return
+
+        st.today.count += 1
+        st.history.append({
+            "id": f"AUTO-{datetime.now().strftime('%H%M%S')}",
+            "side": side, "qty": qty, "entry": close,
+            "sl": sl_price, "tp": tp_price,
+            "ok": getattr(res_exe, "ok", True), "msg": getattr(res_exe, "message", "")
+        })
+        storage.put_user(uid, st)
+
+        enter_line = (
+            f"🔧 Executed: {st.settings.pair} {'LONG' if side_long else 'SHORT'} "
+            f"qty={qty:.6f} @~{close:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}\n"
+            f"↳ {getattr(res_exe, 'message', '')}"
+        )
+        await update.message.reply_text(
+            safe_daily + "\n\n(AUTO)\n" + safe_ta + "\n" + _esc(enter_line),
+            parse_mode="HTML"
+        )
+
+async def m5report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+
+    arg = (context.args[0].lower() if context.args else "status")
+    if arg not in ("start", "stop", "status"):
+        await update.message.reply_text("Dùng: /m5report start | stop | status")
+        return
+
+    if arg == "status":
+        await update.message.reply_text(f"M5 report hiện: {'ON' if st.settings.m5_report_enabled else 'OFF'}")
+        return
+
+    if arg == "start":
+        st.settings.m5_report_enabled = True
+        storage.put_user(uid, st)
+        await update.message.reply_text("✅ ĐÃ BẬT M5 report (sẽ tự động gửi snapshot mỗi 5 phút).")
+        try:
+            sym = st.settings.pair.replace("/", "")
+            await update.message.reply_text(m5_snapshot(sym))
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Không gửi được snapshot ngay: {e}")
+        return
+
+    if arg == "stop":
+        st.settings.m5_report_enabled = False
+        storage.put_user(uid, st)
+        await update.message.reply_text("⏸ ĐÃ TẮT M5 report.")
+        return
+
+# ================== /autolog ==================
+async def autolog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    try:
+        from core import auto_trade_engine as ae
+    except Exception as e:
+        await update.message.reply_text(f"Không import được auto_trade_engine: {e}")
+        return
+
+    txt = None
+
+    # 1) Ưu tiên: getter chính thức từ engine (nếu có)
+    try:
+        getter = getattr(ae, "get_last_decision_text", None)
+        if callable(getter):
+            txt = getter(uid)
+    except Exception:
+        txt = None
+
+    # 2) Fallback: map nội bộ _last_decision_text
+    if not txt:
+        try:
+            last_map = getattr(ae, "_last_decision_text", None)
+            if isinstance(last_map, dict):
+                txt = last_map.get(uid)
+        except Exception:
+            txt = None
+
+    # 3) Fallback nhẹ: hiển thị slot M5 gần nhất (nếu engine chưa lưu log)
+    if not txt:
+        try:
+            slot_map = getattr(ae, "_last_m5_slot_sent", None)
+            if isinstance(slot_map, dict) and uid in slot_map:
+                txt = f"Tick gần nhất (M5 slot) = {slot_map[uid]} (engine chưa lưu full text cho tick này)."
+        except Exception:
+            txt = None
+
+    if not txt:
+        await update.message.reply_text("Chưa có tick AUTO nào chạy cho user này (hoặc engine chưa lưu log).")
+        return
+
+    # Bảo vệ giới hạn Telegram (khoảng < 4000 ký tự)
+    if len(txt) > 3500:
+        txt = txt[:3500] + "\n…(rút gọn)…"
+
+    await update.message.reply_text(f"📜 Auto log gần nhất:\n{txt}")
+
+
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    if not st.pending:
+        await update.message.reply_text("Không có pending signal."); return
+    if context.args and context.args[0] == st.pending.id:
+        from data.market_data import get_klines
+        df = get_klines(symbol=st.settings.pair.replace("/",""), interval="5m", limit=10)
+        if df is None:
+            await update.message.reply_text("Không lấy được giá hiện tại."); return
+        close = float(df.iloc[-1]["close"])
+        entry_price = close
+        sl = st.pending.sl or (close * 0.99 if st.pending.side=="LONG" else close * 1.01)
+        tp = st.pending.tp or (close * 1.02 if st.pending.side=="LONG" else close * 0.98)
+
+        bal = await ex.balance_usdt()
+        qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, entry_price)
+        await ex.set_leverage(st.settings.pair, st.settings.leverage)
+        side_long = st.pending.side.upper()=="LONG"
+        res = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl, tp)
+
+        st.today.count += 1
+        st.history.append({"id": st.pending.id, "side": st.pending.side, "qty": qty, "entry": entry_price, "sl": sl, "tp": tp, "ok": res.ok, "msg": res.message})
+        st.pending = None
+        storage.put_user(uid, st)
+        await update.message.reply_text(res.message)
+    else:
+        await update.message.reply_text("Sai ID. Dùng /approve <id>")
+
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    if st.pending and context.args and context.args[0] == st.pending.id:
+        st.pending = None
+        storage.put_user(uid, st)
+        await update.message.reply_text("Đã từ chối tín hiệu.")
+    else:
+        await update.message.reply_text("Không có pending hoặc sai ID.")
+
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    symbol = st.settings.pair
+
+    pct = 100.0
+    if context.args:
+        arg = (context.args[0] or "").strip().lower()
+        if arg in ("all", "full"):
+            pct = 100.0
+        else:
+            try: pct = float(arg)
+            except Exception:
+                await update.message.reply_text("Sai cú pháp. Dùng: /close [phần_trăm]\nVD: /close 50 (đóng 50%)")
+                return
+            if pct <= 0:
+                await update.message.reply_text("Phần trăm phải > 0.")
+                return
+
+    try:
+        res = await ex.close_position_pct(symbol, pct)
+        await update.message.reply_text(res.message)
+    except Exception as e:
+        await update.message.reply_text(f"Lỗi /close: {e}")
+
+async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    st = storage.get_user(uid)
+    d = now_vn().date().isoformat()
+    text = format_daily_moon_tide_report(d, float(st.settings.tide_window_hours))
+    await update.message.reply_text(text)
+
+# ================== Custom Commands (bổ sung) ==================
+async def aboutme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    about_text = """
+💡 **Trading là môn tìm hiểu về bản thân:**
+- **Thân - Tâm - Trí**
+- Phải luôn vận hành 3 hệ thống: **QLV - TÂM LÝ - HTGD**
+ 🧍‍♂️ *THÂN – Quản lý vốn (Số 8 – Trưởng thành)*
+ 🧘‍♂️ *TÂM – Tâm lý (Số 2 – Cân bằng cảm xúc)*
+ 🧠 *TRÍ – Hệ thống giao dịch (Số 3 – Chủ đạo)*
+
+👤 **HỆ THỐNG: User #Me : 4 Mùa & 4 Phase Moon & 4 Tides**
+ 
+🧍‍♂️ *THÂN – Quản lý vốn (Số 8 – Trưởng thành)*
+1. Sức khỏe bạn có đang ổn không ? Hôm nay đã vận động min 15 phút chưa ?
+2. Quản lý Vốn là: Giữ đều vol ( Vốn x Đòn Bẩy , SL chịu được là giống nhau)
+3. Nguyên tắc QLV: 8:8:8/ (2:3:5) theo pytago trong một mạng/ tổng 8) 
+4. Số lệnh: Tối đa 8 lệnh/ngày - Mỗi giờ thủy triều max 2 lệnh
+5. Tỷ lệ R:R > 1.3 (Tổng 4) : Ghi sẵn target/stop max 50%, không thay đổi sau khi vào lệnh, nếu nó đi ngược Sl 50% vẫn OK - phải đo % để tính đòn bẩy
+6. Đòn bẩy: X17,X26,X35,X44 (Nhắc về con số trưởng thành 8) : Thân dò X17 - 20% vốn, Trí  50% Tín hiệu tốt thì X26 / Xác suất cao, SL ngắn X35~X44
+
+🧘‍♂️ *TÂM – Tâm lý (Số 2 – Cân bằng cảm xúc)*
+1. Bạn KO bị stress hay căng thẳng chứ ? Hôm nay đã thiền min 15 phút chưa ?
+2. Tâm lý trước lệnh : Checklist trước lệnh + Thở 8 lần để tỉnh thức trước click
+3. Tâm lý trong lệnh : Nếu đang hoảng loạn "Vô tác", Ko được đi thêm lệnh hoặc DCA
+4. Tâm lý sau lệnh: Tổng kết 1 điều tốt + 1 bài học mỗi cuối ngày
+5. Tâm lý hồi phục sau thắng/Thua: Dừng giao dịch 48h = 2 ngày để bình tĩnh tâm khi thua
+
+🧠 *TRÍ – Hệ thống giao dịch (Số 3 – Chủ đạo)*
+1. Bạn có đang tỉnh táo và sáng suốt không ? Hôm nay đã thiền min 15 phút chưa
+2. Chỉ BTC/USDT
+3. Theo trend chính (D, H4) - Sonic R " TREND IS YOUR FRIEND "
+4. CTTT Đa Khung M30,M5/Fibo 50%/ Wyckoff -Phase-Spring/ Mô Hình /KC-HT lý tưởng/Volumn DGT/ SQ9 -9 cây nến/ Nâng cao Sonic R+Elliot (ăn sóng 3)+Wyckoff
+5. Phase trăng - Biến động theo tứ xung theo độ rọi (0 - 25 - 50 - 75 - 100)
+6. Vùng giờ thủy triều ±1h "Tín hiệu thường xác định sau khi hết vùng thủy triều"
+7. Đồng pha RSI & EMA RSI (đa khung)
+8. Chiến lược 1 or phá nền giá Down M5 or Luôn hỏi đã "CẠN CUNG" chưa ?
+9. Stoch RSI công tắc xác nhận bật
+
+📝 *Lời nhắc thêm từ Nhân số học:*
+10. Số chủ đạo 3: Hạn chế mạng xã hội, tập trung yêu bản thân, hạn chế phân tán năng lượng
+11. 4 số 11: Viết nhật ký, Kiểm tra checklist trước vào lệnh, Kiên trì 1 hệ thống giao dịch, Hạn chế cộng đồng
+12. Kiếm củi 3 năm đốt trong 1h rất nhiều 
+13. Cảnh giác: "Đã bị cháy nhiều lần vì vi phạm HTGD, trả thù, DCA khi hoảng loạn"
+14. Không được vào lệnh bằng điện thoại — Phải chậm lại, không hấp tấp
+15. "YOU ARE WHAT YOU REPEAT"
+16. Biên độ dao động Khung Bé / H4 / D1 / W — đang ntn — Điều chỉnh cái thì sao?
+
+📈 **MỤC TIÊU:**
+- Phiên bản ổn định, vững tâm – tự do thật sự từ kỷ luật
+
+🚀 **TRẠNG THÁI HIỆN TẠI:**
+- Phiên bản 3.1.4 – *Đang cập nhật mỗi ngày*
+""".strip()
+    # Dùng Markdown để giữ format in đậm/nghiêng như bạn soạn
+    await update.message.reply_text(about_text, parse_mode="Markdown")
+
+async def journal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    form_link = "https://docs.google.com/forms/d/e/1FAIpQLSeXQmxn8X9BCUC_StiOid1wFCue_19y3hEQBTHULnNHl7ShSg/viewform"
+    await update.message.reply_text(f"📋 Mời bạn điền nhật ký giao dịch tại đây:\n{form_link}")
+
+async def recovery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    checklist_text = (
+        "🧠 *Phục hồi tâm lý sau thua lỗ – Vấn đề & Giải pháp*\n\n"
+        "❗ *Vấn đề 1:* Hay trả thù, ăn thua với thị trường\n"
+        "🔧 *Giải pháp:* Tập không vào thêm lệnh để ăn thua or DCA và tuân thủ SL đã đặt\n\n"
+        "❗ *Vấn đề 2:* Cố chấp vẫn bật máy tính để tìm thêm kèo vào lại ngay tức thì or phá vỡ HTGD\n"
+        "🔧 *Giải pháp:* Rèn tính rời bỏ máy tính, nhìn chart - quay về quan sát cảm xúc or kiểm điểm lại HTGD\n\n"
+        "❗ *Vấn đề 3:* Không có cơ chế phục hồi cảm xúc\n"
+        "🔧 *Giải pháp:* Dừng giao dịch 48h = 2 ngày, viết ra cảm xúc, hít thở sâu mỗi ngày\n\n"
+        "❗ *Vấn đề 4:* Tập trung quá nhiều vào kết quả\n"
+        "🔧 *Giải pháp:* Đặt mục tiêu là tính nhất quán, không phải lợi nhuận\n\n"
+        "❗ *Vấn đề 5:* Tự trừng phạt khi sai\n"
+        "🔧 *Giải pháp:* Xem sai lầm như dữ liệu cải thiện hệ thống, không phán xét bản thân , hành động khác ngu ngốc ảnh hưởng đến cảm xúc\n\n"
+        "❗ *Vấn đề 6:* Thiếu hệ thống rèn tâm\n"
+        "🔧 *Giải pháp:* Mỗi sáng viết 3 điều biết ơn, mỗi tối ghi lại cảm xúc – luyện tâm như luyện kỹ thuật\n\n"
+        "❗ *Vấn đề 7:* Rà Soát và Tuân Thủ 3 Hệ Thống : THÂN (QLV-8) - TÂM (CẢM XÚC-2) - TRÍ(HTGD-3)\n"
+        "🔧 *Giải pháp:* Rà Soát và Tuân Thủ 3 Hệ Thống : THÂN (QLV-8) - TÂM (CẢM XÚC-2) - TRÍ(HTGD-3)\n\n"
+        "✅ *Hãy chỉ quay lại thị trường khi 3 hệ thống THÂN - TÂM - TRÍ đã bình ổn.*"
+    )
+    await update.message.reply_text(checklist_text.strip(), parse_mode="Markdown")
+
+# ================== Error handler ==================
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        err = context.error
+        print(f"[TG ERROR] {err}")
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Lỗi: {err}")
+    except Exception:
+        pass
+
+# ================== App builder ==================
+def build_app():
+    token = TELEGRAM_BOT_TOKEN
+    if not token:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+
+    async def _post_init(app: Application):
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            print("[BOOT] Webhook deleted (switching to polling).")
+        except Exception as e:
+            print(f"[BOOT] delete_webhook warn: {e}")
+
+        app.bot_data["storage"] = storage
+
+        async def _spawn_after_start():
+            await asyncio.sleep(0)
+            print("[M5] Background m5_report_loop() started.")
+            app.create_task(m5_report_loop(app, storage))
+            print("[AUTO] Background start_auto_loop() started.")
+            app.create_task(start_auto_loop(app, storage))
+            print("[AUTO PRESET] Background auto preset daemon started.")
+            app.create_task(_auto_preset_daemon(app))
+
+        asyncio.get_event_loop().create_task(_spawn_after_start())
+
+    app = ApplicationBuilder().token(token).job_queue(None).post_init(_post_init).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("preset", preset_cmd))
+    app.add_handler(CommandHandler("setenv", setenv_cmd))
+    app.add_handler(CommandHandler("setenv_status", setenv_status_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("tidewindow", tidewindow_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("order", order_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("m5report", m5report_cmd))
+    app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("reject", reject_cmd))
+    app.add_handler(CommandHandler("close", close_cmd))
+    app.add_handler(CommandHandler("daily", daily_cmd))
+    app.add_handler(CommandHandler("autolog", autolog_cmd))
+    app.add_handler(CommandHandler("aboutme", aboutme_command))
+    app.add_handler(CommandHandler("journal", journal_command))
+    app.add_handler(CommandHandler("recovery_checklist", recovery_command))
+    app.add_error_handler(_on_error)
+    return app
+
+
+
+
+# ===== Auto preset helpers (map P1..P4 theo Moon API) ==========================
+def _preset_mode() -> str:
+    return (os.getenv("PRESET_MODE", "auto") or "auto").upper()
+
+def _apply_preset_code_runtime(pcode: str) -> bool:
+    preset = PRESETS.get(pcode)
+    if not preset:
+        return False
+    # 1) Ghi ENV
+    for k, v in preset.items():
+        os.environ[k] = _bool_str(v) if isinstance(v, bool) else str(v)
+    # 2) Bơm runtime sang auto_trade_engine nếu có
+    applied = False
+    try:
+        from core import auto_trade_engine as ae
+        fn = getattr(ae, "apply_runtime_overrides", None)
+        if callable(fn):
+            fn({k: os.environ[k] for k in preset.keys()})
+            applied = True
+        else:
+            for k, sval in os.environ.items():
+                if k in preset and hasattr(ae, k):
+                    typ = type(getattr(ae, k))
+                    if typ is bool:
+                        setattr(ae, k, sval.strip().lower() in ("1","true","yes","on"))
+                    elif typ is int:
+                        setattr(ae, k, int(float(sval)))
+                    elif typ is float:
+                        setattr(ae, k, float(sval))
+                    else:
+                        setattr(ae, k, sval)
+                    applied = True
+    except Exception:
+        pass
+    return applied
+
+async def _apply_auto_preset_now(app=None, silent: bool = True):
+    pcode, meta = resolve_preset_code(None)
+    ok = _apply_preset_code_runtime(pcode)
+    if (not silent) and app:
+        try:
+            chat_id = int(os.getenv("AUTO_DEBUG_CHAT_ID") or TELEGRAM_CHAT_ID) if (os.getenv("AUTO_DEBUG_CHAT_ID") or "").isdigit() else TELEGRAM_CHAT_ID
+        except Exception:
+            chat_id = TELEGRAM_CHAT_ID
+        if chat_id:
+            txt = (
+                "🌕 Auto preset: "
+                f"<b>{html.escape(meta.get('phase') or '')}</b> — {meta.get('illum')}% ({html.escape(meta.get('direction') or '')})\n"
+                f"→ Áp dụng <b>{pcode}</b>: {html.escape(meta.get('label') or '')}"
+            )
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+            except Exception:
+                pass
+
+async def _auto_preset_daemon(app: Application):
+    """Mỗi ngày 00:05 JST: nếu PRESET_MODE=AUTO thì tự đổi preset theo Moon mới."""
+    await asyncio.sleep(1)
+    if _preset_mode() == "AUTO":
+        await _apply_auto_preset_now(app, silent=True)
+    while True:
+        now = datetime.now(TOKYO_TZ)
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+        sleep_s = max(60.0, (nxt - now).total_seconds())
+        await asyncio.sleep(sleep_s)
+        if _preset_mode() == "AUTO":
+            await _apply_auto_preset_now(app, silent=True)
+
+
+
+

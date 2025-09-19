@@ -1,0 +1,21 @@
+# Telegram bot (có JobQueue)
+python-telegram-bot[job-queue]==20.1
+
+# Data & TA
+pandas
+numpy
+ta
+
+# HTTP & async utils
+requests
+aiohttp
+pytz
+python-dotenv
+
+# Exchange clients (nếu bạn dùng)
+ccxt==4.3.89
+python-binance
+websocket-client
+
+# (Tuỳ chọn) Scheduler – PTB extra đã kéo rồi, có thể bỏ dòng này
+# APScheduler>=3.10.4
