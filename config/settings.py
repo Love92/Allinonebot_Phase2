@@ -1,77 +1,76 @@
-# ----------------------- config/settings.py (FULL) -----------------------
+# ----------------------- config/settings.py -----------------------
 from __future__ import annotations
 import os, json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-def _bool(v: str | None, default: bool = False) -> bool:
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+# -------- helpers ----------
+def _env_bool(key: str, default: str = "false") -> bool:
+    return (os.getenv(key, default) or "").strip().lower() in ("1","true","yes","on","y")
 
-# ====== Cấu hình cũ (fallback đơn tài khoản) ======
-EXCHANGE_ID = os.getenv("EXCHANGE", "binanceusdm")
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
-TESTNET = _bool(os.getenv("TESTNET"), False)
+def _as_float(env_key: str, default: str) -> float:
+    try:
+        return float(os.getenv(env_key, default))
+    except Exception:
+        return float(default)
 
-PAIR = os.getenv("PAIR", "BTC/USDT")
-MODE = os.getenv("MODE", "manual")              # manual | auto
-PRESET_MODE = os.getenv("PRESET_MODE", "auto")
+def _as_int(env_key: str, default: str) -> int:
+    try:
+        return int(float(os.getenv(env_key, default)))
+    except Exception:
+        return int(default)
 
-# --- compatibility exports for modules cũ (tg/bot.py, v.v.) ---
-DEFAULT_MODE = os.getenv("DEFAULT_MODE", MODE)
-DEFAULT_PAIR = os.getenv("DEFAULT_PAIR", PAIR)
-DEFAULT_PRESET_MODE = os.getenv("DEFAULT_PRESET_MODE", PRESET_MODE)
+# ===== Telegram =====
+TELEGRAM_BOT_TOKEN            = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID              = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ====== Runtime / Strategy flags (bổ sung theo .env cũ) ======
-MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "8"))
-MAX_ORDERS_PER_TIDE_WINDOW = int(os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", "2"))
+# Kênh phát kèo (EXECUTE-only)
+TELEGRAM_BROADCAST_BOT_TOKEN  = os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN", "").strip()
+TELEGRAM_BROADCAST_CHAT_ID    = os.getenv("TELEGRAM_BROADCAST_CHAT_ID", "").strip()
 
-TIDE_WINDOW_HOURS = float(os.getenv("TIDE_WINDOW_HOURS", "2.5"))
-SCHEDULER_TICK_SEC = int(os.getenv("SCHEDULER_TICK_SEC", "2"))
+# ===== Modes / Defaults =====
+# (giữ compatibility với bản cũ)
+MODE           = os.getenv("MODE", "manual").strip().lower()   # manual | auto
+DEFAULT_MODE   = os.getenv("DEFAULT_MODE", MODE)
+PAIR           = os.getenv("PAIR", "BTC/USDT").strip().upper()
+PRESET_MODE    = os.getenv("PRESET_MODE", "auto")
 
-COOLDOWN_H4_CANDLES = int(os.getenv("COOLDOWN_H4_CANDLES", "3"))
-M5_BACKFILL_SLOTS = int(os.getenv("M5_BACKFILL_SLOTS", "2"))
-M5_CLOSE_GRACE_SEC = int(os.getenv("M5_CLOSE_GRACE_SEC", "12"))
-M5_MAX_DELAY_SEC = int(os.getenv("M5_MAX_DELAY_SEC", "60"))
-M5_STRICT_CLOSE = _bool(os.getenv("M5_STRICT_CLOSE"), False)
+# ===== Exchange — Single-account (Binance fallback như bản cũ) =====
+EXCHANGE_ID    = os.getenv("EXCHANGE", "binanceusdm").strip().lower()
+API_KEY        = os.getenv("API_KEY", "").strip()
+API_SECRET     = os.getenv("API_SECRET", "").strip()
+TESTNET        = _env_bool("TESTNET", "false")
 
-SONIC_MODE = os.getenv("SONIC_MODE", "weight")
+# Cho phép /settings thay đổi risk/leverage chung
+RISK_PERCENT_DEFAULT = _as_float("RISK_PERCENT", "20")
+LEVERAGE_DEFAULT     = _as_int("LEVERAGE", "44")
+
+# ===== Weather / Tide (để tránh ImportError ở data/moon_tide.py) =====
+WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY", "").strip()
+WORLDTIDES_KEY = os.getenv("WORLDTIDES_KEY", "").strip()
 try:
-    SONIC_WEIGHT = float(os.getenv("SONIC_WEIGHT", "1.0"))
+    LAT = float(os.getenv("LAT", "10.8231"))
+    LON = float(os.getenv("LON", "106.6297"))
 except Exception:
-    SONIC_WEIGHT = 1.0
+    LAT, LON = 10.8231, 106.6297
 
-# ====== Telegram tokens ======
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")      # có thể là số hoặc để trống
+# ===== Scheduler / Runtime knobs =====
+TIDE_WINDOW_HOURS     = _as_float("TIDE_WINDOW_HOURS", "2.5")
+SCHEDULER_TICK_SEC    = _as_int("SCHEDULER_TICK_SEC", "2")
+MAX_ORDERS_PER_DAY    = _as_int("MAX_ORDERS_PER_DAY", "8")
+MAX_ORDERS_PER_TIDE_WINDOW = _as_int("MAX_ORDERS_PER_TIDE_WINDOW", "2")
+M5_MAX_DELAY_SEC      = _as_int("M5_MAX_DELAY_SEC", "60")
 
-# Bot/Channel phát kèo (EXECUTE-only)
-TELEGRAM_BROADCAST_BOT_TOKEN = os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN", "")
-TELEGRAM_BROADCAST_CHAT_ID = os.getenv("TELEGRAM_BROADCAST_CHAT_ID", "")
+# ===== Debug flags =====
+AUTO_DEBUG                = _env_bool("AUTO_DEBUG", "true")
+AUTO_DEBUG_VERBOSE        = _env_bool("AUTO_DEBUG_VERBOSE", "false")
+AUTO_DEBUG_ONLY_WHEN_SKIP = _env_bool("AUTO_DEBUG_ONLY_WHEN_SKIP", "false")
 
-# ====== Moon / Tide / Geo / Weather ======
-LAT = float(os.getenv("LAT", "32.7503"))
-LON = float(os.getenv("LON", "129.8777"))
-
-# <== các biến khiến ImportError ở moon_tide.py
-WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY", "")
-WORLDTIDES_KEY = os.getenv("WORLDTIDES_KEY", "")
-
-# ====== Webhook (nếu dùng) ======
-USE_WEBHOOK = _bool(os.getenv("USE_WEBHOOK"), False)
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")
-
-# ====== Debug flags ======
-AUTO_DEBUG = _bool(os.getenv("AUTO_DEBUG"), False)
-AUTO_DEBUG_VERBOSE = _bool(os.getenv("AUTO_DEBUG_VERBOSE"), False)
-AUTO_DEBUG_ONLY_WHEN_SKIP = _bool(os.getenv("AUTO_DEBUG_ONLY_WHEN_SKIP"), False)
-
-# ====== MULTI-ACCOUNT ======
-# Nhận JSON 1 dòng trên Render hoặc nhiều dòng (nếu .env local bọc bằng nháy đơn)
+# ===== Multi-account (Phase2) =====
+# ACCOUNTS_JSON: 1 dòng JSON dạng list các account bổ sung (BingX/OKX...)
+# Ví dụ 1 dòng cho BingX (thay vào .env):
+# ACCOUNTS_JSON=[{"name":"bingx_test","exchange":"bingx","api_key":"<BINGX_KEY>","api_secret":"<BINGX_SECRET>","testnet":false,"pair":"BTC/USDT:USDT"}]
 ACCOUNTS_JSON = (os.getenv("ACCOUNTS_JSON", "") or "").strip()
 ACCOUNTS: list[dict] = []
 if ACCOUNTS_JSON:
@@ -82,14 +81,25 @@ if ACCOUNTS_JSON:
     except Exception:
         ACCOUNTS = []
 
-# ====== Fallback single account (giữ tương thích cũ) ======
+# Fallback Single Binance account (y như bản cũ)
 SINGLE_ACCOUNT = {
     "name": "default",
-    "exchange": EXCHANGE_ID,
+    "exchange": EXCHANGE_ID,          # "binanceusdm"
     "api_key": API_KEY,
     "api_secret": API_SECRET,
     "testnet": TESTNET,
-    "pair": PAIR,
-    "risk_percent": float(os.getenv("RISK_PERCENT", "20")),
-    "leverage": int(os.getenv("LEVERAGE", "44")),
+    "pair": PAIR,                     # giữ "BTC/USDT" cho Binance
+    # risk/leverage mặc định; runtime /settings sẽ ghi đè khi execute
+    "risk_percent": RISK_PERCENT_DEFAULT,
+    "leverage": LEVERAGE_DEFAULT,
 }
+
+# (auto_trade_engine sẽ import cả ACCOUNTS và SINGLE_ACCOUNT và tự merge)
+# Không cần cờ bật/tắt đa sàn: nếu ACCOUNTS trống ⇒ chỉ chạy SINGLE_ACCOUNT (Binance như cũ);
+# nếu ACCOUNTS có (ví dụ BingX) ⇒ chạy cả 2.
+
+# ===== Compatibility exports =====
+EXCHANGE = EXCHANGE_ID
+DEFAULT_PAIR = PAIR
+DEFAULT_PRESET_MODE = PRESET_MODE
+# ----------------------- /config/settings.py -----------------------
