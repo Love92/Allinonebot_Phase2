@@ -542,7 +542,7 @@ def evaluate_signal(symbol: str = "BTCUSDT", tide_window_hours: float = TIDE_WIN
         sonic_h4  = _sonic_trend(h4_now)
         sonic_m30 = _sonic_trend(m30_now)
 
-        # 2) Directional scoring per TF (truyền thêm series RSI để xét cross gần đây)
+        # 2) Directional scoring per TF
         sc_h4, side_h4, dbg_h4 = score_tf_directional_v2(
             "H4",
             h4_prev["RSI_14"], h4_now["RSI_14"], h4_now["EMA_RSI_12"],
@@ -560,7 +560,7 @@ def evaluate_signal(symbol: str = "BTCUSDT", tide_window_hours: float = TIDE_WIN
             sonic_mode=_sonic_mode(), sonic_weight=_sonic_weight()
         )
 
-        # 3) Sonic veto (nếu bật) chặn ngược xu hướng lớn theo H4
+        # 3) Sonic veto (nếu bật)
         signal = "NONE"; skip = True
         if _sonic_mode() == "veto":
             if side_h4 == "LONG" and sonic_h4 == "down":
@@ -575,7 +575,7 @@ def evaluate_signal(symbol: str = "BTCUSDT", tide_window_hours: float = TIDE_WIN
         # 5) Optional synergy bonus
         syn = _synergy_bonus(dbg_h4, dbg_m30)
 
-        # 6) Total & decide desired side (giữ khung cũ)
+        # 6) Total & decide desired side
         total_raw = sc_h4 + sc_m30 + moon_bonus + syn
 
         desired = None
@@ -593,18 +593,42 @@ def evaluate_signal(symbol: str = "BTCUSDT", tide_window_hours: float = TIDE_WIN
         signal = desired if desired in ("LONG","SHORT") else "NONE"
         skip = (signal == "NONE")
 
+        # ===== NEW: Extreme guard (block theo yêu cầu) =====
+        guard_note = ""
+        if not skip and signal in ("LONG","SHORT"):
+            if _get_env_bool("EXTREME_BLOCK_ON", True):
+                try:
+                    rsi_ob = float(os.getenv("EXTREME_RSI_OB", "70"))
+                    rsi_os = float(os.getenv("EXTREME_RSI_OS", "30"))
+                    st_ob  = float(os.getenv("EXTREME_STOCH_OB", "80"))
+                    st_os  = float(os.getenv("EXTREME_STOCH_OS", "20"))
+                except Exception:
+                    rsi_ob, rsi_os, st_ob, st_os = 70.0, 30.0, 80.0, 20.0
+
+                # H4 & M30 extremes
+                h4_long_block   = (h4_now["RSI_14"] >= rsi_ob) or (h4_now["Stoch_D"] >= st_ob)
+                h4_short_block  = (h4_now["RSI_14"] <= rsi_os) or (h4_now["Stoch_D"] <= st_os)
+                m30_long_block  = (m30_now["RSI_14"] >= rsi_ob) or (m30_now["Stoch_D"] >= st_ob)
+                m30_short_block = (m30_now["RSI_14"] <= rsi_os) or (m30_now["Stoch_D"] <= st_os)
+
+                if signal == "LONG" and (h4_long_block or m30_long_block):
+                    skip = True
+                    guard_note = "⚠️ Extreme-guard: RSI/Stoch đang <b>quá mua</b> (H4 hoặc M30) → chặn LONG."
+                if signal == "SHORT" and (h4_short_block or m30_short_block):
+                    skip = True
+                    guard_note = "⚠️ Extreme-guard: RSI/Stoch đang <b>quá bán</b> (H4 hoặc M30) → chặn SHORT."
+
         # 7) M5 entry — đồng bộ format với /m5report
         m5_line, m5_meta = m5_entry_summary(symbol, signal if signal in ("LONG","SHORT") else None)
         m5_ok, m5_reason, m5m = m5_entry_check(symbol, signal if signal in ("LONG","SHORT") else None)
         if not m5_ok and not skip and signal in ("LONG","SHORT"):
             skip = True  # HTF ok nhưng M5 chưa đạt → chờ
 
-        # 8) Format khối hiển thị (giữ nguyên khung)
+        # 8) Format hiển thị
         def _fmt_block(tf: str, now: pd.Series, prev: pd.Series, score: float, side: str, dbg: Dict) -> str:
-            rsi_dbg = dbg.get("RSI", {})
-            st_dbg  = dbg.get("STOCH", {})
+            rsi_dbg = dbg.get("RSI", {}); st_dbg = dbg.get("STOCH", {})
             st_map = {True: "Cross: ✔", False: "Cross: —"}
-            st_dir_txt = f"move={st_dbg.get('move','?')}, align={st_dbg.get('align','?')}, slope={st_dbg.get('slope','?')}, {st_map.get(bool(st_dbg.get('cross', False)), 'Cross: —')}"
+            st_dir_txt  = f"move={st_dbg.get('move','?')}, align={st_dbg.get('align','?')}, slope={st_dbg.get('slope','?')}, {st_map.get(bool(st_dbg.get('cross', False)), 'Cross: —')}"
             rsi_dir_txt = f"move={rsi_dbg.get('move','?')}, align={rsi_dbg.get('align','?')}"
             return (
                 f"📈 **{tf}** | Score: {score} | Side: {side}\n"
@@ -643,11 +667,12 @@ def evaluate_signal(symbol: str = "BTCUSDT", tide_window_hours: float = TIDE_WIN
         decision_txt = {"LONG":"✅ LONG bias (chờ M5)","SHORT":"✅ SHORT bias (chờ M5)","NONE":"⏸ Chưa đủ điều kiện — Quan sát"}[signal]
 
         total_disp = round(total_raw, 2)
-
-        # ENV display (giữ nguyên khung)
         sonic_mode_line = f"(SONIC_MODE={_sonic_mode()}, SONIC_WEIGHT={_sonic_weight():.2f})"
         st_env_line = f"(STCH_GAP_MIN={os.getenv('STCH_GAP_MIN','3.0')}, STCH_SLOPE_MIN={os.getenv('STCH_SLOPE_MIN','2.0')}, STCH_RECENT_N={os.getenv('STCH_RECENT_N','3')})"
         htf_env_line = f"(HTF_NEAR_ALIGN={os.getenv('HTF_NEAR_ALIGN','true')}, HTF_MIN_ALIGN_SCORE={os.getenv('HTF_MIN_ALIGN_SCORE','6.5')}, HTF_NEAR_ALIGN_GAP={os.getenv('HTF_NEAR_ALIGN_GAP','2.0')}, SYNERGY_ON={os.getenv('SYNERGY_ON','true')})"
+
+        # Chèn guard_note nếu có
+        guard_line = (guard_note + "\n") if guard_note else ""
 
         text = (
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -663,6 +688,7 @@ def evaluate_signal(symbol: str = "BTCUSDT", tide_window_hours: float = TIDE_WIN
             f"{st_env_line}\n"
             f"{htf_env_line}\n"
             f"{tide_txt}\n"
+            f"{guard_line}"
             f"🧭 Kết luận: {decision_txt}\n"
             "━━━━━━━━━━━━━━━━━━━━━━━"
         )
