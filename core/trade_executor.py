@@ -433,6 +433,33 @@ class ExchangeClient:
         except Exception as e:
             return OrderResult(False, f"Close thất bại: {e}")
 
+    async def close_position_pct(self, symbol: str, pct: float) -> OrderResult:
+        """
+        Đóng theo phần trăm vị thế hiện tại (reduceOnly).
+        """
+        try:
+            pct = max(0.0, min(100.0, float(pct)))
+            if pct == 0.0:
+                return OrderResult(True, "Không có gì để đóng (0%).")
+
+            sym = self.normalize_symbol(symbol)
+            side_long, qty = await self.current_position(sym)
+            if (side_long is None and qty == 0) or qty <= 0:
+                return OrderResult(True, "Không có vị thế mở.")
+
+            close_qty = qty * (pct / 100.0)
+            # làm tròn nhẹ theo LOT_STEP_FALLBACK để tránh lỗi step
+            lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
+            close_qty = max(self._floor_step(close_qty, lot_step), lot_step)
+
+            side = "sell" if side_long else "buy"
+            params = {"reduceOnly": True}
+            order = await self._io(self.client.create_order, sym, "market", side, close_qty, None, params)
+            oid = (order or {}).get("id", "N/A")
+            return OrderResult(True, f"Đã đóng {pct:.1f}% vị thế (orderId={oid})")
+        except Exception as e:
+            return OrderResult(False, f"Close% thất bại: {e}")
+
     async def market_with_sl_tp(self, symbol: str, side_long: bool, qty: float, sl: float, tp: float) -> OrderResult:
         try:
             sym = self.normalize_symbol(symbol)
