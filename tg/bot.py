@@ -33,6 +33,28 @@ from data.moon_tide import resolve_preset_code
 storage = Storage()
 ex = ExchangeClient()
 
+# ==== QUOTA helpers: 2 lệnh / cửa sổ thủy triều, 8 lệnh / ngày (gộp mọi mode) ====
+def _quota_precheck_and_label(st):
+    now = now_vn()
+    twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
+    if not twin:
+        return False, "⏳ Ngoài khung thủy triều.", None, None, 0
+    start, end = twin
+    tide_label = f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
+    tkey = (start + (end - start) / 2).strftime("%Y-%m-%d %H:%M")
+    used = int(st.tide_window_trades.get(tkey, 0))
+    if st.today.count >= st.settings.max_orders_per_day:
+        return False, f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day}).", tide_label, tkey, used
+    if used >= st.settings.max_orders_per_tide_window:
+        return False, f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh.", tide_label, tkey, used
+    return True, "", tide_label, tkey, used
+
+def _quota_commit(st, tkey, used, uid):
+    st.today.count += 1
+    st.tide_window_trades[tkey] = used + 1
+    storage.put_user(uid, st)
+
+
 # ================== Helpers ==================
 def _esc(s: str) -> str:
     return html.escape(s or "", quote=False)
@@ -589,6 +611,13 @@ async def setenv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "STCH_GAP_MIN": "float",
         "STCH_SLOPE_MIN": "float",
         "STCH_RECENT_N": "int",
+		
+		# Extreme guard (block LONG/SHORT ở vùng quá mua/bán H4/M30)
+        "EXTREME_BLOCK_ON": "bool",
+        "EXTREME_RSI_OB": "float",
+        "EXTREME_RSI_OS": "float",
+        "EXTREME_STOCH_OB": "float",
+        "EXTREME_STOCH_OS": "float",
 
         # Near-align & synergy
         "HTF_NEAR_ALIGN": "bool",
@@ -719,6 +748,10 @@ async def setenv_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "STCH_GAP_MIN", "STCH_SLOPE_MIN", "STCH_RECENT_N",
         "HTF_NEAR_ALIGN", "HTF_MIN_ALIGN_SCORE", "HTF_NEAR_ALIGN_GAP",
         "SYNERGY_ON", "M30_TAKEOVER_MIN",
+		
+		# ===== Extreme guard (block LONG/SHORT ở vùng quá mua/bán H4/M30) =====
+		"EXTREME_BLOCK_ON", "EXTREME_RSI_OB", "EXTREME_RSI_OS", "EXTREME_STOCH_OB", "EXTREME_STOCH_OS",
+
 
         # Limits
         "MAX_TRADES_PER_WINDOW", "MAX_CONCURRENT_POS", "M5_MAX_DELAY_SEC", "SCHEDULER_TICK_SEC",
@@ -952,7 +985,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /order <long|short> [qty|auto] [sl] [tp]
     - Đặt lệnh đồng thời: account mặc định (Binance/SINGLE_ACCOUNT) + tất cả account trong ACCOUNTS_JSON.
-    - Khớp lệnh theo futures của từng sàn; văn bản broadcast hiển thị Entry theo BINANCE SPOT.
+    - Khớp lệnh theo futures của từng sàn; broadcast hiển thị Entry theo BINANCE SPOT.
     - Mode label: "Thủ công ORDER".
     """
     import os, json
@@ -994,21 +1027,12 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         leverage     = int(getattr(_S, "LEVERAGE_DEFAULT", 44))
         logic_pair   = DEFAULT_PAIR
 
-    # kiểm soát khung thủy triều như bản cũ
-    now = now_vn()
-    twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
-    if not twin:
-        await msg.reply_text("⏳ Ngoài khung thủy triều — chưa cho phép /order."); return
-    start, end = twin
-    tide_label = f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
-    tkey = (start + (end - start) / 2).strftime("%Y-%m-%d %H:%M")
-    if st.today.count >= st.settings.max_orders_per_day:
-        await msg.reply_text(f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day})."); return
-    used = int(st.tide_window_trades.get(tkey, 0))
-    if used >= st.settings.max_orders_per_tide_window:
-        await msg.reply_text(f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh."); return
+    # QUOTA precheck (tide + daily)
+    ok_quota, why, tide_label, tkey, used = _quota_precheck_and_label(st)
+    if not ok_quota:
+        await msg.reply_text(why); return
 
-    # tập account: SINGLE_ACCOUNT + ACCOUNTS_JSON (lọc trùng)
+    # tập account
     try:
         ACCOUNTS = getattr(_S, "ACCOUNTS", [])
         if not isinstance(ACCOUNTS, list): ACCOUNTS = []
@@ -1021,13 +1045,13 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SINGLE_ACCOUNT = getattr(_S, "SINGLE_ACCOUNT", None)
     base = ([SINGLE_ACCOUNT] if SINGLE_ACCOUNT else []) + ACCOUNTS
 
+    # lọc trùng
     uniq, seen = [], set()
     for acc in base:
         try:
             exid = str(acc.get("exchange","")).lower()
             key  = (exid, acc.get("api_key",""))
-            if key in seen: 
-                continue
+            if key in seen: continue
             seen.add(key)
             if not acc.get("pair"):
                 acc = {**acc, "pair": logic_pair}
@@ -1053,7 +1077,6 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pair   = acc.get("pair") or logic_pair
 
             cli = ExchangeClient(exid, api, secret, testnet)
-
             px  = await cli.ticker_price(pair)
             if not px or px <= 0:
                 results.append(f"• {name} | {exid} | {pair} → ERR: Không lấy được giá futures."); 
@@ -1079,7 +1102,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r = await cli.market_with_sl_tp(pair, side_long, qty, sl_use, tp_use)
             results.append(f"• {name} | {exid} | {pair} → {r.message}")
 
-            # chỉ broadcast khi vào lệnh OK
+            # broadcast khi OK
             if getattr(r, "ok", False):
                 side_label = "LONG" if side_long else "SHORT"
                 btxt = _fmt_exec_broadcast(
@@ -1096,21 +1119,28 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             results.append(f"• {acc.get('name','?')} | ERR: {e}")
 
-    # cập nhật quota 1 lần
-    st.today.count += 1
-    st.tide_window_trades[tkey] = used + 1
-    storage.put_user(uid, st)
+    # QUOTA commit (1 lần)
+    _quota_commit(st, tkey, used, uid)
 
     await msg.reply_text(
         f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
         f"⏱ Tide window: {tide_label}\n" + "\n".join(results)
     )
 
-
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /report
+    - In báo cáo H4→M30 (và daily Moon/Tide).
+    - Nếu MODE=manual: tạo pending (duyệt /approve).
+    - Nếu MODE=auto và có tín hiệu hợp lệ:
+        + KIỂM TRA QUOTA trước khi vào lệnh (2 lệnh/tide, 8 lệnh/ngày): _quota_precheck_and_label(st)
+        + Vào lệnh (single-account hiện tại). Sau khi THỬ vào lệnh xong → _quota_commit(st, tkey, used, uid) 1 lần.
+        + Broadcast “Mode: AUTO” (entry hiển thị dùng Binance SPOT).
+    """
     uid = _uid(update)
     st = storage.get_user(uid)
 
+    # ----------- 1) Báo cáo kỹ thuật + daily ----------
     d = now_vn().date().isoformat()
     daily = format_daily_moon_tide_report(d, float(st.settings.tide_window_hours))
 
@@ -1122,6 +1152,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None, lambda: evaluate_signal(sym, tide_window_hours=float(st.settings.tide_window_hours))
             )
         except TypeError:
+            # fallback version hàm cũ
             res = await loop.run_in_executor(None, lambda: evaluate_signal(sym))
     except Exception as e:
         await update.message.reply_text(_esc(daily) + f"\n\n⚠️ Lỗi /report: {_esc(str(e))}")
@@ -1137,142 +1168,156 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_daily = _esc(daily)
     safe_ta    = _esc(ta_text)
 
+    # In báo cáo trước
+    try:
+        await update.message.reply_text(safe_daily + "\n\n" + safe_ta, parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text(safe_daily + "\n\n" + (res.get("text") or "—"))
+
+    # Không trade nếu bị skip
     if res.get("skip", True):
-        await update.message.reply_text(
-            safe_daily + "\n\n⏸ <b>Ngoài điều kiện trade / chỉ quan sát</b>\n" + safe_ta,
-            parse_mode="HTML"
-        )
         return
 
     side = (res.get("signal") or "NONE").upper()
-    score = int(res.get("confidence", 0))
+    if side not in ("LONG", "SHORT"):
+        return
 
-    if st.settings.mode == "manual":
+    # ----------- 2) Nhánh MANUAL: tạo pending ----------
+    if (st.settings.mode or "manual").lower() == "manual":
+        score = int(res.get("confidence", 0))
         ps = create_pending(storage, uid, st.settings.pair, side, score, entry_hint=None, sl=None, tp=None)
-        safe_block = safe_ta + f"\nID: <code>{ps.id}</code>\nDùng /approve {ps.id} hoặc /reject {ps.id}"
-        await update.message.reply_text(safe_daily + "\n\n" + safe_block, parse_mode="HTML")
-    else:
-        try:
-            late_only = (os.getenv("ENTRY_LATE_ONLY", "false").lower() in ("1","true","yes","on","y"))
-            late_pref = (os.getenv("ENTRY_LATE_PREF", "false").lower() in ("1","true","yes","on","y"))
-            late_from = float(os.getenv("ENTRY_LATE_FROM_HRS", "1.5"))
-            late_to   = float(os.getenv("ENTRY_LATE_TO_HRS", "2.0"))
-
-            now = now_vn()
-            twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
-            if twin:
-                start, end = twin
-                center = start + (end - start) / 2
-                delta_hr = (now - center).total_seconds() / 3600.0
-                in_late = (delta_hr >= late_from and delta_hr <= late_to)
-
-                if late_only and not in_late:
-                    await update.message.reply_text(
-                        safe_daily + "\n\n(AUTO) " + _esc(
-                            f"ENTRY_LATE_ONLY=true → chỉ cho phép vào trong late window "
-                            f"[{(center + timedelta(hours=late_from)).strftime('%H:%M')}–{(center + timedelta(hours=late_to)).strftime('%H:%M')}] "
-                            f"(center={center.strftime('%H:%M')}, now={now.strftime('%H:%M')}).\n"
-                            "⏸ Bỏ qua vào lệnh lần này."
-                        ) + "\n" + safe_ta,
-                        parse_mode="HTML"
-                    )
-                    return
-
-                if (not late_only) and late_pref and (not in_late):
-                    try:
-                        conf = int(res.get("confidence", 0))
-                        if conf < 6:
-                            await update.message.reply_text(
-                                safe_daily + "\n\n(AUTO) " + _esc("ENTRY_LATE_PREF=true và ngoài late window → bỏ qua vì điểm chưa đủ mạnh.") + "\n" + safe_ta,
-                                parse_mode="HTML"
-                            )
-                            return
-                    except Exception:
-                        pass
-        except Exception as _e_enforce:
-            print(f"[AUTO][WARN] Late-window check error: {_e_enforce}")
-
-        try:
-            from data.market_data import get_klines
-            dfp = get_klines(symbol=st.settings.pair.replace("/",""), interval="5m", limit=2)
-            if dfp is None or len(dfp) == 0:
-                await update.message.reply_text(safe_daily + "\n\n(AUTO) " + _esc("Không lấy được giá hiện tại.") + "\n" + safe_ta, parse_mode="HTML")
-                return
-            close = float(dfp.iloc[-1]["close"])
-        except Exception as e:
-            await update.message.reply_text(safe_daily + f"\n\n(AUTO) Lỗi lấy giá: {_esc(str(e))}\n" + safe_ta, parse_mode="HTML")
-            return
-
-        try:
-            bal = await ex.balance_usdt()
-            qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, close)
-            await ex.set_leverage(st.settings.pair, st.settings.leverage)
-        except Exception as e:
-            await update.message.reply_text(safe_daily + f"\n\n(AUTO) Lỗi khối lượng/leverage: {_esc(str(e))}\n" + safe_ta, parse_mode="HTML")
-            return
-
-        side_long = (side == "LONG")
-        try:
-            sl_price, tp_price = auto_sl_by_leverage(close, side_long, st.settings.leverage)
-        except Exception:
-            if side_long:
-                sl_price, tp_price = close * 0.99, close * 1.02
-            else:
-                sl_price, tp_price = close * 1.01, close * 0.98
-
-        try:
-            res_exe = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl_price, tp_price)
-        except Exception as e:
-            await update.message.reply_text(safe_daily + f"\n\n(AUTO) Lỗi khớp lệnh: {_esc(str(e))}\n" + safe_ta, parse_mode="HTML")
-            return
-
-        st.today.count += 1
-        st.history.append({
-            "id": f"AUTO-{datetime.now().strftime('%H%M%S')}",
-            "side": side, "qty": qty, "entry": close,
-            "sl": sl_price, "tp": tp_price,
-            "ok": getattr(res_exe, "ok", True), "msg": getattr(res_exe, "message", "")
-        })
-        storage.put_user(uid, st)
-
-        enter_line = (
-            f"🔧 Executed: {st.settings.pair} {'LONG' if side_long else 'SHORT'} "
-            f"qty={qty:.6f} @~{close:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}\n"
-            f"↳ {getattr(res_exe, 'message', '')}"
+        block = (
+            safe_ta
+            + f"\nID: <code>{ps.id}</code>\nDùng /approve {ps.id} hoặc /reject {ps.id}"
         )
-		# broadcast “Mode: AUTO” — Entry hiển thị lấy từ Spot
+        await update.message.reply_text(safe_daily + "\n\n" + block, parse_mode="HTML")
+        return
+
+    # ----------- 3) Nhánh AUTO: quota + timing + vào lệnh ----------
+    # 3.1 QUOTA PRECHECK (mục 2.7)
+    ok_quota, why, tide_label, tkey, used = _quota_precheck_and_label(st)
+    if not ok_quota:
         try:
-           side_label = "LONG" if side_long else "SHORT"
-           tide_label = None
-           try:
-              twin2 = tide_window_now(now_vn(), hours=float(st.settings.tide_window_hours))
-              if twin2:
-                  ts, te = twin2
-                  tide_label = f"{ts.strftime('%H:%M')}–{te.strftime('%H:%M')}"
-           except Exception:
-              pass
-           entry_spot = _binance_spot_entry(st.settings.pair)
-           btxt = _fmt_exec_broadcast(
-               pair=st.settings.pair.replace(":USDT",""),
-               side=side_label,
-               acc_name="default",
-               ex_id=getattr(ex, "exchange_id", "binanceusdm"),
-               lev=st.settings.leverage,
-               risk=st.settings.risk_percent,
-               qty=qty,
-               entry_spot=(entry_spot or close),
-               sl=sl_price, tp=tp_price,
-               tide_label=tide_label,
-               mode_label="AUTO",
-           )
-           await _broadcast_html(btxt)
+            await update.message.reply_text("(AUTO) " + why)
         except Exception:
             pass
+        return
 
-        await update.message.reply_text(
-            safe_daily + "\n\n(AUTO)\n" + safe_ta + "\n" + _esc(enter_line),
-            parse_mode="HTML"
-        )
+    # 3.2 Ràng buộc "late window" (nếu bật)
+    try:
+        late_only = (os.getenv("ENTRY_LATE_ONLY", "false").lower() in ("1","true","yes","on","y"))
+        late_pref = (os.getenv("ENTRY_LATE_PREF", "false").lower() in ("1","true","yes","on","y"))
+        late_from = float(os.getenv("ENTRY_LATE_FROM_HRS", "1.5"))
+        late_to   = float(os.getenv("ENTRY_LATE_TO_HRS", "2.0"))
+
+        now = now_vn()
+        twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
+        if twin:
+            start, end = twin
+            center = start + (end - start) / 2
+            delta_hr = (now - center).total_seconds() / 3600.0
+            in_late = (delta_hr >= late_from and delta_hr <= late_to)
+
+            if late_only and not in_late:
+                await update.message.reply_text(
+                    "(AUTO) "
+                    + _esc(
+                        f"ENTRY_LATE_ONLY=true → chỉ cho phép vào trong late window "
+                        f"[{(center + timedelta(hours=late_from)).strftime('%H:%M')}–{(center + timedelta(hours=late_to)).strftime('%H:%M')}] "
+                        f"(center={center.strftime('%H:%M')}, now={now.strftime('%H:%M')}).\n"
+                        "⏸ Bỏ qua vào lệnh lần này."
+                    )
+                )
+                return
+
+            if (not late_only) and late_pref and (not in_late):
+                conf = int(res.get("confidence", 0))
+                if conf < 6:
+                    await update.message.reply_text(
+                        "(AUTO) " + _esc("ENTRY_LATE_PREF=true và ngoài late window → bỏ qua vì điểm chưa đủ mạnh.")
+                    )
+                    return
+    except Exception as _e_enforce:
+        print(f"[AUTO][WARN] Late-window check error: {_e_enforce}")
+
+    # 3.3 Lấy giá SPOT (để hiển thị broadcast) + giá futures (để khớp lệnh)
+    try:
+        from data.market_data import get_klines
+        dfp = get_klines(symbol=st.settings.pair.replace("/", ""), interval="5m", limit=2)
+        if dfp is None or len(dfp) == 0:
+            await update.message.reply_text("(AUTO) Không lấy được giá hiện tại.")
+            return
+        close = float(dfp.iloc[-1]["close"])
+    except Exception as e:
+        await update.message.reply_text(f"(AUTO) Lỗi lấy giá: {_esc(str(e))}")
+        return
+
+    # 3.4 Tính size + leverage
+    try:
+        bal = await ex.balance_usdt()
+        qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, close)
+        await ex.set_leverage(st.settings.pair, st.settings.leverage)
+    except Exception as e:
+        await update.message.reply_text(f"(AUTO) Lỗi khối lượng/leverage: {_esc(str(e))}")
+        return
+
+    side_long = (side == "LONG")
+    try:
+        sl_price, tp_price = auto_sl_by_leverage(close, "LONG" if side_long else "SHORT", st.settings.leverage)
+    except Exception:
+        if side_long:
+            sl_price, tp_price = close * 0.99, close * 1.02
+        else:
+            sl_price, tp_price = close * 1.01, close * 0.98
+
+    # 3.5 Thử khớp lệnh (single-account hiện tại)
+    try:
+        res_exe = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl_price, tp_price)
+    except Exception as e:
+        res_exe = OrderResult(False, f"Order failed: {e}")  # fallback để vẫn commit quota
+
+    # 3.6 Lưu lịch sử (không cộng quota ở đây)
+    st.history.append({
+        "id": f"AUTO-{datetime.now().strftime('%H%M%S')}",
+        "side": side, "qty": qty, "entry": close,
+        "sl": sl_price, "tp": tp_price,
+        "ok": getattr(res_exe, "ok", True), "msg": getattr(res_exe, "message", "")
+    })
+    storage.put_user(uid, st)
+
+    # 3.7 Broadcast “Mode: AUTO” (hiển thị entry từ Binance SPOT), nếu lệnh OK
+    try:
+        if getattr(res_exe, "ok", False):
+            entry_spot = _binance_spot_entry(st.settings.pair)
+            btxt = _fmt_exec_broadcast(
+                pair=st.settings.pair.replace(":USDT",""),
+                side=("LONG" if side_long else "SHORT"),
+                acc_name="default",
+                ex_id=getattr(ex, "exchange_id", "binanceusdm"),
+                lev=st.settings.leverage,
+                risk=st.settings.risk_percent,
+                qty=qty,
+                entry_spot=(entry_spot or close),
+                sl=sl_price, tp=tp_price,
+                tide_label=tide_label,  # lấy từ quota-precheck
+                mode_label="AUTO",
+            )
+            await _broadcast_html(btxt)
+    except Exception:
+        pass
+
+    # 3.8 QUOTA COMMIT (mục 2.7) — chỉ +1 lần cho cả phiên AUTO này
+    _quota_commit(st, tkey, used, uid)
+
+    # 3.9 Phản hồi kết quả
+    enter_line = (
+        f"🔧 Executed: {st.settings.pair} {'LONG' if side_long else 'SHORT'} "
+        f"qty={qty:.6f} @~{close:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}\n"
+        f"↳ {getattr(res_exe, 'message', '')}"
+    )
+    await update.message.reply_text("(AUTO)\n" + enter_line)
+
+
 
 async def m5report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
@@ -1380,13 +1425,14 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     side_long = (side == "LONG")
     pair = st.settings.pair or getattr(_S, "PAIR", "BTC/USDT")
 
+    # QUOTA precheck
+    ok_quota, why, tide_label, tkey, used = _quota_precheck_and_label(st)
+    if not ok_quota:
+        await msg.reply_text(why); return
+
     # user settings
     risk_percent = float(st.settings.risk_percent)
     leverage     = int(st.settings.leverage)
-
-    # tide label (chỉ để hiển thị, không chặn)
-    twin = tide_window_now(now_vn(), hours=float(st.settings.tide_window_hours))
-    tide_label = f"{twin[0].strftime('%H:%M')}–{twin[1].strftime('%H:%M')}" if twin else None
 
     # SPOT entry for display
     entry_spot = _binance_spot_entry(pair)
@@ -1451,10 +1497,9 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             results.append(f"• {acc.get('name','?')} | ERR: {e}")
 
-    # clear pending & tăng quota ngày (1 lần)
-    st.today.count += 1
+    # clear pending & QUOTA commit (1 lần)
     st.pending = None
-    storage.put_user(uid, st)
+    _quota_commit(st, tkey, used, uid)
 
     await msg.reply_text(f"✅ Đã APPROVE #{pend_id} — {pair} {side}\n" + "\n".join(results))
 
@@ -1687,9 +1732,14 @@ async def _apply_auto_preset_now(app=None, silent: bool = True):
     ok = _apply_preset_code_runtime(pcode)
     if (not silent) and app:
         try:
-            chat_id = int(os.getenv("AUTO_DEBUG_CHAT_ID") or TELEGRAM_CHAT_ID) if (os.getenv("AUTO_DEBUG_CHAT_ID") or "").isdigit() else TELEGRAM_CHAT_ID
+            # Ưu tiên AUTO_DEBUG_CHAT_ID nếu là số; fallback dùng TELEGRAM_BROADCAST_CHAT_ID
+            raw = os.getenv("AUTO_DEBUG_CHAT_ID", "")
+            if raw.isdigit():
+                chat_id = int(raw)
+            else:
+                chat_id = int(TELEGRAM_BROADCAST_CHAT_ID) if str(TELEGRAM_BROADCAST_CHAT_ID).lstrip("-").isdigit() else None
         except Exception:
-            chat_id = TELEGRAM_CHAT_ID
+            chat_id = None
         if chat_id:
             txt = (
                 "🌕 Auto preset: "
@@ -1700,6 +1750,7 @@ async def _apply_auto_preset_now(app=None, silent: bool = True):
                 await app.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
             except Exception:
                 pass
+
 
 async def _auto_preset_daemon(app: Application):
     """Mỗi ngày 00:05 JST: nếu PRESET_MODE=AUTO thì tự đổi preset theo Moon mới."""
@@ -1713,5 +1764,4 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-
 
