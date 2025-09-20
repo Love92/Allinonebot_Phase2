@@ -30,7 +30,6 @@ TELEGRAM_BROADCAST_BOT_TOKEN  = os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN", "").st
 TELEGRAM_BROADCAST_CHAT_ID    = os.getenv("TELEGRAM_BROADCAST_CHAT_ID", "").strip()
 
 # ===== Modes / Defaults =====
-# (giữ compatibility với bản cũ)
 MODE           = os.getenv("MODE", "manual").strip().lower()   # manual | auto
 DEFAULT_MODE   = os.getenv("DEFAULT_MODE", MODE)
 PAIR           = os.getenv("PAIR", "BTC/USDT").strip().upper()
@@ -68,8 +67,8 @@ AUTO_DEBUG_VERBOSE        = _env_bool("AUTO_DEBUG_VERBOSE", "false")
 AUTO_DEBUG_ONLY_WHEN_SKIP = _env_bool("AUTO_DEBUG_ONLY_WHEN_SKIP", "false")
 
 # ===== Multi-account (Phase2) =====
-# ACCOUNTS_JSON: 1 dòng JSON dạng list các account bổ sung (BingX/OKX...)
-# Ví dụ 1 dòng cho BingX (thay vào .env):
+# ACCOUNTS_JSON: 1 dòng JSON list các account bổ sung (BingX/OKX...)
+# Ví dụ 1 dòng cho BingX (đặt trong .env):
 # ACCOUNTS_JSON=[{"name":"bingx_test","exchange":"bingx","api_key":"<BINGX_KEY>","api_secret":"<BINGX_SECRET>","testnet":false,"pair":"BTC/USDT:USDT"}]
 ACCOUNTS_JSON = (os.getenv("ACCOUNTS_JSON", "") or "").strip()
 ACCOUNTS: list[dict] = []
@@ -93,10 +92,6 @@ SINGLE_ACCOUNT = {
     "risk_percent": RISK_PERCENT_DEFAULT,
     "leverage": LEVERAGE_DEFAULT,
 }
-
-# (auto_trade_engine sẽ import cả ACCOUNTS và SINGLE_ACCOUNT và tự merge)
-# Không cần cờ bật/tắt đa sàn: nếu ACCOUNTS trống ⇒ chỉ chạy SINGLE_ACCOUNT (Binance như cũ);
-# nếu ACCOUNTS có (ví dụ BingX) ⇒ chạy cả 2.
 
 # ===== Compatibility exports =====
 EXCHANGE = EXCHANGE_ID
