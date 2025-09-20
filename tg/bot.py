@@ -889,93 +889,169 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(head + "\n" + pos)
 
 async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = _uid(update)
-    st = storage.get_user(uid)
+    """
+    /order <long|short> [qty|auto] [sl] [tp]
+    - Luôn đặt lệnh trên account mặc định (Binance) + tất cả account trong ACCOUNTS_JSON (ví dụ BingX).
+      => Đáp ứng yêu cầu: 1 lệnh /order chạy đồng thời cả Binance và BingX.
+    - Nếu không truyền qty -> auto size theo risk/leverage hiện tại (/settings), fallback ENV default.
+    """
+    import os, json
+    from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
+    from config import settings as _S
 
-    if not context.args or context.args[0].lower() not in ("long", "short"):
-        await update.message.reply_text("Cú pháp: /order <long|short> [entry] [tp] [sl]\nVD: /order long 64850"); return
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
 
-    side_long = (context.args[0].lower() == "long")
+    # ---- parse args ----
+    if not context.args:
+        await msg.reply_text("Dùng: /order <long|short> [qty|auto] [sl] [tp]\nVD: /order long auto")
+        return
 
+    side_raw = (context.args[0] or "").strip().lower()
+    if side_raw not in ("long","short"):
+        await msg.reply_text("Side phải là long|short. VD: /order short auto")
+        return
+    side_long = (side_raw == "long")
+
+    qty_arg = None; sl_arg = None; tp_arg = None
+    if len(context.args) >= 2 and context.args[1].strip().lower() != "auto":
+        try:
+            qty_arg = float(context.args[1])
+        except Exception:
+            qty_arg = None
+    if len(context.args) >= 3:
+        try: sl_arg = float(context.args[2])
+        except Exception: sl_arg = None
+    if len(context.args) >= 4:
+        try: tp_arg = float(context.args[3])
+        except Exception: tp_arg = None
+
+    # ---- lấy user settings + default ----
+    DEFAULT_PAIR = getattr(_S, "PAIR", "BTC/USDT")
+    try:
+        st = storage.get_user(uid)
+        risk_percent = float(st.settings.risk_percent)
+        leverage     = int(st.settings.leverage)
+        logic_pair   = st.settings.pair or DEFAULT_PAIR
+    except Exception:
+        risk_percent = float(getattr(_S, "RISK_PERCENT_DEFAULT", 20))
+        leverage     = int(getattr(_S, "LEVERAGE_DEFAULT", 44))
+        logic_pair   = DEFAULT_PAIR
+
+    # ---- bắt buộc trong khung thủy triều (giữ như bản cũ) ----
     now = now_vn()
     twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
     if not twin:
-        await update.message.reply_text("⏳ Ngoài khung thủy triều — chưa cho phép /order.")
+        await msg.reply_text("⏳ Ngoài khung thủy triều — chưa cho phép /order.")
         return
     start, end = twin
     tkey = (start + (end - start) / 2).strftime("%Y-%m-%d %H:%M")
-
     if st.today.count >= st.settings.max_orders_per_day:
-        await update.message.reply_text(f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day})."); return
+        await msg.reply_text(f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day})."); return
     used = int(st.tide_window_trades.get(tkey, 0))
     if used >= st.settings.max_orders_per_tide_window:
-        await update.message.reply_text(f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh."); return
+        await msg.reply_text(f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh."); return
 
-    if len(context.args) >= 2:
-        try: entry = float(context.args[1])
-        except Exception:
-            await update.message.reply_text("Entry không hợp lệ."); return
-    else:
+    # ---- build danh sách account: [SINGLE_ACCOUNT] + ACCOUNTS_JSON ----
+    SINGLE_ACCOUNT = getattr(_S, "SINGLE_ACCOUNT", None)
+    try:
+        ACCOUNTS = getattr(_S, "ACCOUNTS", [])
+        if not isinstance(ACCOUNTS, list): ACCOUNTS = []
+    except Exception:
         try:
-            from data.market_data import get_klines
-            dfp = get_klines(symbol=st.settings.pair.replace("/",""), interval="5m", limit=2)
-            if dfp is None or len(dfp) == 0:
-                await update.message.reply_text("Không lấy được giá hiện tại."); return
-            entry = float(dfp.iloc[-1]["close"])
-        except Exception as e:
-            await update.message.reply_text(f"Lỗi lấy giá: {e}"); return
-
-    tp = sl = None
-    if len(context.args) >= 3:
-        try: tp = float(context.args[2])
-        except: tp = None
-    if len(context.args) >= 4:
-        try: sl = float(context.args[3])
-        except: sl = None
-
-    if tp is None or sl is None:
-        try:
-            base_sl, base_tp = auto_sl_by_leverage(entry, "LONG" if side_long else "SHORT", st.settings.leverage)
+            ACCOUNTS = json.loads(os.getenv("ACCOUNTS_JSON","[]"))
+            if not isinstance(ACCOUNTS, list): ACCOUNTS = []
         except Exception:
-            if side_long:
-                base_sl, base_tp = entry * 0.99, entry * 1.02
+            ACCOUNTS = []
+    base = ([SINGLE_ACCOUNT] if SINGLE_ACCOUNT else []) + ACCOUNTS
+
+    # lọc trùng theo (exchange, api_key)
+    uniq, seen = [], set()
+    for acc in base:
+        try:
+            ex = str(acc.get("exchange","")).lower()
+            key = (ex, acc.get("api_key",""))
+            if key not in seen:
+                seen.add(key)
+                if not acc.get("pair"):
+                    acc = {**acc, "pair": logic_pair}
+                uniq.append(acc)
+        except Exception:
+            continue
+
+    if not uniq:
+        await msg.reply_text("Không có account nào để đặt lệnh. Kiểm tra API_KEY/API_SECRET hoặc ACCOUNTS_JSON.")
+        return
+
+    # ---- chạy lệnh theo từng account ----
+    results = []
+    for acc in uniq:
+        try:
+            ex_id   = str(acc.get("exchange") or "").lower()
+            api     = acc.get("api_key") or ""
+            secret  = acc.get("api_secret") or ""
+            testnet = bool(acc.get("testnet", False))
+            acc_pair= acc.get("pair") or logic_pair
+
+            client = ExchangeClient(exchange_id=ex_id, api_key=api, api_secret=secret, testnet=testnet)
+
+            # giá/khối lượng riêng từng sàn
+            px  = await client.ticker_price(acc_pair)
+            if (not px) or px <= 0:
+                try:
+                    from data.market_data import get_klines
+                    dfp = get_klines(symbol=acc_pair.replace("/","").replace(":USDT",""), interval="5m", limit=2)
+                    if dfp is not None and len(dfp)>0:
+                        px = float(dfp.iloc[-1]["close"])
+                except Exception:
+                    pass
+            if (not px) or px <= 0:
+                results.append(f"• {acc.get('name','?')} | {ex_id} | {acc_pair} → ERR: Không lấy được giá.")
+                continue
+
+            bal = await client.balance_usdt()
+            if qty_arg and qty_arg > 0:
+                qty = float(qty_arg)
             else:
-                base_sl, base_tp = entry * 1.01, entry * 0.98
-        if tp is None:
-            tp = entry + (base_tp - entry) * 0.5
-        if sl is None:
-            sl = entry - (entry - base_sl) * 0.5 if side_long else entry + (base_sl - entry) * 0.5
+                qty = calc_qty(
+                    balance_usdt=bal,
+                    risk_percent=risk_percent,
+                    leverage=leverage,
+                    entry_price=px,
+                    lot_step=float(os.getenv("LOT_STEP_FALLBACK","0.001"))
+                )
 
-    try:
-        bal = await ex.balance_usdt()
-        qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, entry)
-        await ex.set_leverage(st.settings.pair, st.settings.leverage)
-    except Exception as e:
-        await update.message.reply_text(f"Lỗi tính khối lượng/đặt leverage: {e}"); return
+            # SL/TP: nhập tay hoặc auto theo leverage
+            if sl_arg is None or tp_arg is None:
+                sl_auto, tp_auto = auto_sl_by_leverage(px, "LONG" if side_long else "SHORT", leverage)
+                sl_use = sl_arg if sl_arg is not None else sl_auto
+                tp_use = tp_arg if tp_arg is not None else tp_auto
+            else:
+                sl_use, tp_use = sl_arg, tp_arg
 
-    try:
-        res_exe = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl, tp)
-    except Exception as e:
-        await update.message.reply_text(f"Lỗi khớp lệnh: {e}"); return
+            # set leverage mỗi sàn, rồi vào lệnh có SL (TP quản theo logic riêng)
+            try:
+                await client.set_leverage(acc_pair, leverage)
+            except Exception:
+                pass
 
+            res = await client.market_with_sl_tp(acc_pair, side_long, qty, sl_use, tp_use)
+            results.append(f"• {acc.get('name','?')} | {ex_id} | {acc_pair} → {res.message}")
+        except Exception as e:
+            results.append(f"• {acc.get('name','?')} | ERR: {e}")
+
+    # ---- cập nhật quota 1 lần (không nhân theo số sàn) ----
     st.today.count += 1
     st.tide_window_trades[tkey] = used + 1
-    st.history.append({
-        "id": f"MANUAL-{datetime.now().strftime('%H%M%S')}",
-        "side": "LONG" if side_long else "SHORT",
-        "qty": qty, "entry": entry, "sl": sl, "tp": tp,
-        "ok": getattr(res_exe, "ok", True), "msg": getattr(res_exe, "message", "")
-    })
     storage.put_user(uid, st)
 
-    await update.message.reply_text(
-        "✅ Đã vào lệnh thủ công trong <b>cửa sổ thủy triều</b> "
-        f"({start.strftime('%H:%M')}–{end.strftime('%H:%M')}):\n"
-        f"{st.settings.pair} {'LONG' if side_long else 'SHORT'} qty={qty:.6f} @~{entry:.2f}\n"
-        f"SL={sl:.2f} | TP={tp:.2f}\n"
-        f"({st.tide_window_trades[tkey]}/{st.settings.max_orders_per_tide_window} lệnh trong cửa sổ hiện tại)",
-        parse_mode="HTML"
+    header = (
+        f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
+        f"⏱ Tide window: {start.strftime('%H:%M')}–{end.strftime('%H:%M')}\n"
+        f"({st.tide_window_trades[tkey]}/{st.settings.max_orders_per_tide_window} lệnh trong cửa sổ hiện tại)"
     )
+    await msg.reply_text(header + "\n" + "\n".join(results))
+
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
@@ -1476,7 +1552,6 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-
 
 
 
