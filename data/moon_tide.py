@@ -1,6 +1,6 @@
 # ----------------------- data/moon_tide.py -----------------------
 from __future__ import annotations
-import json
+import json, math
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple, Optional, Dict, Any
 import requests
@@ -169,13 +169,20 @@ def _nearest_main_anchor(age: float) -> Tuple[str, float]:
             best_key, best_dist = k, d
     return best_key, best_dist
 
-# ==== Age estimation ==============================================
+# ==== Age estimation (cosine-based) ===============================
 def estimate_age(illum: int, date_iso: str) -> float:
     """
-    Ước lượng tuổi trăng theo độ rọi + hướng tăng/giảm so với hôm qua.
-    Waxing: 0..100% → 0..Full; Waning: 100..0% → Full..29.53
+    Ước lượng tuổi trăng từ %illum theo quan hệ cosine (chuẩn vật lý hơn tuyến tính).
+    Xác định waxing/waning bằng cách so với hôm qua (giữ logic cũ).
+      f = illum/100
+      E = arccos(1 - 2f)
+      frac = E / (2π)
+      → waxing: age ≈ frac*T; waning: age ≈ T - frac*T
     """
     i = max(0, min(100, int(illum)))
+    f = i / 100.0
+
+    # xác định waxing/waning theo hôm qua
     try:
         d = datetime.strptime(date_iso, "%Y-%m-%d").date()
         y = (d - timedelta(days=1)).isoformat()
@@ -184,11 +191,19 @@ def estimate_age(illum: int, date_iso: str) -> float:
     except Exception:
         waxing = None
 
+    try:
+        E = math.acos(max(-1.0, min(1.0, 1.0 - 2.0*f)))
+        frac = E / (2.0 * math.pi)
+    except Exception:
+        # fallback tuyến tính hiếm khi lỗi
+        return (i / 100.0) * T_LUNAR
+
     if waxing is True:
-        return (i / 100.0) * ANCHORS["F"]
+        return frac * T_LUNAR
     if waxing is False:
-        return ANCHORS["F"] + (1.0 - i / 100.0) * (T_LUNAR - ANCHORS["F"])
-    return (i / 100.0) * T_LUNAR  # fallback tuyến tính
+        return T_LUNAR - frac * T_LUNAR
+    # nếu không xác định được hướng thì fallback gần đúng
+    return frac * T_LUNAR
 
 # ==== Mapping: preset & micro =====================================
 def map_preset(illum: int, waxing: Optional[bool]) -> Tuple[str, Dict[str, Any]]:
@@ -274,11 +289,15 @@ def moon_context_v2(phase: str, illum: int, date_iso: str) -> Dict[str, Any]:
 
 def next_anchor_dates(date_iso: str) -> Dict[str, str]:
     """
-    Ước lượng ngày JST cho 4 mốc sắp tới (🌑/🌓/🌕/🌗) dựa trên tuổi trăng xấp xỉ.
+    Ước lượng ngày JST cho 4 mốc sắp tới (🌑/🌓/🌕/🌗) dựa trên tuổi trăng cosine-based.
+    Dùng mốc 12:00 JST để hạn chế “rụng” về cùng ngày khi còn <24h tới mốc.
     """
     _, illum = get_moon_phase(date_iso)
     age = estimate_age(int(illum), date_iso)
-    base_dt = TOKYO_TZ.localize(datetime.strptime(date_iso, "%Y-%m-%d"))
+
+    # mốc 12:00 JST thay vì 00:00
+    base_dt = TOKYO_TZ.localize(datetime.strptime(date_iso, "%Y-%m-%d")) + timedelta(hours=12)
+
     out: Dict[str, str] = {}
     for k in MAIN_ANCHORS:
         A = ANCHORS[k]
