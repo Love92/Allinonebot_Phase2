@@ -195,6 +195,13 @@ PRESETS = {
         # NEW — guard lật hướng M30 quanh mốc thủy triều
         "M30_FLIP_GUARD": True,
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+		# Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 75.0,
+        "EXTREME_RSI_OS": 25.0,
+        "EXTREME_STOCH_OB": 85.0,
+        "EXTREME_STOCH_OS": 15.0,
+
 
         # M5 gate (giữ logic mặc định, có thể vặn thêm bằng /setenv khi cần)
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
@@ -229,6 +236,12 @@ PRESETS = {
         # NEW — guard lật hướng M30 quanh mốc thủy triều
         "M30_FLIP_GUARD": True,
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center    
+	    # Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 75.0,
+        "EXTREME_RSI_OS": 25.0,
+        "EXTREME_STOCH_OB": 85.0,
+        "EXTREME_STOCH_OS": 15.0,
 
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
         "M5_WICK_PCT": 0.50,
@@ -262,6 +275,12 @@ PRESETS = {
         # NEW — guard lật hướng M30 quanh mốc thủy triều
         "M30_FLIP_GUARD": True,
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+		# Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 75.0,
+        "EXTREME_RSI_OS": 25.0,
+        "EXTREME_STOCH_OB": 85.0,
+        "EXTREME_STOCH_OS": 15.0,
 
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
         "M5_WICK_PCT": 0.50,
@@ -294,6 +313,12 @@ PRESETS = {
         # NEW — guard lật hướng M30 quanh mốc thủy triều
         "M30_FLIP_GUARD": True,
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+		# Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 75.0,
+        "EXTREME_RSI_OS": 25.0,
+        "EXTREME_STOCH_OB": 85.0,
+        "EXTREME_STOCH_OS": 15.0,
 
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
         "M5_WICK_PCT": 0.50,
@@ -423,6 +448,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
         f"<code>/setenv M30_STABLE_MIN_SEC 180</code> (hiện: {v('M30_STABLE_MIN_SEC','180')})\n"
+		
+        # ===== Extreme-guard (H4/M30 quá mua/quá bán) =====
+        f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
+        f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
+        f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
+        f"<code>/setenv EXTREME_STOCH_OB 80</code> (hiện: {v('EXTREME_STOCH_OB','80')})\n"
+        f"<code>/setenv EXTREME_STOCH_OS 20</code> (hiện: {v('EXTREME_STOCH_OS','20')})\n\n"
+
 
         "<b>Entry timing (thủy triều) — <i>giá trị hiện tại</i>:</b>\n"
         f"<code>/setenv ENTRY_LATE_ONLY true|false</code> (hiện: {v('ENTRY_LATE_ONLY','false')})\n"
@@ -430,6 +463,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>/setenv ENTRY_LATE_FROM_HRS 1.2</code> (hiện: {v('ENTRY_LATE_FROM_HRS','1.2')})\n"
         f"<code>/setenv ENTRY_LATE_TO_HRS 2.5</code> (hiện: {v('ENTRY_LATE_TO_HRS','2.5')})\n"
         f"<code>/setenv TIDE_WINDOW_HOURS 2.5</code> (hiện: {v('TIDE_WINDOW_HOURS','2.5')})\n\n"
+
 
         "<b>M5 gate (logic mới A/B + strict tuần tự):</b>\n"
         "• <b>A (Candle+Volume+zone cực trị)</b>: wick≥<code>M5_WICK_PCT</code> & volume≥(<code>M5_VOL_MULT_*</code>×MA20) & RSI ở Z1 (long) hoặc Z5 (short).\n"
@@ -1764,4 +1798,3 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-
