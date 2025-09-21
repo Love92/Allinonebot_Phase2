@@ -1,497 +1,531 @@
 # tg/join_gate.py
+# -*- coding: utf-8 -*-
+"""
+Join Gate cho GROUP/CHANNEL VIP:
+- Bridge mọi thao tác quản trị (create invite link, approve/decline) qua token broadcast (@Doghli_bot),
+  dù lệnh được gõ từ "All in one Bot".
+- Quản lý thuê bao (grant/revoke/info, DB JSON bền nếu trỏ /data/vip_members.json).
+- Tự động quét & kick user hết hạn định kỳ.
+- Anti-spam link cho GROUP (xóa link ngoài whitelist, auto-ban nếu spam).
+
+ENV cần:
+  TELEGRAM_BROADCAST_BOT_TOKEN=<token của @Doghli_bot>
+  JOIN_GATE_VIP_GROUP_ID=-100xxxxxxxxxx         # nếu dùng group
+  JOIN_GATE_VIP_CHANNEL_ID=-100yyyyyyyyyy       # nếu dùng channel
+  JOIN_GATE_ADMIN_ALERT_CHAT_ID=<user_id|group_id âm>   # nơi nhận cảnh báo (tùy chọn)
+  JOIN_GATE_ADMIN_IDS=547597578,7404...         # ai được chạy lệnh admin
+
+  JOIN_GATE_ANTISPAM_ON=true|false
+  JOIN_GATE_ALLOW_LINKS=false
+  JOIN_GATE_ALLOWED_LINK_DOMAINS=t.me/yourvip,binance.com
+  JOIN_GATE_LINK_SPAM_MAX=2
+  JOIN_GATE_LINK_SPAM_WINDOW_S=300
+  JOIN_GATE_AUTOBAN_ON=true
+  JOIN_GATE_AUTODELETE_LINKS=true
+
+  JOIN_GATE_DM_TEXT="Chao ban!... (dùng \\n để xuống dòng)"
+  JOIN_GATE_SUBS_DB=/data/vip_members.json
+  JOIN_GATE_DEFAULT_SUBS_DAYS=30
+"""
+
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
-import json
 import time
-import logging
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Set, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
-from telegram import Update, ChatPermissions
+from telegram import (
+    Bot,
+    Update,
+    ChatInviteLink,
+    ChatMember,
+    constants,
+)
 from telegram.ext import (
     Application,
-    ContextTypes,
-    ChatJoinRequestHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
+from telegram.error import TelegramError
 
-log = logging.getLogger(__name__)
+# ----------------- Bridge bot (dùng @Doghli_bot) -----------------
+GATE_TOKEN = os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN") or ""
+gate_bot: Optional[Bot] = Bot(GATE_TOKEN) if GATE_TOKEN else None
 
+VIP_GROUP_ID = int(os.getenv("JOIN_GATE_VIP_GROUP_ID", "0") or 0)
+VIP_CHANNEL_ID = int(os.getenv("JOIN_GATE_VIP_CHANNEL_ID", "0") or 0)
 
-# ============== ENV HELPERS ==============
+ADMIN_ALERT_CHAT_ID_RAW = os.getenv("JOIN_GATE_ADMIN_ALERT_CHAT_ID", "").strip()
+ADMIN_ALERT_CHAT_ID = int(ADMIN_ALERT_CHAT_ID_RAW) if (ADMIN_ALERT_CHAT_ID_RAW and ADMIN_ALERT_CHAT_ID_RAW.lstrip("-").isdigit()) else None
 
-def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
-    v = os.getenv(name, "").strip()
-    try:
-        if v and (v.lstrip("-").isdigit()):
-            return int(v)
-    except Exception:
-        pass
-    return default
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = (os.getenv(name, "") or "").strip().lower()
-    if v in ("1", "true", "yes", "on", "y"): return True
-    if v in ("0", "false", "no", "off", "n"): return False
-    return bool(default)
-
-def _env_csv(name: str) -> List[str]:
-    v = os.getenv(name, "") or ""
-    if not v.strip(): return []
-    return [p.strip().lower() for p in v.split(",") if p.strip()]
-
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name, None)
-    return default if v is None else str(v)
-
-
-# ============== CONFIG (ENV) ==============
-# Chat IDs âm cho group & channel VIP
-VIP_GROUP_ID: Optional[int]   = _env_int("JOIN_GATE_VIP_GROUP_ID", None)
-VIP_CHANNEL_ID: Optional[int] = _env_int("JOIN_GATE_VIP_CHANNEL_ID", None)
-
-# Nơi nhận cảnh báo (group quản trị)
-ADMIN_ALERT_CHAT_ID: Optional[int] = _env_int("JOIN_GATE_ADMIN_ALERT_CHAT_ID", None)
-
-# Admin IDs (được dùng lệnh /approve_*, /decline_*, /vip_link_*, /grant, /revoke, /subinfo, /subs_dump, /subs_reload)
-ADMIN_IDS: Set[int] = set()
-for s in _env_csv("JOIN_GATE_ADMIN_IDS"):
-    if s.lstrip("-").isdigit():
-        ADMIN_IDS.add(int(s))
-
-# Anti-spam cho GROUP
-ANTISPAM_ON: bool = _env_bool("JOIN_GATE_ANTISPAM_ON", True)
-ALLOW_LINKS: bool = _env_bool("JOIN_GATE_ALLOW_LINKS", False)  # nếu False: xoá mọi link không nằm whitelist
-ALLOWED_LINK_DOMAINS: Set[str] = set(_env_csv("JOIN_GATE_ALLOWED_LINK_DOMAINS"))  # ví dụ: "t.me/yourvip,binance.com"
-LINK_SPAM_MAX: int = int(_env_int("JOIN_GATE_LINK_SPAM_MAX", 2) or 2)  # quá số lần trong window thì block
-LINK_SPAM_WINDOW_S: int = int(_env_int("JOIN_GATE_LINK_SPAM_WINDOW_S", 300) or 300)  # 5 phút
-AUTOBAN_ON: bool = _env_bool("JOIN_GATE_AUTOBAN_ON", True)
-AUTO_DELETE_LINKS: bool = _env_bool("JOIN_GATE_AUTODELETE_LINKS", True)
-
-# DM hướng dẫn khi join-request
-DM_TEXT: str = _env_str(
-    "JOIN_GATE_DM_TEXT",
-    "Chào bạn!\n\n"
-    "Để vào VIP, vui lòng **trả lời tin nhắn này** kèm:\n"
-    "• Sàn & UID bạn đã follow (Binance/BingX)\n"
-    "• Ảnh/screenshot xác nhận đã follow\n\n"
-    "Sau khi bạn gửi, admin sẽ duyệt yêu cầu của bạn."
-)
-
-# Subscription (thu phí/giữ hạn)
-SUBS_DB_PATH: str = _env_str("JOIN_GATE_SUBS_DB", "vip_members.json")
-DEFAULT_SUB_DAYS: int = int(_env_int("JOIN_GATE_DEFAULT_SUBS_DAYS", 30) or 30)
-
-
-# ============== RUNTIME STATE ==============
-# Spam buffer: user_id -> list[timestamps] (số lần dính link trong window)
-_LINK_HITS: Dict[int, List[float]] = {}
-
-# Membership DB: user_id -> {"until": "2025-10-01T00:00:00Z", "notes": "...", "granted_by": 123456}
-_MEMBERS: Dict[str, Dict[str, str]] = {}
-
-
-# ============== UTILITIES ==============
-
-LINK_RE = re.compile(r'(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+)', re.IGNORECASE)
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-
-def _load_members():
-    global _MEMBERS
-    try:
-        with open(SUBS_DB_PATH, "r", encoding="utf-8") as f:
-            _MEMBERS = json.load(f)
-            if not isinstance(_MEMBERS, dict):
-                _MEMBERS = {}
-    except Exception:
-        _MEMBERS = {}
-
-def _save_members():
-    try:
-        with open(SUBS_DB_PATH, "w", encoding="utf-8") as f:
-            json.dump(_MEMBERS, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning("save members failed: %s", e)
-
-def _is_admin(uid: int) -> bool:
-    return True if not ADMIN_IDS else (uid in ADMIN_IDS)
-
-def _in_vip_scope(chat_id: int) -> bool:
-    return (VIP_GROUP_ID is not None and chat_id == VIP_GROUP_ID) or (VIP_CHANNEL_ID is not None and chat_id == VIP_CHANNEL_ID)
-
-def _domain_in_whitelist(url: str) -> bool:
-    if not ALLOWED_LINK_DOMAINS:
-        return False
-    u = url.lower()
-    # Cho phép nếu bất kỳ domain trong whitelist là substring
-    return any(dom in u for dom in ALLOWED_LINK_DOMAINS)
-
-async def _alert_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
-    if ADMIN_ALERT_CHAT_ID:
-        try:
-            await context.bot.send_message(ADMIN_ALERT_CHAT_ID, text)
-        except Exception:
-            pass
-
-
-# ============== JOIN REQUEST HANDLERS ==============
-
-async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý join-request cho cả GROUP & CHANNEL đã cấu hình."""
-    req = update.chat_join_request  # type: ignore[attr-defined]
-    if not req:
-        return
-
-    chat_id = req.chat.id
-    if not _in_vip_scope(chat_id):
-        return
-
-    user = req.from_user
-    uid = user.id
-    uname = f"@{user.username}" if user and user.username else (user.full_name if user else str(uid))
-
-    # DM hướng dẫn (nếu user chưa chat trước với bot có thể fail)
-    try:
-        await context.bot.send_message(chat_id=uid, text=DM_TEXT, parse_mode="Markdown")
-    except Exception:
-        pass
-
-    # Báo admin
-    chat_kind = "GROUP" if (VIP_GROUP_ID is not None and chat_id == VIP_GROUP_ID) else "CHANNEL"
-    await _alert_admin(context,
-        f"🔔 Join request vào VIP {chat_kind}\n"
-        f"• User: {uname} (id={uid})\n"
-        f"• Chat: {req.chat.title} (id={chat_id})\n\n"
-        f"Admin dùng:\n"
-        f"/approve_{chat_kind.lower()} {uid}\n"
-        f"/decline_{chat_kind.lower()} {uid}"
-    )
-
-
-# ============== ADMIN COMMANDS — APPROVE / DECLINE ==============
-
-async def _approve_common(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id: Optional[int], label: str):
-    if not _check_admin(update): return
-    if target_chat_id is None:
-        await _safe_reply(update, f"{label}: chưa cấu hình chat id.")
-        return
-    if not context.args:
-        await _safe_reply(update, f"Dùng: /approve_{label.lower()} <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-        await context.bot.approve_chat_join_request(chat_id=target_chat_id, user_id=target)
-        await _safe_reply(update, f"✅ Đã approve user {target} vào {label}.")
-        try:
-            await context.bot.send_message(target, f"✅ Yêu cầu join vào {label} đã được duyệt. Chào mừng!")
-        except Exception:
-            pass
-    except Exception as e:
-        await _safe_reply(update, f"❌ Approve lỗi: {e}")
-
-async def _decline_common(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id: Optional[int], label: str):
-    if not _check_admin(update): return
-    if target_chat_id is None:
-        await _safe_reply(update, f"{label}: chưa cấu hình chat id.")
-        return
-    if not context.args:
-        await _safe_reply(update, f"Dùng: /decline_{label.lower()} <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-        await context.bot.decline_chat_join_request(chat_id=target_chat_id, user_id=target)
-        await _safe_reply(update, f"🚫 Đã từ chối user {target} vào {label}.")
-        try:
-            await context.bot.send_message(target, f"❌ Yêu cầu join vào {label} đã bị từ chối.")
-        except Exception:
-            pass
-    except Exception as e:
-        await _safe_reply(update, f"❌ Decline lỗi: {e}")
-
-async def approve_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _approve_common(update, context, VIP_GROUP_ID, "GROUP")
-
-async def decline_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _decline_common(update, context, VIP_GROUP_ID, "GROUP")
-
-async def approve_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _approve_common(update, context, VIP_CHANNEL_ID, "CHANNEL")
-
-async def decline_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _decline_common(update, context, VIP_CHANNEL_ID, "CHANNEL")
-
-
-# ============== ADMIN COMMANDS — INVITE LINKS ==============
-
-async def _new_link_common(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id: Optional[int], label: str):
-    if not _check_admin(update): return
-    if target_chat_id is None:
-        await _safe_reply(update, f"{label}: chưa cấu hình chat id.")
-        return
-    try:
-        link = await context.bot.create_chat_invite_link(
-            chat_id=target_chat_id,
-            creates_join_request=True,
-            name=f"VIP {label} Join Request Link",
-        )
-        await _safe_reply(update, f"🔗 Link join-request {label} mới:\n{link.invite_link}")
-    except Exception as e:
-        await _safe_reply(update, f"❌ Tạo link lỗi: {e}")
-
-async def vip_link_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _new_link_common(update, context, VIP_GROUP_ID, "GROUP")
-
-async def vip_link_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _new_link_common(update, context, VIP_CHANNEL_ID, "CHANNEL")
-
-
-# ============== ADMIN COMMANDS — SUBS (THU PHÍ/HẠN DÙNG) ==============
-
-def _parse_days(arg: Optional[str]) -> int:
-    if not arg: return DEFAULT_SUB_DAYS
-    try:
-        d = int(arg)
-        return d if d > 0 else DEFAULT_SUB_DAYS
-    except Exception:
-        return DEFAULT_SUB_DAYS
-
-async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /grant <user_id> [days]
-    - Gán hạn dùng (days) vào DB; bot sẽ tự kick khi hết hạn.
-    - Không tự approve join-request (vì join-request phải theo quy trình).
-    """
-    if not _check_admin(update): return
-    if not context.args:
-        await _safe_reply(update, "Dùng: /grant <user_id> [days]")
-        return
-    try:
-        target = int(context.args[0])
-        days = _parse_days(context.args[1] if len(context.args) >= 2 else None)
-        until = _now_utc() + timedelta(days=days)
-        _MEMBERS[str(target)] = {
-            "until": _iso(until),
-            "notes": f"granted {days}d",
-            "granted_by": str(update.effective_user.id if update.effective_user else 0)
-        }
-        _save_members()
-        await _safe_reply(update, f"✅ Đã grant user {target} {days} ngày (tới {until.date().isoformat()}).")
-        try:
-            await context.bot.send_message(target, f"🎟️ Bạn đã được cấp quyền VIP {days} ngày (tới {until.date().isoformat()}).")
-        except Exception:
-            pass
-    except Exception as e:
-        await _safe_reply(update, f"❌ Grant lỗi: {e}")
-
-async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /revoke <user_id>
-    - Xoá khỏi DB và kick khỏi group/channel (nếu đang trong đó).
-    """
-    if not _check_admin(update): return
-    if not context.args:
-        await _safe_reply(update, "Dùng: /revoke <user_id>")
-        return
-    try:
-        target = int(context.args[0])
-        _MEMBERS.pop(str(target), None)
-        _save_members()
-        # Kick nếu có trong group/channel
-        await _kick_everywhere(context, target)
-        await _safe_reply(update, f"🚫 Đã revoke user {target}.")
-    except Exception as e:
-        await _safe_reply(update, f"❌ Revoke lỗi: {e}")
-
-async def subinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /subinfo <user_id>
-    """
-    if not _check_admin(update): return
-    if not context.args:
-        await _safe_reply(update, "Dùng: /subinfo <user_id>")
-        return
-    target = str(context.args[0])
-    info = _MEMBERS.get(target)
-    if not info:
-        await _safe_reply(update, f"ℹ️ User {target} chưa có trong DB.")
-        return
-    await _safe_reply(update, f"User {target}: {json.dumps(info, ensure_ascii=False)}")
-
-async def subs_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xuất DB ra text (cho admin)."""
-    if not _check_admin(update): return
-    await _safe_reply(update, json.dumps(_MEMBERS, ensure_ascii=False, indent=2))
-
-async def subs_reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reload DB từ file (khi sửa file thủ công)."""
-    if not _check_admin(update): return
-    _load_members()
-    await _safe_reply(update, "🔄 Đã reload DB từ file.")
-
-async def _kick_everywhere(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Kick user khỏi group/channel nếu đang ở trong (ban rồi unban để out)."""
-    for cid in [VIP_GROUP_ID, VIP_CHANNEL_ID]:
-        if cid is None: continue
-        try:
-            await context.bot.ban_chat_member(cid, user_id)
-            await context.bot.unban_chat_member(cid, user_id)  # unban để vẫn có thể join lại sau
-        except Exception:
-            pass
-
-async def _subs_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job chạy định kỳ: kick những user hết hạn."""
-    now = _now_utc()
-    expired: List[int] = []
-    for k, v in list(_MEMBERS.items()):
-        try:
-            until = datetime.fromisoformat(v.get("until")).astimezone(timezone.utc)
-            if now >= until:
-                expired.append(int(k))
-        except Exception:
+def _parse_admin_ids() -> set[int]:
+    s = os.getenv("JOIN_GATE_ADMIN_IDS", "") or ""
+    out: set[int] = set()
+    for tok in re.split(r"[,\s]+", s.strip()):
+        if not tok:
             continue
+        try:
+            out.add(int(tok))
+        except Exception:
+            pass
+    return out
 
-    for uid in expired:
-        await _kick_everywhere(context, uid)
-        _MEMBERS.pop(str(uid), None)
-        await _alert_admin(context, f"⏰ Hết hạn và đã kick user {uid}.")
+ADMIN_IDS = _parse_admin_ids()
+
+# ----------------- Subs DB -----------------
+SUBS_DB_PATH = os.getenv("JOIN_GATE_SUBS_DB", "vip_members.json")
+DEFAULT_SUB_DAYS = int(os.getenv("JOIN_GATE_DEFAULT_SUBS_DAYS", "30") or 30)
+
+# DB format: { "<user_id>": { "exp": <unix_ts>, "note": "..." } }
+_subs_cache: Dict[str, Dict[str, Any]] = {}
+
+async def _load_db() -> None:
+    global _subs_cache
+    try:
+        def _read(path: str):
+            if not os.path.exists(path):
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        _subs_cache = await asyncio.to_thread(_read, SUBS_DB_PATH)
+        if not isinstance(_subs_cache, dict):
+            _subs_cache = {}
+    except Exception:
+        _subs_cache = {}
+
+async def _save_db() -> None:
+    data = _subs_cache
+    def _write(path: str, obj: dict):
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    try:
+        await asyncio.to_thread(_write, SUBS_DB_PATH, data)
+    except Exception:
+        pass
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _fmt_time(ts: int) -> str:
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts)
+
+# ----------------- Utilities -----------------
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def _alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if not ADMIN_ALERT_CHAT_ID:
+        return
+    try:
+        # gửi bằng bot hiện tại (All in one Bot). Nếu muốn gửi bằng gate_bot: dùng gate_bot.send_message
+        await context.bot.send_message(chat_id=ADMIN_ALERT_CHAT_ID, text=text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        pass
+
+async def _dm_user(user_id: int, text: str, *, via_gate: bool = True) -> None:
+    try:
+        if via_gate and gate_bot:
+            await gate_bot.send_message(chat_id=user_id, text=text, parse_mode=constants.ParseMode.MARKDOWN, disable_web_page_preview=True)
+        else:
+            # gửi bằng bot hiện tại nếu muốn
+            pass
+    except TelegramError:
+        # thường là user chưa start bot
+        pass
+    except Exception:
+        pass
+
+# ----------------- Commands: create links -----------------
+async def _ensure_gate(msg) -> bool:
+    if gate_bot is None:
+        await msg.reply_text("❌ Chưa cấu hình TELEGRAM_BROADCAST_BOT_TOKEN (bot @Doghli_bot).")
+        return False
+    return True
+
+async def vip_link_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not await _ensure_gate(msg):
+        return
+    if not VIP_GROUP_ID:
+        await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_GROUP_ID.")
+        return
+    try:
+        link: ChatInviteLink = await gate_bot.create_chat_invite_link(
+            chat_id=VIP_GROUP_ID,
+            creates_join_request=True,
+            name="VIP Group Link",
+        )
+        await msg.reply_text(f"🔗 Link join-request GROUP mới:\n{link.invite_link}")
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Tạo link lỗi: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Tạo link lỗi: {e}")
+
+async def vip_link_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not await _ensure_gate(msg):
+        return
+    if not VIP_CHANNEL_ID:
+        await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_CHANNEL_ID.")
+        return
+    try:
+        link: ChatInviteLink = await gate_bot.create_chat_invite_link(
+            chat_id=VIP_CHANNEL_ID,
+            creates_join_request=True,
+            name="VIP Channel Link",
+        )
+        await msg.reply_text(f"🔗 Link join-request CHANNEL mới:\n{link.invite_link}")
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Tạo link lỗi: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Tạo link lỗi: {e}")
+
+# ----------------- Commands: approve/decline -----------------
+async def approve_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not await _ensure_gate(msg):
+        return
+    if not VIP_GROUP_ID:
+        await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_GROUP_ID.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /approve_group <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+        await gate_bot.approve_chat_join_request(chat_id=VIP_GROUP_ID, user_id=target)
+        await msg.reply_text(f"✅ Approved vào GROUP: <code>{target}</code>", parse_mode=constants.ParseMode.HTML)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Approve lỗi: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Approve lỗi: {e}")
+
+async def decline_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not await _ensure_gate(msg):
+        return
+    if not VIP_GROUP_ID:
+        await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_GROUP_ID.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /decline_group <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+        await gate_bot.decline_chat_join_request(chat_id=VIP_GROUP_ID, user_id=target)
+        await msg.reply_text(f"🛑 Declined vào GROUP: <code>{target}</code>", parse_mode=constants.ParseMode.HTML)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Decline lỗi: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Decline lỗi: {e}")
+
+async def approve_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not await _ensure_gate(msg):
+        return
+    if not VIP_CHANNEL_ID:
+        await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_CHANNEL_ID.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /approve_channel <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+        await gate_bot.approve_chat_join_request(chat_id=VIP_CHANNEL_ID, user_id=target)
+        await msg.reply_text(f"✅ Approved vào CHANNEL: <code>{target}</code>", parse_mode=constants.ParseMode.HTML)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Approve lỗi: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Approve lỗi: {e}")
+
+async def decline_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not await _ensure_gate(msg):
+        return
+    if not VIP_CHANNEL_ID:
+        await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_CHANNEL_ID.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /decline_channel <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+        await gate_bot.decline_chat_join_request(chat_id=VIP_CHANNEL_ID, user_id=target)
+        await msg.reply_text(f"🛑 Declined vào CHANNEL: <code>{target}</code>", parse_mode=constants.ParseMode.HTML)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Decline lỗi: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Decline lỗi: {e}")
+
+# ----------------- Subs: grant/revoke/info/dump/reload -----------------
+async def subs_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    await _load_db()
+    await msg.reply_text("🔄 Đã reload DB subs.")
+
+async def subs_dump(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    await _save_db()
+    # gửi gọn
+    await msg.reply_text(f"💾 Subs DB path: {SUBS_DB_PATH}\nSố entries: {len(_subs_cache)}")
+
+async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /grant <user_id> [days]")
+        return
+    try:
+        target = int(context.args[0])
+    except Exception:
+        await msg.reply_text("user_id không hợp lệ.")
+        return
+    days = DEFAULT_SUB_DAYS
+    if len(context.args) >= 2:
+        try:
+            days = max(1, int(context.args[1]))
+        except Exception:
+            pass
+    exp = _now_ts() + days * 86400
+    _subs_cache[str(target)] = {"exp": exp}
+    await _save_db()
+    await msg.reply_text(f"✅ Grant {days} ngày cho <code>{target}</code> (exp: { _fmt_time(exp) })", parse_mode=constants.ParseMode.HTML)
+
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /revoke <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+    except Exception:
+        await msg.reply_text("user_id không hợp lệ.")
+        return
+    _subs_cache.pop(str(target), None)
+    await _save_db()
+    await msg.reply_text(f"🗑️ Đã revoke <code>{target}</code>", parse_mode=constants.ParseMode.HTML)
+    # Kicked ngay khỏi group/channel nếu đang ở
+    await _kick_everywhere(target)
+
+async def subinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await msg.reply_text("🚫 Bạn không có quyền.")
+        return
+    if not context.args:
+        await msg.reply_text("Dùng: /subinfo <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+    except Exception:
+        await msg.reply_text("user_id không hợp lệ.")
+        return
+    rec = _subs_cache.get(str(target))
+    if not rec:
+        await msg.reply_text("❓ Không có trong DB.")
+        return
+    exp = int(rec.get("exp", 0) or 0)
+    await msg.reply_text(f"ℹ️ <code>{target}</code> exp: { _fmt_time(exp) } ({max(0, exp - _now_ts())//86400} ngày còn lại)", parse_mode=constants.ParseMode.HTML)
+
+# ----------------- Expiry scan -----------------
+async def _kick(chat_id: int, user_id: int) -> None:
+    if not gate_bot:
+        return
+    try:
+        # Ban rồi unban để “kick mềm” — cho phép join lại sau này (khi được grant).
+        await gate_bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        try:
+            await gate_bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+async def _kick_everywhere(user_id: int) -> None:
+    if VIP_GROUP_ID:
+        await _kick(VIP_GROUP_ID, user_id)
+    if VIP_CHANNEL_ID:
+        await _kick(VIP_CHANNEL_ID, user_id)
+
+async def _scan_and_kick(context: ContextTypes.DEFAULT_TYPE):
+    # quét mỗi giờ
+    now = _now_ts()
+    expired = [int(uid) for uid, rec in (_subs_cache or {}).items() if int(rec.get("exp", 0) or 0) > 0 and int(rec["exp"]) <= now]
+    for u in expired:
+        await _kick_everywhere(u)
+        _subs_cache.pop(str(u), None)
+        if ADMIN_ALERT_CHAT_ID:
+            try:
+                await context.bot.send_message(ADMIN_ALERT_CHAT_ID, f"⚠️ Đã kick hết hạn: {u}")
+            except Exception:
+                pass
     if expired:
-        _save_members()
+        await _save_db()
 
+# ----------------- Anti-spam (GROUP) -----------------
+ANTISPAM_ON = (os.getenv("JOIN_GATE_ANTISPAM_ON", "true").lower() == "true")
+ALLOW_LINKS = (os.getenv("JOIN_GATE_ALLOW_LINKS", "false").lower() == "true")
+WL_DOMAINS = [d.strip().lower() for d in (os.getenv("JOIN_GATE_ALLOWED_LINK_DOMAINS", "") or "").split(",") if d.strip()]
+SPAM_MAX = int(os.getenv("JOIN_GATE_LINK_SPAM_MAX", "2") or 2)
+SPAM_WINDOW = int(os.getenv("JOIN_GATE_LINK_SPAM_WINDOW_S", "300") or 300)
+AUTOBAN_ON = (os.getenv("JOIN_GATE_AUTOBAN_ON", "true").lower() == "true")
+AUTODELETE = (os.getenv("JOIN_GATE_AUTODELETE_LINKS", "true").lower() == "true")
 
-# ============== GROUP ANTI-SPAM (DELETE LINKS, AUTOBAN) ==============
+_violate: dict[Tuple[int,int], deque] = defaultdict(deque)  # key=(chat_id,user_id) -> deque[timestamps]
 
-def _extract_links(text: str) -> List[str]:
-    if not text: return []
-    return LINK_RE.findall(text)
+_URL_RE = re.compile(r"(https?://\S+|t\.me/\S+)", re.IGNORECASE)
 
-def _record_link_hit(user_id: int) -> int:
-    """Trả về số hit trong window sau khi ghi nhận một hit mới."""
-    now = time.time()
-    arr = _LINK_HITS.get(user_id, [])
-    # giữ lại hit trong cửa sổ
-    arr = [t for t in arr if now - t <= LINK_SPAM_WINDOW_S]
-    arr.append(now)
-    _LINK_HITS[user_id] = arr
-    return len(arr)
+def _is_allowed_link(text: str) -> bool:
+    if ALLOW_LINKS:
+        if not WL_DOMAINS:
+            return True
+        low = text.lower()
+        return any(dom in low for dom in WL_DOMAINS)
+    # không cho link: chỉ cho whitelist
+    low = text.lower()
+    return any(dom in low for dom in WL_DOMAINS)
 
-async def _group_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Giữ group sạch: xoá link spam, block nếu vượt ngưỡng."""
-    if not ANTISPAM_ON: return
+async def _moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ANTISPAM_ON:
+        return
     msg = update.effective_message
     chat = update.effective_chat
-    user = update.effective_user
-    if not msg or not chat or not user: return
-    if VIP_GROUP_ID is None or chat.id != VIP_GROUP_ID: return
-    if user.id in ADMIN_IDS: return  # bỏ qua admin
-
-    text = msg.text or msg.caption or ""
-    links = _extract_links(text)
-    if not links:
+    if not chat or chat.id != VIP_GROUP_ID:
+        return
+    if not msg or not (msg.text or msg.caption):
+        return
+    text = (msg.text or msg.caption or "")
+    if not _URL_RE.search(text):
         return
 
-    # Nếu cho phép link, nhưng chỉ whitelist domain, thì loại những link hợp lệ
-    bad_links = []
-    for u in links:
-        if ALLOW_LINKS and _domain_in_whitelist(u):
-            continue
-        bad_links.append(u)
-
-    if not bad_links:
+    # link phát hiện
+    allowed = _is_allowed_link(text)
+    if allowed:
         return
 
-    # Xoá tin nhắn chứa link không hợp lệ
-    if AUTO_DELETE_LINKS:
+    # vi phạm
+    if AUTODELETE:
         try:
             await msg.delete()
         except Exception:
             pass
 
-    hits = _record_link_hit(user.id)
-    warn_txt = (
-        f"⚠️ @{user.username or user.id}: Link không được phép trong nhóm này."
-        f" ({hits}/{LINK_SPAM_MAX} trong {LINK_SPAM_WINDOW_S//60} phút)"
-    )
-    await _alert_admin(context, f"[ANTI-SPAM] {warn_txt}\nNội dung: {text[:200]}")
+    # ghi nhận
+    key = (chat.id, msg.from_user.id if msg.from_user else 0)
+    dq = _violate[key]
+    now = time.time()
+    dq.append(now)
+    # cắt cửa sổ
+    while dq and now - dq[0] > SPAM_WINDOW:
+        dq.popleft()
 
-    # Autoban khi vượt ngưỡng
-    if AUTOBAN_ON and hits >= LINK_SPAM_MAX:
+    if AUTOBAN_ON and len(dq) >= SPAM_MAX:
+        # kick
         try:
-            await context.bot.ban_chat_member(chat.id, user.id)
-            await _alert_admin(context, f"🚫 Đã block user {user.id} vì spam link.")
-        except Exception as e:
-            await _alert_admin(context, f"❌ Block user {user.id} lỗi: {e}")
-
-
-# ============== COMMON HELPERS ==============
-
-def _check_admin(update: Update) -> bool:
-    uid = update.effective_user.id if update.effective_user else 0
-    if not _is_admin(uid):
-        # im lặng nếu không phải admin
-        return False
-    return True
-
-async def _safe_reply(update: Update, text: str):
-    try:
-        await update.message.reply_text(text)
-    except Exception:
-        try:
-            await update.effective_message.reply_text(text)
+            if gate_bot:
+                await gate_bot.ban_chat_member(chat_id=chat.id, user_id=key[1])
+                try:
+                    await gate_bot.unban_chat_member(chat_id=chat.id, user_id=key[1], only_if_banned=True)
+                except Exception:
+                    pass
         except Exception:
             pass
+        dq.clear()
+        await _alert(context, f"🚫 Auto-ban vì spam link: <code>{key[1]}</code> (group)",)
 
-
-# ============== REGISTRATION ==============
-
+# ----------------- Register -----------------
 def register_join_gate(app: Application) -> None:
     """
-    Gọi sau khi build Application ở bot chính.
-    - Thêm handler join-request cho cả group & channel VIP.
-    - Thêm lệnh admin: approve/decline, tạo link, quản lý hạn dùng.
-    - Bật anti-spam cho group (delete link + autoban).
-    - Đăng ký job cleanup hết hạn mỗi ngày 03:00 UTC (có thể chỉnh).
+    Gọi trong main.py sau khi tạo Application của "All in one Bot":
+        from tg.join_gate import register_join_gate
+        app = build_app()
+        register_join_gate(app)
     """
-    # Load subs DB
-    _load_members()
+    # load DB ngay
+    app.job_queue.run_once(lambda c: _load_db(), when=1)
 
-    # Join request
-    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    # lệnh tạo link
+    app.add_handler(CommandHandler("vip_link_group", vip_link_group))
+    app.add_handler(CommandHandler("vip_link_channel", vip_link_channel))
 
-    # Approve/Decline
-    app.add_handler(CommandHandler("approve_group", approve_group_cmd))
-    app.add_handler(CommandHandler("decline_group", decline_group_cmd))
-    app.add_handler(CommandHandler("approve_channel", approve_channel_cmd))
-    app.add_handler(CommandHandler("decline_channel", decline_channel_cmd))
+    # approve/decline
+    app.add_handler(CommandHandler("approve_group", approve_group))
+    app.add_handler(CommandHandler("decline_group", decline_group))
+    app.add_handler(CommandHandler("approve_channel", approve_channel))
+    app.add_handler(CommandHandler("decline_channel", decline_channel))
 
-    # Invite links
-    app.add_handler(CommandHandler("vip_link_group", vip_link_group_cmd))
-    app.add_handler(CommandHandler("vip_link_channel", vip_link_channel_cmd))
+    # subs
+    app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CommandHandler("revoke", revoke))
+    app.add_handler(CommandHandler("subinfo", subinfo))
+    app.add_handler(CommandHandler("subs_dump", subs_dump))
+    app.add_handler(CommandHandler("subs_reload", subs_reload))
 
-    # Subs (thu phí/hạn dùng)
-    app.add_handler(CommandHandler("grant", grant_cmd))
-    app.add_handler(CommandHandler("revoke", revoke_cmd))
-    app.add_handler(CommandHandler("subinfo", subinfo_cmd))
-    app.add_handler(CommandHandler("subs_dump", subs_dump_cmd))
-    app.add_handler(CommandHandler("subs_reload", subs_reload_cmd))
+    # anti-spam (chỉ khi app hiện tại ở trong group và có quyền xóa)
+    app.add_handler(MessageHandler(filters.ALL, _moderate), group=21)
 
-    # Anti-spam cho group
-    app.add_handler(MessageHandler(filters.TEXT | filters.Caption(True), _group_text_handler))
+    # quét hết hạn mỗi giờ (03:00 UTC vẫn đảm bảo chạy 1 lần, nhưng để chắc thì/hour)
+    app.job_queue.run_repeating(_scan_and_kick, interval=3600, first=30)
 
-    # Job cleanup hết hạn — 1 lần/ngày
-    if hasattr(app, "job_queue") and app.job_queue:
-        # chạy lúc 03:00 UTC mỗi ngày
-        target_time = datetime.time(datetime.strptime("03:00", "%H:%M"))
-        try:
-            app.job_queue.run_daily(_subs_cleanup_job, time=target_time, name="join_gate_cleanup")
-        except Exception:
-            # fallback: mỗi 6 giờ
-            app.job_queue.run_repeating(_subs_cleanup_job, interval=6*3600, name="join_gate_cleanup_6h")
+# --------------- Optional: DM template khi có join-request ---------------
+# LƯU Ý: để nhận được ChatJoinRequest update, bot phải chạy BẰNG CHÍNH token @Doghli_bot.
+# Với mô hình bridge 1-app hiện tại, ta không nhận được event này; admin duyệt thủ công bằng lệnh.
+JOIN_DM_TEXT = os.getenv("JOIN_GATE_DM_TEXT", "").strip()
+
+async def _send_join_dm(user_id: int):
+    if not JOIN_DM_TEXT:
+        return
+    await _dm_user(user_id, JOIN_DM_TEXT, via_gate=True)
