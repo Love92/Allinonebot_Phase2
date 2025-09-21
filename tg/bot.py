@@ -197,10 +197,10 @@ PRESETS = {
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
 		# Extreme guard defaults
         "EXTREME_BLOCK_ON": True,
-        "EXTREME_RSI_OB": 75.0,
-        "EXTREME_RSI_OS": 25.0,
-        "EXTREME_STOCH_OB": 85.0,
-        "EXTREME_STOCH_OS": 15.0,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
 
 
         # M5 gate (giữ logic mặc định, có thể vặn thêm bằng /setenv khi cần)
@@ -238,10 +238,10 @@ PRESETS = {
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center    
 	    # Extreme guard defaults
         "EXTREME_BLOCK_ON": True,
-        "EXTREME_RSI_OB": 75.0,
-        "EXTREME_RSI_OS": 25.0,
-        "EXTREME_STOCH_OB": 85.0,
-        "EXTREME_STOCH_OS": 15.0,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
 
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
         "M5_WICK_PCT": 0.50,
@@ -277,10 +277,10 @@ PRESETS = {
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
 		# Extreme guard defaults
         "EXTREME_BLOCK_ON": True,
-        "EXTREME_RSI_OB": 75.0,
-        "EXTREME_RSI_OS": 25.0,
-        "EXTREME_STOCH_OB": 85.0,
-        "EXTREME_STOCH_OS": 15.0,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
 
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
         "M5_WICK_PCT": 0.50,
@@ -315,10 +315,10 @@ PRESETS = {
         "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
 		# Extreme guard defaults
         "EXTREME_BLOCK_ON": True,
-        "EXTREME_RSI_OB": 75.0,
-        "EXTREME_RSI_OS": 25.0,
-        "EXTREME_STOCH_OB": 85.0,
-        "EXTREME_STOCH_OS": 15.0,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
 
         "M5_STRICT": False, "M5_RELAX_KIND": "either",
         "M5_WICK_PCT": 0.50,
@@ -453,8 +453,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
         f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
         f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
-        f"<code>/setenv EXTREME_STOCH_OB 80</code> (hiện: {v('EXTREME_STOCH_OB','80')})\n"
-        f"<code>/setenv EXTREME_STOCH_OS 20</code> (hiện: {v('EXTREME_STOCH_OS','20')})\n\n"
+        f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','80')})\n"
+        f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','20')})\n\n"
 
 
         "<b>Entry timing (thủy triều) — <i>giá trị hiện tại</i>:</b>\n"
