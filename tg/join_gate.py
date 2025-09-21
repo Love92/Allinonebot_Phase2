@@ -6,6 +6,7 @@ Join Gate cho GROUP/CHANNEL VIP:
   dù lệnh được gõ từ "All in one Bot".
 - Quản lý thuê bao (grant/revoke/info, DB JSON).
 - Anti-spam link cho GROUP.
+- Tự động REVOKE primary invite link sau khi tạo link join-request (để bắt buộc duyệt).
 - Tương thích cả hai trường hợp: có JobQueue và không có JobQueue.
 
 ENV cần:
@@ -166,6 +167,25 @@ async def _dm_user(user_id: int, text: str, *, via_gate: bool = True) -> None:
     except Exception:
         pass
 
+# ---------- Helper: revoke primary invite link (ngăn join thẳng) ----------
+async def _revoke_primary_invite(chat_id: int) -> bool:
+    """
+    Thu hồi (revoke) primary invite link để bắt buộc mọi người phải dùng link dạng join-request.
+    Yêu cầu: @Doghli_bot là admin của chat_id.
+    """
+    if not gate_bot:
+        return False
+    try:
+        primary = await gate_bot.export_chat_invite_link(chat_id=chat_id)  # str (primary link)
+        if not primary:
+            return False
+        await gate_bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=primary)
+        return True
+    except TelegramError:
+        return False
+    except Exception:
+        return False
+
 # ----------------- Commands: create links -----------------
 async def _ensure_gate(msg) -> bool:
     if gate_bot is None:
@@ -185,12 +205,16 @@ async def vip_link_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_GROUP_ID.")
         return
     try:
+        # Tạo link join-request
         link: ChatInviteLink = await gate_bot.create_chat_invite_link(
             chat_id=VIP_GROUP_ID,
             creates_join_request=True,
             name="VIP Group Link",
         )
-        await msg.reply_text(f"🔗 Link join-request GROUP mới:\n{link.invite_link}")
+        # Revoke primary link mở
+        revoked = await _revoke_primary_invite(VIP_GROUP_ID)
+        extra = "\n🔒 Đã revoke primary invite link (link mở)." if revoked else ""
+        await msg.reply_text(f"🔗 Link join-request GROUP mới:\n{link.invite_link}{extra}")
     except TelegramError as e:
         await msg.reply_text(f"❌ Tạo link lỗi: {e.message}")
     except Exception as e:
@@ -208,12 +232,16 @@ async def vip_link_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ Thiếu JOIN_GATE_VIP_CHANNEL_ID.")
         return
     try:
+        # Tạo link join-request
         link: ChatInviteLink = await gate_bot.create_chat_invite_link(
             chat_id=VIP_CHANNEL_ID,
             creates_join_request=True,
             name="VIP Channel Link",
         )
-        await msg.reply_text(f"🔗 Link join-request CHANNEL mới:\n{link.invite_link}")
+        # Revoke primary link mở
+        revoked = await _revoke_primary_invite(VIP_CHANNEL_ID)
+        extra = "\n🔒 Đã revoke primary invite link (link mở)." if revoked else ""
+        await msg.reply_text(f"🔗 Link join-request CHANNEL mới:\n{link.invite_link}{extra}")
     except TelegramError as e:
         await msg.reply_text(f"❌ Tạo link lỗi: {e.message}")
     except Exception as e:
@@ -359,17 +387,22 @@ async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=constants.ParseMode.HTML,
     )
 
-async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def revoke(update: Update, Context: ContextTypes.DEFAULT_TYPE):
+    # giữ tương thích tên tham số context (không dùng)
     msg = update.effective_message
     uid = update.effective_user.id if update.effective_user else 0
     if not _is_admin(uid):
         await msg.reply_text("🚫 Bạn không có quyền.")
         return
-    if not context.args:
+    if not update.message or not update.message.text:
+        await msg.reply_text("Dùng: /revoke <user_id>")
+        return
+    parts = update.message.text.strip().split()
+    if len(parts) < 2:
         await msg.reply_text("Dùng: /revoke <user_id>")
         return
     try:
-        target = int(context.args[0])
+        target = int(parts[1])
     except Exception:
         await msg.reply_text("user_id không hợp lệ.")
         return
@@ -535,11 +568,9 @@ def register_join_gate(app: Application) -> None:
     # --- DB + scheduler ---
     jq = getattr(app, "job_queue", None)
     if jq:
-        # Có JobQueue → chuẩn PTB
         jq.run_once(lambda c: asyncio.create_task(_load_db()), when=1)
         jq.run_repeating(_scan_and_kick, interval=3600, first=30)
     else:
-        # Không có JobQueue → load DB sync ngay, bỏ quét định kỳ để tránh lỗi
         _load_db_sync()
 
 # --------------- Optional: DM template khi có join-request ---------------
