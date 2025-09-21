@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Join Gate cho GROUP/CHANNEL VIP:
-- Bridge mọi thao tác quản trị (create invite link, approve/decline) qua token broadcast (@Doghli_bot),
+- Bridge thao tác quản trị (create invite link, approve/decline) qua token broadcast (@Doghli_bot),
   dù lệnh được gõ từ "All in one Bot".
-- Quản lý thuê bao (grant/revoke/info, DB JSON bền nếu trỏ /data/vip_members.json).
-- Tự động quét & kick user hết hạn định kỳ.
-- Anti-spam link cho GROUP (xóa link ngoài whitelist, auto-ban nếu spam).
+- Quản lý thuê bao (grant/revoke/info, DB JSON).
+- Anti-spam link cho GROUP.
+- Tương thích cả hai trường hợp: có JobQueue và không có JobQueue.
 
 ENV cần:
   TELEGRAM_BROADCAST_BOT_TOKEN=<token của @Doghli_bot>
@@ -36,14 +36,13 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 from telegram import (
     Bot,
     Update,
     ChatInviteLink,
-    ChatMember,
     constants,
 )
 from telegram.ext import (
@@ -87,6 +86,7 @@ DEFAULT_SUB_DAYS = int(os.getenv("JOIN_GATE_DEFAULT_SUBS_DAYS", "30") or 30)
 _subs_cache: Dict[str, Dict[str, Any]] = {}
 
 async def _load_db() -> None:
+    """Load DB async (safe cho môi trường có event loop)."""
     global _subs_cache
     try:
         def _read(path: str):
@@ -94,9 +94,21 @@ async def _load_db() -> None:
                 return {}
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        _subs_cache = await asyncio.to_thread(_read, SUBS_DB_PATH)
-        if not isinstance(_subs_cache, dict):
+        data = await asyncio.to_thread(_read, SUBS_DB_PATH)
+        _subs_cache = data if isinstance(data, dict) else {}
+    except Exception:
+        _subs_cache = {}
+
+def _load_db_sync() -> None:
+    """Load DB sync (dùng khi không có JobQueue và chưa có loop)."""
+    global _subs_cache
+    try:
+        if not os.path.exists(SUBS_DB_PATH):
             _subs_cache = {}
+            return
+        with open(SUBS_DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            _subs_cache = data if isinstance(data, dict) else {}
     except Exception:
         _subs_cache = {}
 
@@ -130,20 +142,26 @@ async def _alert(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if not ADMIN_ALERT_CHAT_ID:
         return
     try:
-        # gửi bằng bot hiện tại (All in one Bot). Nếu muốn gửi bằng gate_bot: dùng gate_bot.send_message
-        await context.bot.send_message(chat_id=ADMIN_ALERT_CHAT_ID, text=text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
+        await context.bot.send_message(
+            chat_id=ADMIN_ALERT_CHAT_ID,
+            text=text,
+            parse_mode=constants.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except Exception:
         pass
 
 async def _dm_user(user_id: int, text: str, *, via_gate: bool = True) -> None:
     try:
         if via_gate and gate_bot:
-            await gate_bot.send_message(chat_id=user_id, text=text, parse_mode=constants.ParseMode.MARKDOWN, disable_web_page_preview=True)
-        else:
-            # gửi bằng bot hiện tại nếu muốn
-            pass
+            await gate_bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=constants.ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
     except TelegramError:
-        # thường là user chưa start bot
+        # thường là user chưa /start bot
         pass
     except Exception:
         pass
@@ -311,7 +329,6 @@ async def subs_dump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🚫 Bạn không có quyền.")
         return
     await _save_db()
-    # gửi gọn
     await msg.reply_text(f"💾 Subs DB path: {SUBS_DB_PATH}\nSố entries: {len(_subs_cache)}")
 
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,7 +354,10 @@ async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exp = _now_ts() + days * 86400
     _subs_cache[str(target)] = {"exp": exp}
     await _save_db()
-    await msg.reply_text(f"✅ Grant {days} ngày cho <code>{target}</code> (exp: { _fmt_time(exp) })", parse_mode=constants.ParseMode.HTML)
+    await msg.reply_text(
+        f"✅ Grant {days} ngày cho <code>{target}</code> (exp: { _fmt_time(exp) })",
+        parse_mode=constants.ParseMode.HTML,
+    )
 
 async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -356,7 +376,6 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _subs_cache.pop(str(target), None)
     await _save_db()
     await msg.reply_text(f"🗑️ Đã revoke <code>{target}</code>", parse_mode=constants.ParseMode.HTML)
-    # Kicked ngay khỏi group/channel nếu đang ở
     await _kick_everywhere(target)
 
 async def subinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,14 +397,17 @@ async def subinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❓ Không có trong DB.")
         return
     exp = int(rec.get("exp", 0) or 0)
-    await msg.reply_text(f"ℹ️ <code>{target}</code> exp: { _fmt_time(exp) } ({max(0, exp - _now_ts())//86400} ngày còn lại)", parse_mode=constants.ParseMode.HTML)
+    await msg.reply_text(
+        f"ℹ️ <code>{target}</code> exp: { _fmt_time(exp) } ({max(0, exp - _now_ts())//86400} ngày còn lại)",
+        parse_mode=constants.ParseMode.HTML,
+    )
 
 # ----------------- Expiry scan -----------------
 async def _kick(chat_id: int, user_id: int) -> None:
     if not gate_bot:
         return
     try:
-        # Ban rồi unban để “kick mềm” — cho phép join lại sau này (khi được grant).
+        # Ban rồi unban để “kick mềm” — cho phép join lại sau này
         await gate_bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         try:
             await gate_bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
@@ -401,9 +423,9 @@ async def _kick_everywhere(user_id: int) -> None:
         await _kick(VIP_CHANNEL_ID, user_id)
 
 async def _scan_and_kick(context: ContextTypes.DEFAULT_TYPE):
-    # quét mỗi giờ
     now = _now_ts()
-    expired = [int(uid) for uid, rec in (_subs_cache or {}).items() if int(rec.get("exp", 0) or 0) > 0 and int(rec["exp"]) <= now]
+    expired = [int(uid) for uid, rec in (_subs_cache or {}).items()
+               if int(rec.get("exp", 0) or 0) > 0 and int(rec["exp"]) <= now]
     for u in expired:
         await _kick_everywhere(u)
         _subs_cache.pop(str(u), None)
@@ -425,7 +447,6 @@ AUTOBAN_ON = (os.getenv("JOIN_GATE_AUTOBAN_ON", "true").lower() == "true")
 AUTODELETE = (os.getenv("JOIN_GATE_AUTODELETE_LINKS", "true").lower() == "true")
 
 _violate: dict[Tuple[int,int], deque] = defaultdict(deque)  # key=(chat_id,user_id) -> deque[timestamps]
-
 _URL_RE = re.compile(r"(https?://\S+|t\.me/\S+)", re.IGNORECASE)
 
 def _is_allowed_link(text: str) -> bool:
@@ -473,7 +494,6 @@ async def _moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dq.popleft()
 
     if AUTOBAN_ON and len(dq) >= SPAM_MAX:
-        # kick
         try:
             if gate_bot:
                 await gate_bot.ban_chat_member(chat_id=chat.id, user_id=key[1])
@@ -484,41 +504,43 @@ async def _moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         dq.clear()
-        await _alert(context, f"🚫 Auto-ban vì spam link: <code>{key[1]}</code> (group)",)
+        await _alert(context, f"🚫 Auto-ban vì spam link: <code>{key[1]}</code> (group)")
 
 # ----------------- Register -----------------
 def register_join_gate(app: Application) -> None:
     """
-    Gọi trong main.py sau khi tạo Application của "All in one Bot":
+    Gọi trong main.py:
         from tg.join_gate import register_join_gate
         app = build_app()
         register_join_gate(app)
     """
-    # load DB ngay
-    app.job_queue.run_once(lambda c: _load_db(), when=1)
-
-    # lệnh tạo link
+    # Handlers lệnh quản trị/link
     app.add_handler(CommandHandler("vip_link_group", vip_link_group))
     app.add_handler(CommandHandler("vip_link_channel", vip_link_channel))
-
-    # approve/decline
     app.add_handler(CommandHandler("approve_group", approve_group))
     app.add_handler(CommandHandler("decline_group", decline_group))
     app.add_handler(CommandHandler("approve_channel", approve_channel))
     app.add_handler(CommandHandler("decline_channel", decline_channel))
 
-    # subs
+    # Subs
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("subinfo", subinfo))
     app.add_handler(CommandHandler("subs_dump", subs_dump))
     app.add_handler(CommandHandler("subs_reload", subs_reload))
 
-    # anti-spam (chỉ khi app hiện tại ở trong group và có quyền xóa)
+    # Anti-spam (chỉ hoạt động nếu app hiện tại ở trong GROUP và có quyền xóa)
     app.add_handler(MessageHandler(filters.ALL, _moderate), group=21)
 
-    # quét hết hạn mỗi giờ (03:00 UTC vẫn đảm bảo chạy 1 lần, nhưng để chắc thì/hour)
-    app.job_queue.run_repeating(_scan_and_kick, interval=3600, first=30)
+    # --- DB + scheduler ---
+    jq = getattr(app, "job_queue", None)
+    if jq:
+        # Có JobQueue → chuẩn PTB
+        jq.run_once(lambda c: asyncio.create_task(_load_db()), when=1)
+        jq.run_repeating(_scan_and_kick, interval=3600, first=30)
+    else:
+        # Không có JobQueue → load DB sync ngay, bỏ quét định kỳ để tránh lỗi
+        _load_db_sync()
 
 # --------------- Optional: DM template khi có join-request ---------------
 # LƯU Ý: để nhận được ChatJoinRequest update, bot phải chạy BẰNG CHÍNH token @Doghli_bot.
