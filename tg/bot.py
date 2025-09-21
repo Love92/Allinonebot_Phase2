@@ -512,6 +512,24 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/setenv_status</code> để xem toàn bộ ENV hiện tại.\n"
         "• <code>/preset auto</code> để đổi nhanh theo Moon (P1–P4)."
     )
+    
+    # === Added lines for new keys (EXTREME, M30, M5 spacing/second-entry) ===
+    text += (
+        "\n<b>Extreme-guard (H4/M30 quá mua/bán):</b>\n"
+        f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
+        f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
+        f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
+        f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
+        f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n"
+        "\n<b>M30 flip guard quanh thủy triều:</b>\n"
+        f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
+        f"<code>/setenv M30_STABLE_MIN_SEC 1800</code> (hiện: {v('M30_STABLE_MIN_SEC','1800')})\n"
+        "\n<b>M5 spacing & second-entry:</b>\n"
+        f"<code>/setenv M5_MIN_GAP_MIN 15</code> (hiện: {v('M5_MIN_GAP_MIN','15')})\n"
+        f"<code>/setenv M5_GAP_SCOPED_TO_WINDOW true|false</code> (hiện: {v('M5_GAP_SCOPED_TO_WINDOW','true')})\n"
+        f"<code>/setenv ALLOW_SECOND_ENTRY true|false</code> (hiện: {v('ALLOW_SECOND_ENTRY','true')})\n"
+        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n"
+    )
     await update.message.reply_text(text, parse_mode="HTML")
 
 # ========== /preset ==========
@@ -582,6 +600,15 @@ async def setenv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key = context.args[0].strip()
     val = " ".join(context.args[1:]).strip()
+    # Aliases (legacy → current)
+    ALIASES = {
+        "EXTREME_GUARD": "EXTREME_BLOCK_ON",
+        "EXTREME_GUARD_KIND": "EXTREME_KIND",
+    }
+    _k_up = key.upper()
+    if _k_up in ALIASES:
+        key = ALIASES[_k_up]
+    
 
     # Whitelist + kiểu dữ liệu mong muốn (đã bổ sung STCH_*, HTF_*, SYNERGY_ON, M30_TAKEOVER_MIN)
     key_types = {
