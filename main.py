@@ -4,6 +4,7 @@ from datetime import timedelta
 from dotenv import load_dotenv
 
 from tg.bot import build_app
+from tg.join_gate import register_join_gate  # quản lý group, chanel private
 from utils.storage import Storage
 from utils.time_utils import now_vn
 from data.moon_tide import get_tide_events
@@ -217,7 +218,8 @@ async def scheduler_loop_m30_h4(app):
 
 if __name__ == "__main__":
     app = build_app()
-
+    
+    register_join_gate(app)     # Phần quản lý group, chanel private kèo
     # (Tuỳ chọn) tạo event loop mới để hết DeprecationWarning
     import asyncio as _asyncio
     loop = _asyncio.new_event_loop()
