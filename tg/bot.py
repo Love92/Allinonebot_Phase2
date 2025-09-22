@@ -583,180 +583,150 @@ async def preset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.environ["PRESET_MODE"] = name
     await _apply_preset_and_reply(update, name)
 
-async def setenv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === /setenv: cập nhật ENV + đẩy vào core.auto_trade_engine ===
+async def setenv_cmd(update, context):
     """
-    /setenv KEY VALUE  (admin only)
-    - Whitelist KEY quan trọng để debug/tuning AUTO.
-    - Apply runtime nếu có thể; nếu không, set os.environ và thông báo có thể cần restart.
+    Dùng:
+      /setenv KEY VALUE
+      /setenv_status  (xem nhanh ENV đang chạy)
+    Hỗ trợ bool: true/false/1/0/on/off/yes/no
     """
-    uid = _uid(update)
-    if not _is_admin(uid):
-        await update.message.reply_text("🚫 Chỉ admin mới được phép dùng /setenv. Đặt ADMIN_USER_ID trong ENV để chỉ định.")
+    from core import auto_trade_engine as ae
+
+    msg = update.effective_message
+    if not context.args or len(context.args) < 2:
+        await msg.reply_html(
+            "Dùng: <code>/setenv KEY VALUE</code>\n"
+            "VD: <code>/setenv ENTRY_LATE_ONLY true</code>\n"
+            "Xem trạng thái: <code>/setenv_status</code>"
+        )
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Dùng: /setenv KEY VALUE\nVD: /setenv AUTO_DEBUG true")
-        return
+    key = (context.args[0] or "").strip()
+    val_raw = " ".join(context.args[1:]).strip()
 
-    key = context.args[0].strip()
-    val = " ".join(context.args[1:]).strip()
-    # Aliases (legacy → current)
-    ALIASES = {
-        "EXTREME_GUARD": "EXTREME_BLOCK_ON",
-        "EXTREME_GUARD_KIND": "EXTREME_KIND",
-    }
-    _k_up = key.upper()
-    if _k_up in ALIASES:
-        key = ALIASES[_k_up]
-    
+    # ---- ép kiểu helper
+    def _as_bool(s: str) -> bool:
+        return str(s or "").strip().lower() in ("1", "true", "on", "yes", "y")
 
-    # Whitelist + kiểu dữ liệu mong muốn (đã bổ sung STCH_*, HTF_*, SYNERGY_ON, M30_TAKEOVER_MIN)
-    key_types = {
-        # DEBUG
-        "AUTO_DEBUG": "bool",
-        "AUTO_DEBUG_VERBOSE": "bool",
-        "AUTO_DEBUG_ONLY_WHEN_SKIP": "bool",
-        "AUTO_DEBUG_CHAT_ID": "str",
-
-        # Thủy triều/entry timing
-        "ENTRY_LATE_PREF": "bool",
-        "ENTRY_LATE_ONLY": "bool",
-        "ENTRY_LATE_FROM_HRS": "float",
-        "ENTRY_LATE_TO_HRS": "float",
-        "TIDE_WINDOW_HOURS": "float",
-        "TP_TIME_HOURS": "float",
-        "PRESET_MODE": "str",  # auto|P1|P2|P3|P4
-        
-        # NEW — guard M30 quanh thủy triều
-        "M30_FLIP_GUARD": "bool",
-        "M30_STABLE_MIN_SEC": "int",
-
-        # M5 (logic mới)
-        "M5_STRICT": "bool",
-        "M5_RELAX_KIND": "str",               # either|rsi_only|candle_only
-        "M5_LOOKBACK": "int",                 # legacy
-        "M5_LOOKBACK_RELAX": "int",           # NEW
-        "M5_RELAX_NEED_CURRENT": "bool",      # NEW
-        "M5_LOOKBACK_STRICT": "int",          # NEW
-        "M5_WICK_PCT": "float",
-        "M5_VOL_MULT": "float",               # legacy
-        "M5_VOL_MULT_RELAX": "float",         # NEW
-        "M5_VOL_MULT_STRICT": "float",        # NEW
-        "M5_REQUIRE_ZONE_STRICT": "bool",
-        "ENTRY_SEQ_WINDOW_MIN": "int",
-        
-        # M5 entry spacing / second entry
-        "M5_MIN_GAP_MIN": "int",             # khoảng cách tối thiểu giữa 2 entry M5 (phút)
-        "M5_GAP_SCOPED_TO_WINDOW": "bool",   # true → reset gap theo từng tide window
-        "ALLOW_SECOND_ENTRY": "bool",        # cho phép vào entry thứ 2 nếu đủ điều kiện
-        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": "float",  # retrace % tối thiểu để entry lần 2        
-        
-
-        # H4/M30 scoring & sizing (legacy – tương thích)
-        "M5_WICK_MIN": "float",
-        "M5_WICK_MIN_CT": "float",
-        "VOL_MA20_MULT": "float",
-        "DELTA_RSI30_MIN": "float",
-        "SIZE_MULT_STRONG": "float",
-        "SIZE_MULT_MID": "float",
-        "SIZE_MULT_CT": "float",
-        "RSI_OB": "float",
-        "RSI_OS": "float",
-
-        # Sonic
-        "SONIC_MODE": "str",      # off|weight|veto
-        "SONIC_WEIGHT": "float",  # 0.0 ~ 1.0
-
-        # ===== NEW knobs cho H4/M30 nới lỏng & đồng bộ =====
-        # Stoch RSI (align/slope/cross)
-        "STCH_GAP_MIN": "float",
-        "STCH_SLOPE_MIN": "float",
-        "STCH_RECENT_N": "int",
-		
-		# Extreme guard (block LONG/SHORT ở vùng quá mua/bán H4/M30)
-        "EXTREME_BLOCK_ON": "bool",
-        "EXTREME_RSI_OB": "float",
-        "EXTREME_RSI_OS": "float",
-        "EXTREME_STOCH_OB": "float",
-        "EXTREME_STOCH_OS": "float",
-
-        # Near-align & synergy
-        "HTF_NEAR_ALIGN": "bool",
-        "HTF_MIN_ALIGN_SCORE": "float",
-        "HTF_NEAR_ALIGN_GAP": "float",
-        "SYNERGY_ON": "bool",
-        "M30_TAKEOVER_MIN": "float",
-
-        # System limits
-        "MAX_TRADES_PER_WINDOW": "int",
-        "MAX_CONCURRENT_POS": "int",
-        "M5_MAX_DELAY_SEC": "int",
-        "SCHEDULER_TICK_SEC": "int",
-
-        # Quản trị
-        "ADMIN_USER_ID": "int",
-    }
-    if key not in key_types:
-        await update.message.reply_text(f"KEY không được phép: {key}\nGõ /help để xem danh sách KEY hỗ trợ.")
-        return
-
-    # Parse value theo đúng kiểu
-    t = key_types[key]
-    try:
-        if t == "bool":
-            v = val.lower() in ("1", "true", "yes", "on", "y")
-            os.environ[key] = "true" if v else "false"
-        elif t == "int":
-            v = int(float(val))
-            os.environ[key] = str(v)
-        elif t == "float":
-            v = float(val)
-            os.environ[key] = str(v)
-        else:
-            v = val
-            os.environ[key] = v
-    except Exception as e:
-        await update.message.reply_text(f"Giá trị không hợp lệ cho {key}: {val} — {e}")
-        return
-
-    # Thử áp dụng runtime cho engine nếu có
-    applied_runtime = False
-    try:
-        from core import auto_trade_engine as ae
-        apply_fn = getattr(ae, "apply_runtime_overrides", None)
-        if callable(apply_fn):
-            apply_fn({key: os.environ[key]})
-            applied_runtime = True
-        else:
-            if hasattr(ae, key):
-                typ = type(getattr(ae, key))
-                new_val = os.environ[key]
-                if typ is bool:
-                    setattr(ae, key, new_val.lower() in ("1","true","yes","on"))
-                elif typ is int:
-                    setattr(ae, key, int(float(new_val)))
-                elif typ is float:
-                    setattr(ae, key, float(new_val))
-                else:
-                    setattr(ae, key, new_val)
-                applied_runtime = True
-    except Exception:
-        pass
-
-    # Nếu set ADMIN_USER_ID thì cập nhật vào storage fallback
-    if key == "ADMIN_USER_ID":
+    def _is_floatlike(s: str) -> bool:
         try:
-            storage.data["_admin_uid"] = int(os.environ["ADMIN_USER_ID"])
-            storage.persist()
+            float(s); return True
         except Exception:
-            pass
+            return False
 
-    msg = f"✅ Đã set {key} = {os.environ[key]}"
-    if applied_runtime:
-        msg += " (đã áp dụng runtime cho AUTO engine)."
-    else:
-        msg += " (có thể cần khởi động lại bot để áp dụng hoàn toàn)."
-    await update.message.reply_text(msg)
+    def _is_intlike(s: str) -> bool:
+        try:
+            int(float(s)); return True
+        except Exception:
+            return False
+
+    # ---- alias/whitelist key
+    # Alias tương thích cũ:
+    aliases = {
+        "MAX_ORDERS_PER_TIDE_WINDOW": "MAX_TRADES_PER_WINDOW",
+        # các alias guard "extreme" mà anh test trước:
+        "EXTREME_GUARD": "EXTREME_BLOCK_ON",
+        "EXTREME_GUARD_KIND": "EXTREME_KIND",  # (hiện chưa dùng tách rời, mình gom theo ngưỡng RSI/Stoch)
+    }
+    key_norm = aliases.get(key, key)
+
+    # Danh sách KEY cho phép và kiểu dữ liệu
+    bool_keys = {
+        "ENTRY_LATE_ONLY",
+        "ENTRY_LATE_PREF",
+        "AUTO_DEBUG",
+        "AUTO_DEBUG_VERBOSE",
+        "AUTO_DEBUG_ONLY_WHEN_SKIP",
+        "ENFORCE_M5_MATCH_M30",
+        "M30_FLIP_GUARD",
+        "M5_GAP_SCOPED_TO_WINDOW",
+        "ALLOW_SECOND_ENTRY",
+        "M5_RELAX_NEED_CURRENT",
+        "M5_REQUIRE_ZONE_STRICT",
+        "EXTREME_BLOCK_ON",           # bật/tắt chặn cực trị RSI/Stoch
+    }
+    int_keys = {
+        "M5_MAX_DELAY_SEC",
+        "SCHEDULER_TICK_SEC",
+        "MAX_TRADES_PER_WINDOW",
+        "M30_STABLE_MIN_SEC",
+        "M30_NEED_CONSEC_N",
+        "M5_MIN_GAP_MIN",
+        "M5_LOOKBACK_RELAX",
+        "M5_LOOKBACK_STRICT",
+        "ENTRY_SEQ_WINDOW_MIN",
+        "RSI_OB", "RSI_OS",
+        # nếu anh có giới hạn toàn cục:
+        "MAX_TRADES_PER_DAY",
+        "MAX_TRADES_PER_TIDE_WINDOW",
+    }
+    float_keys = {
+        "ENTRY_LATE_FROM_HRS",
+        "ENTRY_LATE_TO_HRS",
+        "TP_TIME_HOURS",
+        "M5_WICK_PCT",
+        "M5_VOL_MULT_RELAX",
+        "M5_VOL_MULT_STRICT",
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT",
+        "EXTREME_RSI_OB", "EXTREME_RSI_OS",
+        "EXTREME_STOCH_OB", "EXTREME_STOCH_OS",
+        "SIZE_MULT_STRONG", "SIZE_MULT_MID", "SIZE_MULT_CT",
+        "SONIC_WEIGHT",
+        "HTF_MIN_ALIGN_SCORE",
+        "HTF_NEAR_ALIGN_GAP",
+        "STCH_GAP_MIN", "STCH_SLOPE_MIN", "STCH_RECENT_N",
+    }
+
+    # Một số key QUY ĐỊNH theo string tự do (không ép kiểu):
+    passthrough_str = {
+        "SONIC_MODE",      # weight|strict|…
+        "M5_RELAX_KIND",   # either|rsi_only|candle_only
+        "AUTO_DEBUG_CHAT_ID",
+    }
+
+    # Validate + ép kiểu
+    kv_to_apply = {}
+    try:
+        if key_norm in bool_keys:
+            kv_to_apply[key_norm] = "true" if _as_bool(val_raw) else "false"
+        elif key_norm in int_keys:
+            if not _is_intlike(val_raw):
+                await msg.reply_text(f"Giá trị cho {key_norm} phải là số nguyên.")
+                return
+            kv_to_apply[key_norm] = str(int(float(val_raw)))
+        elif key_norm in float_keys:
+            if not _is_floatlike(val_raw):
+                await msg.reply_text(f"Giá trị cho {key_norm} phải là số (float).")
+                return
+            kv_to_apply[key_norm] = str(float(val_raw))
+        elif key_norm in passthrough_str:
+            kv_to_apply[key_norm] = val_raw
+        else:
+            await msg.reply_text(
+                f"KEY không được phép: {key}\nGõ /help để xem KEY hỗ trợ."
+            )
+            return
+    except Exception as e:
+        await msg.reply_text(f"Lỗi ép kiểu: {e}")
+        return
+
+    # Ghi ENV process-wide
+    import os
+    for k, v in kv_to_apply.items():
+        os.environ[k] = v
+
+    # Đẩy vào core để loop AUTO dùng ngay
+    try:
+        ae._apply_runtime_env(kv_to_apply)  # <— cầu nối sang core
+    except Exception as e:
+        # vẫn tiếp tục, vì auto sẽ đọc ENV ở tick sau
+        print(f"[WARN] _apply_runtime_env failed: {e}")
+
+    # Phản hồi
+    pretty = "\n".join([f"• {k} = {v}" for k, v in kv_to_apply.items()])
+    await msg.reply_html(f"✅ Đã cập nhật ENV (runtime):\n{pretty}")
+
 
 # ========== /setenv_status ==========
 async def setenv_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
