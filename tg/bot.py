@@ -1366,8 +1366,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text("(AUTO)\n" + enter_line)
 
-
-
+# ================== /m5report ==================
 async def m5report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
     st = storage.get_user(uid)
@@ -1386,9 +1385,48 @@ async def m5report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage.put_user(uid, st)
         await update.message.reply_text("✅ ĐÃ BẬT M5 report (sẽ tự động gửi snapshot mỗi 5 phút).")
         try:
+            # 1) Snapshot M5 như cũ
             sym = st.settings.pair.replace("/", "")
-            await update.message.reply_text(m5_snapshot(sym))
+            snap = m5_snapshot(sym)
+
+            # 2) Nếu đang ở MANUAL và có pending -> ghép thêm block gợi ý duyệt tay
+            try:
+                mode_now = (st.settings.mode or "").lower()
+            except Exception:
+                mode_now = "manual"
+
+            # st.pending do engine set khi phát hiện đủ điều kiện nhưng ở manual
+            pend = getattr(st, "pending", None)
+
+            if mode_now == "manual" and pend:
+                # an toàn hoá dữ liệu hiển thị
+                pid  = getattr(pend, "id", None)
+                side = str(getattr(pend, "side", "") or "").upper()
+                sl   = getattr(pend, "sl", None)
+                tp   = getattr(pend, "tp", None)
+
+                # Tên cặp định dạng cho futures multi-exchange (ví dụ "BTC/USDT:USDT")
+                pair_u = st.settings.pair
+
+                hint_lines = [
+                    "────────────",
+                    "🟨 <b>Pending cần duyệt (MANUAL)</b>",
+                    f"• ID: <code>{pid}</code>",
+                    f"• Pair: <code>{pair_u}</code> | Side: <b>{side or '—'}</b>",
+                    f"• SL: <code>{'—' if sl is None else f'{float(sl):.2f}'}</code> | "
+                    f"TP: <code>{'—' if tp is None else f'{float(tp):.2f}'}</code>",
+                    "",
+                    f"👉 Duyệt: <code>/approve {pid}</code>",
+                    f"❌ Huỷ:  <code>/reject {pid}</code>",
+                    "────────────",
+                ]
+                snap = snap + "\n" + "\n".join(hint_lines)
+
+            # Gửi ra 1 lần ngay khi start
+            await update.message.reply_text(snap, parse_mode=constants.ParseMode.HTML)
+
         except Exception as e:
+            # Giữ nguyên thông báo lỗi cũ
             await update.message.reply_text(f"⚠️ Không gửi được snapshot ngay: {e}")
         return
 
