@@ -447,7 +447,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/tidewindow — xem/đổi ± giờ quanh thủy triều\n"
         "/report — gửi report H4→M30 (+ M5 filter)\n"
         "/status — trạng thái bot & vị thế\n"
-        "/approve <id> /reject <id> — duyệt tín hiệu (manual)\n"
+        "/approve <code>id</code> /reject <code>id</code> — duyệt tín hiệu (manual)\n"
         "/m5report start|stop — auto M5 snapshot mỗi 5 phút\n"
         "/daily — báo cáo Moon & Tide trong ngày\n"
         "/autolog — log AUTO (tick M5 gần nhất)\n"
@@ -457,6 +457,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 Dùng <code>/help</code> để xem hướng dẫn chi tiết.",
         parse_mode="HTML"
     )
+
 
 async def help_cmd(update, context):
     # helper show ENV/runtimes trong /help
