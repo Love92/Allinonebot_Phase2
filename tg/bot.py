@@ -56,9 +56,6 @@ def _quota_commit(st, tkey, used, uid):
 
 
 # ================== Helpers ==================
-def _esc(s: str) -> str:
-    return html.escape(s or "", quote=False)
-
 def _beautify_report(s: str) -> str:
     if not isinstance(s, str):
         return s
@@ -81,15 +78,15 @@ def _beautify_report(s: str) -> str:
          .replace("wick<=50%", "wick ≤ 50%")
     return s
 # === Telegram helper: split long HTML safely (<4096 chars) ===
+def _esc(s: str) -> str:
+    return html.escape(s or "", quote=False)
 TELEGRAM_HTML_LIMIT = 4096
 _SAFE_BUDGET = 3500  # chừa biên cho thẻ HTML & escape
 
-async def _send_long_html(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+async def _send_long_html(update, context, text: str):
     """
     Gửi chuỗi HTML dài thành nhiều tin, tránh lỗi 4096 của Telegram.
-    - Ưu tiên cắt theo block "\n\n"
-    - Nếu block vẫn dài, cắt cứng theo _SAFE_BUDGET
-    Sử dụng context.bot (PTB v20+), không dùng update.message.bot.
+    Dùng context.bot (PTB v20+), không dùng update.message.bot.
     """
     chat_id = update.effective_chat.id
     txt = text or ""
@@ -106,7 +103,7 @@ async def _send_long_html(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                     chat_id=chat_id, text=buf,
                     parse_mode="HTML", disable_web_page_preview=True
                 )
-            # p có thể vẫn quá dài -> cắt cứng
+            # nếu p vẫn quá dài → cắt cứng
             while len(p) > _SAFE_BUDGET:
                 chunk = p[:_SAFE_BUDGET]
                 await context.bot.send_message(
@@ -453,7 +450,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\nGõ /help để xem hướng dẫn vận hành & DEBUG chi tiết."
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update, context):
     # helper show ENV/runtimes trong /help
     def v(k, d="—"):
         return _env_or_runtime(k, d)
@@ -486,7 +483,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_long_html(update, context, short_text)
         return
 
-    # BẢN ĐẦY ĐỦ — giữ nội dung cũ của anh, bổ sung biến mới + auto-split
+    # BẢN ĐẦY ĐỦ — gom nhóm theo format anh yêu cầu, auto-split
     text = (
         "<b>📘 Hướng dẫn vận hành & DEBUG</b>\n\n"
         "<b>Command chính:</b>\n"
@@ -496,37 +493,71 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/m5report start|stop|status, /daily, /autolog, /preset name|auto\n"
         "/setenv KEY VALUE, /setenv_status\n"
         "\n"
+
         "<b>ENTRY timing (Tide/Late):</b>\n"
         f"<code>/setenv ENTRY_LATE_ONLY true|false</code> (hiện: {v('ENTRY_LATE_ONLY','true')})\n"
         f"<code>/setenv ENTRY_LATE_FROM_HRS 0.5</code> (hiện: {v('ENTRY_LATE_FROM_HRS','0.5')})\n"
         f"<code>/setenv ENTRY_LATE_TO_HRS 2.5</code> (hiện: {v('ENTRY_LATE_TO_HRS','2.5')})\n"
         f"<code>/setenv TIDE_WINDOW_HOURS 2.5</code> (hiện: {v('TIDE_WINDOW_HOURS','2.5')})\n"
-        f"<code>/setenv TP_TIME_HOURS 5.5</code> (hiện: {v('TP_TIME_HOURS','5.5')})\n"
-        "\n"
+        f"<code>/setenv TP_TIME_HOURS 5.5</code> (hiện: {v('TP_TIME_HOURS','5.5')})\n\n"
+
         "<b>M30 Flip-guard & ổn định:</b>\n"
         f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
         f"<code>/setenv M30_STABLE_MIN_SEC 1800</code> (hiện: {v('M30_STABLE_MIN_SEC','1800')})\n"
-        f"<code>/setenv M30_NEED_CONSEC_N 2</code> (hiện: {v('M30_NEED_CONSEC_N','2')})\n"
-        "\n"
+        f"<code>/setenv M30_NEED_CONSEC_N 2</code> (hiện: {v('M30_NEED_CONSEC_N','2')})\n\n"
+
         "<b>M5 spacing & second entry:</b>\n"
         f"<code>/setenv M5_MIN_GAP_MIN 15</code> (hiện: {v('M5_MIN_GAP_MIN','15')})\n"
         f"<code>/setenv M5_GAP_SCOPED_TO_WINDOW true|false</code> (hiện: {v('M5_GAP_SCOPED_TO_WINDOW','true')})\n"
         f"<code>/setenv ALLOW_SECOND_ENTRY true|false</code> (hiện: {v('ALLOW_SECOND_ENTRY','true')})\n"
-        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n"
-        "\n"
+        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n\n"
+
         "<b>Extreme-guard (RSI/Stoch):</b>\n"
         f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
         f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
         f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
         f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
-        f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n"
-        "\n"
-        "…(các nhóm biến/ghi chú khác của anh đặt tiếp ở đây)…\n"
-        "💡 Mẹo: dùng <code>/help short</code> để xem nhanh."
+        f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n\n"
+
+        "<b>HTF tunings & synergy:</b>\n"
+        f"<code>/setenv STCH_GAP_MIN 3</code> (hiện: {v('STCH_GAP_MIN','3')})\n"
+        f"<code>/setenv STCH_SLOPE_MIN 2</code> (hiện: {v('STCH_SLOPE_MIN','2')})\n"
+        f"<code>/setenv STCH_RECENT_N 3</code> (hiện: {v('STCH_RECENT_N','3')})\n"
+        f"<code>/setenv HTF_NEAR_ALIGN true|false</code> (hiện: {v('HTF_NEAR_ALIGN','true')})\n"
+        f"<code>/setenv HTF_MIN_ALIGN_SCORE 6.5</code> (hiện: {v('HTF_MIN_ALIGN_SCORE','6.5')})\n"
+        f"<code>/setenv HTF_NEAR_ALIGN_GAP 2.0</code> (hiện: {v('HTF_NEAR_ALIGN_GAP','2.0')})\n"
+        f"<code>/setenv SYNERGY_ON true|false</code> (hiện: {v('SYNERGY_ON','true')})\n"
+        f"<code>/setenv M30_TAKEOVER_MIN 0</code> (hiện: {v('M30_TAKEOVER_MIN','0')})\n\n"
+
+        "<b>Sonic & M5 filters:</b>\n"
+        f"<code>/setenv SONIC_MODE weight|off</code> (hiện: {v('SONIC_MODE','weight')})\n"
+        f"<code>/setenv SONIC_WEIGHT 1.0</code> (hiện: {v('SONIC_WEIGHT','1.0')})\n"
+        f"<code>/setenv M5_STRICT true|false</code> (hiện: {v('M5_STRICT','false')})\n"
+        f"<code>/setenv M5_RELAX_KIND either|rsi_only|candle_only</code> (hiện: {v('M5_RELAX_KIND','either')})\n"
+        f"<code>/setenv M5_LOOKBACK_RELAX 3</code> (hiện: {v('M5_LOOKBACK_RELAX','3')})\n"
+        f"<code>/setenv M5_RELAX_NEED_CURRENT true|false</code> (hiện: {v('M5_RELAX_NEED_CURRENT','false')})\n"
+        f"<code>/setenv M5_LOOKBACK_STRICT 6</code> (hiện: {v('M5_LOOKBACK_STRICT','6')})\n"
+        f"<code>/setenv M5_WICK_PCT 0.50</code> (hiện: {v('M5_WICK_PCT','0.50')})\n"
+        f"<code>/setenv M5_VOL_MULT_RELAX 1.0</code> (hiện: {v('M5_VOL_MULT_RELAX','1.0')})\n"
+        f"<code>/setenv M5_VOL_MULT_STRICT 1.1</code> (hiện: {v('M5_VOL_MULT_STRICT','1.1')})\n"
+        f"<code>/setenv M5_REQUIRE_ZONE_STRICT true|false</code> (hiện: {v('M5_REQUIRE_ZONE_STRICT','true')})\n"
+        f"<code>/setenv ENTRY_SEQ_WINDOW_MIN 30</code> (hiện: {v('ENTRY_SEQ_WINDOW_MIN','30')})\n\n"
+
+        "<b>Legacy/khác:</b>\n"
+        f"<code>/setenv RSI_OB 65</code> (hiện: {v('RSI_OB','65')})\n"
+        f"<code>/setenv RSI_OS 35</code> (hiện: {v('RSI_OS','35')})\n"
+        f"<code>/setenv DELTA_RSI30_MIN 10</code> (hiện: {v('DELTA_RSI30_MIN','10')})\n"
+        f"<code>/setenv SIZE_MULT_STRONG 1.0</code> (hiện: {v('SIZE_MULT_STRONG','1.0')})\n"
+        f"<code>/setenv SIZE_MULT_MID 0.7</code> (hiện: {v('SIZE_MULT_MID','0.7')})\n"
+        f"<code>/setenv SIZE_MULT_CT 0.4</code> (hiện: {v('SIZE_MULT_CT','0.4')})\n"
+        f"<code>/setenv MAX_TRADES_PER_WINDOW 2</code> (hiện: {v('MAX_TRADES_PER_WINDOW','2')})\n"
+        f"<code>/setenv MAX_TRADES_PER_DAY 8</code> (hiện: {v('MAX_TRADES_PER_DAY','8')})\n"
+        f"<code>/setenv M5_MAX_DELAY_SEC 60</code> (hiện: {v('M5_MAX_DELAY_SEC','60')})\n"
+        f"<code>/setenv SCHEDULER_TICK_SEC 2</code> (hiện: {v('SCHEDULER_TICK_SEC','2')})\n"
+        "\n💡 Mẹo: dùng <code>/help short</code> để xem nhanh."
     )
 
     await _send_long_html(update, context, text)
-
 
 
 # ========== /preset ==========
@@ -583,10 +614,8 @@ async def preset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === /setenv: cập nhật ENV + đẩy vào core.auto_trade_engine ===
 async def setenv_cmd(update, context):
     """
-    Dùng:
-      /setenv KEY VALUE
-      /setenv_status  (xem nhanh ENV đang chạy)
-    Hỗ trợ bool: true/false/1/0/on/off/yes/no
+    /setenv KEY VALUE
+    /setenv_status
     """
     from core import auto_trade_engine as ae
 
@@ -602,128 +631,87 @@ async def setenv_cmd(update, context):
     key = (context.args[0] or "").strip()
     val_raw = " ".join(context.args[1:]).strip()
 
-    # ---- ép kiểu helper
+    # ép kiểu helper
     def _as_bool(s: str) -> bool:
-        return str(s or "").strip().lower() in ("1", "true", "on", "yes", "y")
+        return str(s or "").strip().lower() in ("1","true","on","yes","y")
 
     def _is_floatlike(s: str) -> bool:
-        try:
-            float(s); return True
-        except Exception:
-            return False
+        try: float(s); return True
+        except: return False
 
     def _is_intlike(s: str) -> bool:
-        try:
-            int(float(s)); return True
-        except Exception:
-            return False
+        try: int(float(s)); return True
+        except: return False
 
-    # ---- alias/whitelist key
-    # Alias tương thích cũ:
+    # alias tương thích cũ:
     aliases = {
         "MAX_ORDERS_PER_TIDE_WINDOW": "MAX_TRADES_PER_WINDOW",
-        # các alias guard "extreme" mà anh test trước:
         "EXTREME_GUARD": "EXTREME_BLOCK_ON",
-        "EXTREME_GUARD_KIND": "EXTREME_KIND",  # (hiện chưa dùng tách rời, mình gom theo ngưỡng RSI/Stoch)
+        "EXTREME_GUARD_KIND": "EXTREME_KIND",  # tạm passthrough string
     }
     key_norm = aliases.get(key, key)
 
-    # Danh sách KEY cho phép và kiểu dữ liệu
     bool_keys = {
-        "ENTRY_LATE_ONLY",
-        "ENTRY_LATE_PREF",
-        "AUTO_DEBUG",
-        "AUTO_DEBUG_VERBOSE",
-        "AUTO_DEBUG_ONLY_WHEN_SKIP",
+        "ENTRY_LATE_ONLY","ENTRY_LATE_PREF",
+        "AUTO_DEBUG","AUTO_DEBUG_VERBOSE","AUTO_DEBUG_ONLY_WHEN_SKIP",
         "ENFORCE_M5_MATCH_M30",
         "M30_FLIP_GUARD",
-        "M5_GAP_SCOPED_TO_WINDOW",
-        "ALLOW_SECOND_ENTRY",
-        "M5_RELAX_NEED_CURRENT",
-        "M5_REQUIRE_ZONE_STRICT",
-        "EXTREME_BLOCK_ON",           # bật/tắt chặn cực trị RSI/Stoch
+        "M5_GAP_SCOPED_TO_WINDOW","ALLOW_SECOND_ENTRY",
+        "M5_RELAX_NEED_CURRENT","M5_REQUIRE_ZONE_STRICT",
+        "HTF_NEAR_ALIGN","SYNERGY_ON",
+        "EXTREME_BLOCK_ON",
     }
     int_keys = {
-        "M5_MAX_DELAY_SEC",
-        "SCHEDULER_TICK_SEC",
-        "MAX_TRADES_PER_WINDOW",
-        "M30_STABLE_MIN_SEC",
-        "M30_NEED_CONSEC_N",
-        "M5_MIN_GAP_MIN",
-        "M5_LOOKBACK_RELAX",
-        "M5_LOOKBACK_STRICT",
-        "ENTRY_SEQ_WINDOW_MIN",
-        "RSI_OB", "RSI_OS",
-        # nếu anh có giới hạn toàn cục:
-        "MAX_TRADES_PER_DAY",
-        "MAX_TRADES_PER_TIDE_WINDOW",
+        "M5_MAX_DELAY_SEC","SCHEDULER_TICK_SEC",
+        "MAX_TRADES_PER_WINDOW","MAX_TRADES_PER_DAY","MAX_TRADES_PER_TIDE_WINDOW",
+        "M30_STABLE_MIN_SEC","M30_NEED_CONSEC_N",
+        "M5_MIN_GAP_MIN","M5_LOOKBACK_RELAX","M5_LOOKBACK_STRICT",
+        "ENTRY_SEQ_WINDOW_MIN","M30_TAKEOVER_MIN",
+        "RSI_OB","RSI_OS",
+        "STCH_RECENT_N",
     }
     float_keys = {
-        "ENTRY_LATE_FROM_HRS",
-        "ENTRY_LATE_TO_HRS",
-        "TP_TIME_HOURS",
-        "M5_WICK_PCT",
-        "M5_VOL_MULT_RELAX",
-        "M5_VOL_MULT_STRICT",
+        "ENTRY_LATE_FROM_HRS","ENTRY_LATE_TO_HRS","TP_TIME_HOURS",
+        "M5_WICK_PCT","M5_VOL_MULT_RELAX","M5_VOL_MULT_STRICT",
         "M5_SECOND_ENTRY_MIN_RETRACE_PCT",
-        "EXTREME_RSI_OB", "EXTREME_RSI_OS",
-        "EXTREME_STOCH_OB", "EXTREME_STOCH_OS",
-        "SIZE_MULT_STRONG", "SIZE_MULT_MID", "SIZE_MULT_CT",
-        "SONIC_WEIGHT",
-        "HTF_MIN_ALIGN_SCORE",
-        "HTF_NEAR_ALIGN_GAP",
-        "STCH_GAP_MIN", "STCH_SLOPE_MIN", "STCH_RECENT_N",
+        "EXTREME_RSI_OB","EXTREME_RSI_OS","EXTREME_STOCH_OB","EXTREME_STOCH_OS",
+        "SIZE_MULT_STRONG","SIZE_MULT_MID","SIZE_MULT_CT",
+        "SONIC_WEIGHT","HTF_MIN_ALIGN_SCORE","HTF_NEAR_ALIGN_GAP",
+        "STCH_GAP_MIN","STCH_SLOPE_MIN",
     }
+    passthrough_str = {"SONIC_MODE","M5_RELAX_KIND","AUTO_DEBUG_CHAT_ID","EXTREME_KIND"}
 
-    # Một số key QUY ĐỊNH theo string tự do (không ép kiểu):
-    passthrough_str = {
-        "SONIC_MODE",      # weight|strict|…
-        "M5_RELAX_KIND",   # either|rsi_only|candle_only
-        "AUTO_DEBUG_CHAT_ID",
-    }
-
-    # Validate + ép kiểu
     kv_to_apply = {}
     try:
         if key_norm in bool_keys:
             kv_to_apply[key_norm] = "true" if _as_bool(val_raw) else "false"
         elif key_norm in int_keys:
             if not _is_intlike(val_raw):
-                await msg.reply_text(f"Giá trị cho {key_norm} phải là số nguyên.")
-                return
+                await msg.reply_text(f"Giá trị cho {key_norm} phải là số nguyên."); return
             kv_to_apply[key_norm] = str(int(float(val_raw)))
         elif key_norm in float_keys:
             if not _is_floatlike(val_raw):
-                await msg.reply_text(f"Giá trị cho {key_norm} phải là số (float).")
-                return
+                await msg.reply_text(f"Giá trị cho {key_norm} phải là số (float)."); return
             kv_to_apply[key_norm] = str(float(val_raw))
         elif key_norm in passthrough_str:
             kv_to_apply[key_norm] = val_raw
         else:
-            await msg.reply_text(
-                f"KEY không được phép: {key}\nGõ /help để xem KEY hỗ trợ."
-            )
-            return
+            await msg.reply_text(f"KEY không được phép: {key}\nGõ /help để xem KEY hỗ trợ."); return
     except Exception as e:
-        await msg.reply_text(f"Lỗi ép kiểu: {e}")
-        return
+        await msg.reply_text(f"Lỗi ép kiểu: {e}"); return
 
-    # Ghi ENV process-wide
-    import os
+    # ghi ENV
     for k, v in kv_to_apply.items():
         os.environ[k] = v
 
-    # Đẩy vào core để loop AUTO dùng ngay
+    # đẩy vào core
     try:
-        ae._apply_runtime_env(kv_to_apply)  # <— cầu nối sang core
+        ae._apply_runtime_env(kv_to_apply)
     except Exception as e:
-        # vẫn tiếp tục, vì auto sẽ đọc ENV ở tick sau
         print(f"[WARN] _apply_runtime_env failed: {e}")
 
-    # Phản hồi
     pretty = "\n".join([f"• {k} = {v}" for k, v in kv_to_apply.items()])
     await msg.reply_html(f"✅ Đã cập nhật ENV (runtime):\n{pretty}")
-
 
 # ========== /setenv_status ==========
 async def setenv_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
