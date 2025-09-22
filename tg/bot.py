@@ -460,6 +460,36 @@ async def help_cmd(update, context):
     short_mode = bool(args and args[0].lower() in ("short", "s"))
 
     if short_mode:
+        # Khối bổ sung (đã escape HTML & gọn để không vượt giới hạn Telegram)
+        extra = (
+            "<b>Presets (theo Moon — đặt tên mới):</b>\n"
+            "• P1 — 0–25% (quanh New): Waning Crescent ↔️ New ↔️ Waxing Crescent\n"
+            "• P2 — 25–75% &amp; waxing: Waxing Crescent ↔️ First Quarter ↔️ Waxing Gibbous\n"
+            "• P3 — 75–100% (quanh Full): Waxing Gibbous ↔️ Full ↔️ Waning Gibbous\n"
+            "• P4 — 25–75% &amp; waning: Waning Gibbous ↔️ Last Quarter ↔️ Waning Crescent\n\n"
+            "<b>Auto theo Moon (P1–P4):</b>\n"
+            "• /preset auto để đổi nhanh theo Moon (P1–P4)\n"
+            "• /preset P1|P2|P3|P4 → chọn thủ công preset P-code.\n\n"
+            "<b>Scoring H4/M30 (tóm tắt, đã nới logic theo zone &amp; hướng):</b>\n"
+            "• Z2/Z4 = +2 (ủng hộ hướng đi lên/xuống TÙY vị trí RSI vs EMA-RSI và hướng di chuyển vào zone).\n"
+            "• Z3 (45–55) = −1 (barrier, dễ sideway/đảo, cần cross để xác nhận).\n"
+            "• RSI×EMA(RSI) cross = +2; align ổn định = +1.\n"
+            "• Stoch RSI: bật ↑ từ &lt;20 / gãy ↓ từ &gt;80 = +2; bứt qua 50 = +1.\n"
+            "• Sonic weight (nếu SONIC_MODE=weight) = +W khi cùng chiều (hiện: mode=weight, W=1.0).\n\n"
+            "<b>Moon bonus (H4):</b>\n"
+            "• +0..1.5 điểm tùy preset P1–P4 &amp; stage (pre/on/post) mốc N/FQ/F/LQ — chỉ boost độ tin cậy, không tự đảo bias.\n\n"
+            "<b>Map total → size (đòn bẩy theo điểm):</b>\n"
+            "• Total = H4_score + M30_score + Moon_bonus.\n"
+            "• ≥8.5 → ×1.0; 6.5–8.5 → ×0.7; thấp hơn / CT → ×0.4.\n\n"
+            "<b>AUTO execute &amp; khối lượng:</b>\n"
+            "• Trong khung thủy triều và đạt điều kiện HTF (H4 ưu tiên, M30 không ngược): chọn LONG/SHORT.\n"
+            "• M5 Gate phải PASS (RELAX/STRICT tùy ENV) mới vào lệnh.\n"
+            "• Khối lượng: dùng calc_qty(balance, risk_percent, leverage, price).\n"
+            "• SL/TP tự động theo auto_sl_by_leverage, có thu hẹp biên tùy preset/ENV.\n\n"
+            "<b>Gợi ý debug nhanh:</b>\n"
+            "• /setenv_status để xem toàn bộ ENV hiện tại.\n"
+        )
+
         short_text = (
             "<b>📘 Help (rút gọn)</b>\n\n"
             "<b>Lệnh chính:</b>\n"
@@ -478,6 +508,7 @@ async def help_cmd(update, context):
             f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
             f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
             f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n\n"
+            + extra +
             "➡️ Dùng <code>/help</code> để xem bản đầy đủ (đã auto-split)."
         )
         await _send_long_html(update, context, short_text)
@@ -528,8 +559,8 @@ async def help_cmd(update, context):
         f"<code>/setenv HTF_NEAR_ALIGN_GAP 2.0</code> (hiện: {v('HTF_NEAR_ALIGN_GAP','2.0')})\n"
         f"<code>/setenv SYNERGY_ON true|false</code> (hiện: {v('SYNERGY_ON','true')})\n"
         f"<code>/setenv M30_TAKEOVER_MIN 0</code> (hiện: {v('M30_TAKEOVER_MIN','0')})\n\n"
-		f"<code>/setenv CROSS_RECENT_N 2</code> (hiện: {v('CROSS_RECENT_N','2')})\n"
-		f"<code>/setenv RSI_GAP_MIN 2.0</code> (hiện: {v('RSI_GAP_MIN','2.0')})\n\n"
+        f"<code>/setenv CROSS_RECENT_N 2</code> (hiện: {v('CROSS_RECENT_N','2')})\n"
+        f"<code>/setenv RSI_GAP_MIN 2.0</code> (hiện: {v('RSI_GAP_MIN','2.0')})\n\n"
 
         "<b>Sonic & M5 filters:</b>\n"
         f"<code>/setenv SONIC_MODE weight|off</code> (hiện: {v('SONIC_MODE','weight')})\n"
@@ -560,7 +591,6 @@ async def help_cmd(update, context):
     )
 
     await _send_long_html(update, context, text)
-
 
 # ========== /preset ==========
 async def preset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
