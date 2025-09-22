@@ -528,6 +528,8 @@ async def help_cmd(update, context):
         f"<code>/setenv HTF_NEAR_ALIGN_GAP 2.0</code> (hiện: {v('HTF_NEAR_ALIGN_GAP','2.0')})\n"
         f"<code>/setenv SYNERGY_ON true|false</code> (hiện: {v('SYNERGY_ON','true')})\n"
         f"<code>/setenv M30_TAKEOVER_MIN 0</code> (hiện: {v('M30_TAKEOVER_MIN','0')})\n\n"
+		f"<code>/setenv CROSS_RECENT_N 2</code> (hiện: {v('CROSS_RECENT_N','2')})\n"
+		f"<code>/setenv RSI_GAP_MIN 2.0</code> (hiện: {v('RSI_GAP_MIN','2.0')})\n\n"
 
         "<b>Sonic & M5 filters:</b>\n"
         f"<code>/setenv SONIC_MODE weight|off</code> (hiện: {v('SONIC_MODE','weight')})\n"
@@ -666,7 +668,7 @@ async def setenv_cmd(update, context):
         "MAX_TRADES_PER_WINDOW","MAX_TRADES_PER_DAY","MAX_TRADES_PER_TIDE_WINDOW",
         "M30_STABLE_MIN_SEC","M30_NEED_CONSEC_N",
         "M5_MIN_GAP_MIN","M5_LOOKBACK_RELAX","M5_LOOKBACK_STRICT",
-        "ENTRY_SEQ_WINDOW_MIN","M30_TAKEOVER_MIN",
+        "ENTRY_SEQ_WINDOW_MIN","M30_TAKEOVER_MIN","CROSS_RECENT_N",
         "RSI_OB","RSI_OS",
         "STCH_RECENT_N",
     }
@@ -677,7 +679,7 @@ async def setenv_cmd(update, context):
         "EXTREME_RSI_OB","EXTREME_RSI_OS","EXTREME_STOCH_OB","EXTREME_STOCH_OS",
         "SIZE_MULT_STRONG","SIZE_MULT_MID","SIZE_MULT_CT",
         "SONIC_WEIGHT","HTF_MIN_ALIGN_SCORE","HTF_NEAR_ALIGN_GAP",
-        "STCH_GAP_MIN","STCH_SLOPE_MIN",
+        "STCH_GAP_MIN","STCH_SLOPE_MIN", "RSI_GAP_MIN",
     }
     passthrough_str = {"SONIC_MODE","M5_RELAX_KIND","AUTO_DEBUG_CHAT_ID","EXTREME_KIND"}
 
