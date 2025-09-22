@@ -19,6 +19,7 @@ from utils.time_utils import now_vn, TOKYO_TZ
 from strategy.signal_generator import evaluate_signal, tide_window_now
 from strategy.m5_strategy import m5_snapshot, m5_entry_check
 from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
+from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
 from core.approval_flow import create_pending
 
@@ -1562,30 +1563,56 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Không có pending hoặc sai ID.")
 
-async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = _uid(update)
-    st = storage.get_user(uid)
-    symbol = st.settings.pair
+# ==== /close (đa tài khoản: Binance/BingX/...) ====
+async def close_cmd(update, context):
+    """
+    /close                -> đóng 100% trên tất cả account trong ACCOUNTS_JSON
+    /close 50             -> đóng 50% tất cả account
+    /close bingx_test     -> đóng 100% riêng account 'bingx_test'
+    /close 25 bingx_test  -> đóng 25% riêng 'bingx_test' (hoặc: /close bingx_test 25)
+    """
+    msg = update.effective_message
+    pair = os.getenv("PAIR", "BTC/USDT")
 
-    pct = 100.0
-    if context.args:
-        arg = (context.args[0] or "").strip().lower()
-        if arg in ("all", "full"):
-            pct = 100.0
+    # parse args
+    args = context.args if hasattr(context, "args") else []
+    percent = 100.0
+    account = None
+
+    def _is_percent(s: str) -> bool:
+        try:
+            x = float(s)
+            return 0.0 <= x <= 100.0
+        except:
+            return False
+
+    if args:
+        a0 = args[0]
+        if _is_percent(a0):
+            percent = float(a0)
+            if len(args) >= 2:
+                account = args[1]
         else:
-            try: pct = float(arg)
-            except Exception:
-                await update.message.reply_text("Sai cú pháp. Dùng: /close [phần_trăm]\nVD: /close 50 (đóng 50%)")
-                return
-            if pct <= 0:
-                await update.message.reply_text("Phần trăm phải > 0.")
-                return
+            account = a0
+            if len(args) >= 2 and _is_percent(args[1]):
+                percent = float(args[1])
 
     try:
-        res = await ex.close_position_pct(symbol, pct)
-        await update.message.reply_text(res.message)
+        if account:
+            res = await close_position_on_account(account, pair, percent)
+            ok = res.get("ok", False)
+            text = f"Đã cố gắng đóng {percent:.0f}% vị thế trên <b>{account}</b> ({pair}): {res.get('message','')}"
+            await msg.reply_text(text, parse_mode="HTML")
+        else:
+            results = await close_position_on_all(pair, percent)
+            lines = [f"Đóng {percent:.0f}% vị thế ({pair}) trên TẤT CẢ tài khoản:"]
+            for i, r in enumerate(results, 1):
+                ok = r.get("ok", False)
+                lines.append(f"• #{i} → {r.get('message','ok' if ok else 'fail')}")
+            await msg.reply_text("\n".join(lines))
     except Exception as e:
-        await update.message.reply_text(f"Lỗi /close: {e}")
+        await msg.reply_text(f"❌ Lỗi /close: {e}")
+
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
