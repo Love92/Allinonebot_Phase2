@@ -6,6 +6,64 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
+# ==== [ADD] Helpers: bool env, broadcast & formatter ====
+import html as _html
+from typing import Optional as _Opt
+from telegram import Bot as _TgBot
+
+def _env_bool_rt(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1","true","yes","on","y")
+
+_TELEGRAM_BROADCAST_BOT_TOKEN = (os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN") or "").strip()
+_TELEGRAM_BROADCAST_CHAT_ID   = (os.getenv("TELEGRAM_BROADCAST_CHAT_ID") or "").strip()
+__bcast_bot: _Opt[_TgBot] = None
+if _TELEGRAM_BROADCAST_BOT_TOKEN:
+    try:
+        __bcast_bot = _TgBot(token=_TELEGRAM_BROADCAST_BOT_TOKEN)
+    except Exception:
+        __bcast_bot = None
+
+def _esc_html(s: object) -> str:
+    try:
+        return _html.escape(str(s or ""), quote=False)
+    except Exception:
+        return str(s)
+
+async def _broadcast_html(text: str) -> None:
+    if not (__bcast_bot and _TELEGRAM_BROADCAST_CHAT_ID):
+        return
+    try:
+        await __bcast_bot.send_message(
+            chat_id=int(_TELEGRAM_BROADCAST_CHAT_ID),
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+def _fmt_exec_broadcast(
+    *, pair: str, side: str, acc_name: str, ex_id: str,
+    lev: int, risk: float, qty: float, entry_spot: float,
+    sl: float | None, tp: float | None,
+    tide_label: str | None = None, mode_label: str = "AUTO",
+) -> str:
+    lines = [
+        f"🚀 <b>EXECUTED</b> | <b>{_esc_html(pair)}</b> <b>{_esc_html(side.upper())}</b>",
+        f"• Mode: {mode_label}",
+        f"• Account: {_esc_html(acc_name)} ({_esc_html(ex_id)})",
+        f"• Risk {risk:.1f}% | Lev x{lev}",
+        f"• Entry(SPOT)≈{entry_spot:.2f} | Qty={qty:.6f}",
+        f"• SL={sl:.2f}" if sl else "• SL=—",
+        f"• TP={tp:.2f}" if tp else "• TP=—",
+        f"• Tide: {tide_label}" if tide_label else "",
+    ]
+    return "\n".join([l for l in lines if l])
+# ==== [END ADD] ====
+
 
 # ========= Imports đồng bộ với /report =========
 # Lấy KẾT QUẢ CHUẨN H4/M30/Moon từ strategy.signal_generator.evaluate_signal()
@@ -398,6 +456,21 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     if isinstance(center, datetime):
         tau = (now - center).total_seconds() / 3600.0
     in_late = (tau is not None) and (ENTRY_LATE_FROM_HRS <= tau <= ENTRY_LATE_TO_HRS)
+    # ==== [ADD] Guard: ENTRY_LATE_ONLY ====
+    ENTRY_LATE_ONLY_RT = _env_bool_rt("ENTRY_LATE_ONLY", False)
+    ENTRY_LATE_FROM_HRS_RT = float(os.getenv("ENTRY_LATE_FROM_HRS", str(ENTRY_LATE_FROM_HRS)))
+    ENTRY_LATE_TO_HRS_RT   = float(os.getenv("ENTRY_LATE_TO_HRS",   str(ENTRY_LATE_TO_HRS)))
+    if ENTRY_LATE_ONLY_RT and not in_late:
+        msg = _one_line(
+            "SKIP", "late_only_block", now,
+            f"tau={tau:.2f}h, need {ENTRY_LATE_FROM_HRS_RT}–{ENTRY_LATE_TO_HRS_RT}h"
+        )
+        _last_decision_text[uid] = msg + "\n\n" + (text_block or "")
+        if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+            await _debug_send(app, uid, msg)
+        return msg
+    # ==== [END ADD] ====
+
 
     # Mỗi cửa sổ thủy triều chỉ cho 1 số lệnh nhất định
     key_day = now.strftime("%Y-%m-%d")
@@ -539,6 +612,40 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         chat_id = uid
     try:
         await app.bot.send_message(chat_id=chat_id, text=final_text)
+
+    # ==== [ADD] Broadcast EXECUTED for AUTO ====
+    try:
+        if opened_real:
+            tw_hrs = float(os.getenv("TIDE_WINDOW_HOURS", str(tide_window_hours if 'tide_window_hours' in locals() else 2.5)))
+            _start = (center - timedelta(hours=tw_hrs/2)).strftime("%H:%M") if 'center' in locals() and isinstance(center, datetime) else ""
+            _end   = (center + timedelta(hours=tw_hrs/2)).strftime("%H:%M") if 'center' in locals() and isinstance(center, datetime) else ""
+            tide_label = f"{_start}–{_end}" if _start and _end else None
+            entry_spot = float((locals().get('close_price') or 0.0))
+            acc_name = "default"
+            ex_id = "binanceusdm"
+            try:
+                if 'ex' in locals() and getattr(ex, "exchange_id", None):
+                    ex_id = ex.exchange_id  # type: ignore
+            except Exception:
+                pass
+            btxt = _fmt_exec_broadcast(
+                pair=pair_disp,
+                side=desired_side,
+                acc_name=acc_name,
+                ex_id=ex_id,
+                lev=int(leverage if 'leverage' in locals() else 1),
+                risk=float(risk_percent if 'risk_percent' in locals() else 0.0),
+                qty=float(qty if 'qty' in locals() else 0.0),
+                entry_spot=entry_spot,
+                sl=(float(sl_price) if ('sl_price' in locals() and sl_price is not None) else None),
+                tp=(float(tp_price) if ('tp_price' in locals() and tp_price is not None) else None),
+                tide_label=tide_label,
+                mode_label="AUTO",
+            )
+            await _broadcast_html(btxt)
+    except Exception:
+        pass
+    # ==== [END ADD] ====
     except Exception:
         pass
 
