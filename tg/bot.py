@@ -82,15 +82,19 @@ def _beautify_report(s: str) -> str:
     return s
 # === Telegram helper: split long HTML safely (<4096 chars) ===
 TELEGRAM_HTML_LIMIT = 4096
-_SAFE_BUDGET = 3500  # chừa biên cho thẻ HTML & format
+_SAFE_BUDGET = 3500  # chừa biên cho thẻ HTML & escape
 
-async def _send_long_html(update: Update, text: str):
+async def _send_long_html(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """
-    Gửi chuỗi HTML dài dưới dạng nhiều tin nhắn, tránh lỗi 4096 chars của Telegram.
-    Ưu tiên cắt theo block "\n\n"; nếu vẫn dài sẽ cắt cứng theo _SAFE_BUDGET.
+    Gửi chuỗi HTML dài thành nhiều tin, tránh lỗi 4096 của Telegram.
+    - Ưu tiên cắt theo block "\n\n"
+    - Nếu block vẫn dài, cắt cứng theo _SAFE_BUDGET
+    Sử dụng context.bot (PTB v20+), không dùng update.message.bot.
     """
     chat_id = update.effective_chat.id
-    parts = (text or "").split("\n\n")
+    txt = text or ""
+    parts = txt.split("\n\n")
+
     buf = ""
     for p in parts:
         candidate = (buf + ("\n\n" if buf else "") + p)
@@ -98,21 +102,26 @@ async def _send_long_html(update: Update, text: str):
             buf = candidate
         else:
             if buf:
-                await update.message.bot.send_message(
-                    chat_id=chat_id, text=buf, parse_mode="HTML", disable_web_page_preview=True
+                await context.bot.send_message(
+                    chat_id=chat_id, text=buf,
+                    parse_mode="HTML", disable_web_page_preview=True
                 )
-            # p có thể vẫn quá dài → cắt cứng nhiều khúc
+            # p có thể vẫn quá dài -> cắt cứng
             while len(p) > _SAFE_BUDGET:
                 chunk = p[:_SAFE_BUDGET]
-                await update.message.bot.send_message(
-                    chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True
+                await context.bot.send_message(
+                    chat_id=chat_id, text=chunk,
+                    parse_mode="HTML", disable_web_page_preview=True
                 )
                 p = p[_SAFE_BUDGET:]
             buf = p
+
     if buf:
-        await update.message.bot.send_message(
-            chat_id=chat_id, text=buf, parse_mode="HTML", disable_web_page_preview=True
+        await context.bot.send_message(
+            chat_id=chat_id, text=buf,
+            parse_mode="HTML", disable_web_page_preview=True
         )
+
 
 # ==== BROADCAST (format thống nhất, lấy Entry hiển thị từ BINANCE SPOT) ====
 _bcast_bot: Bot | None = None
@@ -445,7 +454,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Lấy giá trị runtime/ENV để hiển thị ở /help
+    # helper show ENV/runtimes trong /help
     def v(k, d="—"):
         return _env_or_runtime(k, d)
 
@@ -472,33 +481,20 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
             f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
             f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n\n"
-            "➡️ Gõ <code>/help</code> để xem bản đầy đủ (tự chia nhiều tin)."
+            "➡️ Dùng <code>/help</code> để xem bản đầy đủ (đã auto-split)."
         )
-        await _send_long_html(update, short_text)
+        await _send_long_html(update, context, short_text)
         return
 
-    # BẢN ĐẦY ĐỦ — giữ nội dung cũ của anh, có bổ sung biến mới,
-    # và QUAN TRỌNG: thay vì send 1 tin -> dùng _send_long_html để auto-split.
+    # BẢN ĐẦY ĐỦ — giữ nội dung cũ của anh, bổ sung biến mới + auto-split
     text = (
         "<b>📘 Hướng dẫn vận hành & DEBUG</b>\n\n"
         "<b>Command chính:</b>\n"
-        "/aboutme — triết lý THÂN–TÂM–TRÍ & checklist hệ thống cá nhân\n"
-        "/journal — mở form nhật ký giao dịch\n"
-        "/recovery_checklist — checklist phục hồi sau thua lỗ\n"
-        "/mode — xem/đổi chế độ (manual/auto)\n"
-        "/settings — cài đặt: pair, % vốn, leverage\n"
-        "/tidewindow — xem/đổi ± giờ quanh thủy triều\n"
-        "/report — gửi report H4→M30 (+ M5 filter)\n"
-        "/status — trạng thái bot & vị thế\n"
-        "/order — vào lệnh thủ công (trong khung thủy triều)\n"
-        "/approve &lt;id&gt; /reject &lt;id&gt; — duyệt tín hiệu (manual)\n"
-        "/close [pct] — đóng vị thế hiện tại\n"
-        "/m5report start|stop|status — bật/tắt auto M5 snapshot (worker riêng)\n"
-        "/daily — báo cáo Moon & Tide trong ngày\n"
-        "/autolog — in log AUTO (tick M5 gần nhất)\n"
-        "/preset &lt;name&gt;|auto — áp dụng preset theo Moon Phase (P1–P4)\n"
-        "/setenv KEY VALUE — (admin) chỉnh ENV runtime (debug/tuning)\n"
-        "/setenv_status — (admin) xem cấu hình ENV/runtime hiện tại\n"
+        "/aboutme, /journal, /recovery_checklist\n"
+        "/mode, /settings, /tidewindow\n"
+        "/report, /status, /order, /approve, /reject, /close\n"
+        "/m5report start|stop|status, /daily, /autolog, /preset name|auto\n"
+        "/setenv KEY VALUE, /setenv_status\n"
         "\n"
         "<b>ENTRY timing (Tide/Late):</b>\n"
         f"<code>/setenv ENTRY_LATE_ONLY true|false</code> (hiện: {v('ENTRY_LATE_ONLY','true')})\n"
@@ -525,13 +521,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
         f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n"
         "\n"
-        "…(các nhóm biến khác của anh giữ nguyên tại đây)…\n"
-        "\n"
+        "…(các nhóm biến/ghi chú khác của anh đặt tiếp ở đây)…\n"
         "💡 Mẹo: dùng <code>/help short</code> để xem nhanh."
     )
 
-    # Gửi theo nhiều chunk an toàn
-    await _send_long_html(update, text)
+    await _send_long_html(update, context, text)
+
 
 
 # ========== /preset ==========
