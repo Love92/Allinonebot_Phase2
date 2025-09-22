@@ -418,7 +418,6 @@ async def _apply_preset_and_reply(update: Update, preset_name: str, header: str 
         msg += "\n(có thể cần khởi động lại để áp dụng hoàn toàn)."
     await update.message.reply_text(msg, parse_mode="HTML")
 
-
 # ================== Commands ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
@@ -431,25 +430,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage.persist()
 
     await update.message.reply_text(
-        "👋 Xin chào! Bot Moon & Tide đã sẵn sàng.\n"
-        "/aboutme — triết lý THÂN–TÂM–TRÍ & checklist hệ thống cá nhân\n"
+        "👋 Xin chào! Bot Moon & Tide đã sẵn sàng.\n\n"
+        "📌 <b>Mode giao dịch:</b>\n"
+        "• <code>/mode auto</code> — Bot tự động vào lệnh khi đủ điều kiện.\n"
+        "• <code>/mode manual</code> — Bot chỉ báo tín hiệu, cần /approve hoặc /reject mới vào lệnh.\n"
+        "• <code>/order</code> — Vào lệnh thủ công ngay (theo %risk/leverage).\n\n"
+        "📌 <b>Đóng lệnh (/close):</b>\n"
+        "• <code>/close</code> hoặc <code>/close 100</code> — Đóng toàn bộ & hủy TP/SL đang treo.\n"
+        "• <code>/close 50</code> — Đóng 50% vị thế, vẫn giữ TP/SL phần còn lại.\n"
+        "• <code>/close 30 bingx_test</code> — Đóng 30% trên account bingx_test.\n\n"
+        "📌 <b>Command chính:</b>\n"
+        "/aboutme — triết lý THÂN–TÂM–TRÍ & checklist\n"
         "/journal — mở form nhật ký giao dịch\n"
         "/recovery_checklist — checklist phục hồi sau thua lỗ\n"
-        "/mode — xem/đổi chế độ (manual/auto)\n"
         "/settings — cài đặt: pair, % vốn, leverage\n"
         "/tidewindow — xem/đổi ± giờ quanh thủy triều\n"
         "/report — gửi report H4→M30 (+ M5 filter)\n"
         "/status — trạng thái bot & vị thế\n"
-        "/order — vào lệnh thủ công (trong khung thủy triều)\n"
         "/approve <id> /reject <id> — duyệt tín hiệu (manual)\n"
-        "/close [pct] — đóng vị thế hiện tại\n"
-        "/m5report start|stop|status — bật/tắt auto M5 snapshot (worker riêng)\n"
+        "/m5report start|stop — auto M5 snapshot mỗi 5 phút\n"
         "/daily — báo cáo Moon & Tide trong ngày\n"
-        "/autolog — in log AUTO (tick M5 gần nhất)\n"
-        "/preset <name>|auto — áp dụng preset theo Moon Phase (P1–P4)\n"
-        "/setenv KEY VALUE — (admin) chỉnh ENV runtime (debug/tuning)\n"
-        "/setenv_status — (admin) xem cấu hình ENV/runtime hiện tại\n"
-        "\nGõ /help để xem hướng dẫn vận hành & DEBUG chi tiết."
+        "/autolog — log AUTO (tick M5 gần nhất)\n"
+        "/preset <name>|auto — preset theo Moon Phase (P1–P4)\n"
+        "/setenv KEY VALUE — chỉnh ENV runtime\n"
+        "/setenv_status — xem cấu hình ENV/runtime\n\n"
+        "💡 Dùng <code>/help</code> để xem hướng dẫn chi tiết.",
+        parse_mode="HTML"
     )
 
 async def help_cmd(update, context):
@@ -1878,4 +1884,3 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-
