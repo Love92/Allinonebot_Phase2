@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from telegram import Update, Bot
+from telegram import constants
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Application
 
 from config.settings import (
@@ -1877,3 +1878,4 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
+
