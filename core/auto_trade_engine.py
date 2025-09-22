@@ -98,23 +98,55 @@ ENFORCE_M5_MATCH_M30 = _env_bool("ENFORCE_M5_MATCH_M30", "true")
 def _apply_runtime_env(kv: Dict[str, str]) -> None:
     """
     Cho phép /setenv ghi đè nhanh các ENV trong runtime.
+    Đồng bộ lại toàn bộ biến module để auto-loop áp dụng ngay.
     """
     global ENTRY_LATE_ONLY, ENTRY_LATE_FROM_HRS, ENTRY_LATE_TO_HRS
     global AUTO_DEBUG, AUTO_DEBUG_VERBOSE, AUTO_DEBUG_ONLY_WHEN_SKIP, AUTO_DEBUG_CHAT_ID
-    global ENFORCE_M5_MATCH_M30
+    global ENFORCE_M5_MATCH_M30, MAX_TRADES_PER_WINDOW
+    # Guards / filters mới:
+    global M30_FLIP_GUARD, M30_STABLE_MIN_SEC, M30_NEED_CONSEC_N
+    global M5_MIN_GAP_MIN, M5_GAP_SCOPED_TO_WINDOW, ALLOW_SECOND_ENTRY, M5_SECOND_ENTRY_MIN_RETRACE_PCT
+    # Các tham số khác có thể đã khai báo ở trên file:
+    # (TP_TIME_HOURS, M5_WICK_PCT, M5_VOL_MULT_RELAX/STRICT, EXTREME_* ...)
+    # Dùng os.getenv trực tiếp để tránh thiếu biến global
+
     for k, v in kv.items():
-        os.environ[k] = v  # lưu ENV để phần khác đọc đồng nhất
+        os.environ[k] = str(v)
+
     try:
+        # late-window
         ENTRY_LATE_ONLY         = _env_bool("ENTRY_LATE_ONLY", "true" if ENTRY_LATE_ONLY else "false")
         ENTRY_LATE_FROM_HRS     = float(os.getenv("ENTRY_LATE_FROM_HRS", str(ENTRY_LATE_FROM_HRS)))
         ENTRY_LATE_TO_HRS       = float(os.getenv("ENTRY_LATE_TO_HRS", str(ENTRY_LATE_TO_HRS)))
+
+        # debug
         AUTO_DEBUG              = _env_bool("AUTO_DEBUG", "true" if AUTO_DEBUG else "false")
         AUTO_DEBUG_VERBOSE      = _env_bool("AUTO_DEBUG_VERBOSE", "true" if AUTO_DEBUG_VERBOSE else "false")
         AUTO_DEBUG_ONLY_WHEN_SKIP = _env_bool("AUTO_DEBUG_ONLY_WHEN_SKIP", "true" if AUTO_DEBUG_ONLY_WHEN_SKIP else "false")
         AUTO_DEBUG_CHAT_ID      = os.getenv("AUTO_DEBUG_CHAT_ID", AUTO_DEBUG_CHAT_ID)
+
+        # rules
         ENFORCE_M5_MATCH_M30    = _env_bool("ENFORCE_M5_MATCH_M30", "true" if ENFORCE_M5_MATCH_M30 else "false")
+
+        # quota theo cửa sổ thủy triều
+        MAX_TRADES_PER_WINDOW   = int(float(os.getenv("MAX_TRADES_PER_WINDOW",
+                                           os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", str(MAX_TRADES_PER_WINDOW)))))
+
+        # guards M30/M5
+        M30_FLIP_GUARD          = _env_bool("M30_FLIP_GUARD", "true" if M30_FLIP_GUARD else "false")
+        M30_STABLE_MIN_SEC      = int(float(os.getenv("M30_STABLE_MIN_SEC", str(M30_STABLE_MIN_SEC))))
+        M30_NEED_CONSEC_N       = int(float(os.getenv("M30_NEED_CONSEC_N", str(M30_NEED_CONSEC_N))))
+        M5_MIN_GAP_MIN          = int(float(os.getenv("M5_MIN_GAP_MIN", str(M5_MIN_GAP_MIN))))
+        M5_GAP_SCOPED_TO_WINDOW = _env_bool("M5_GAP_SCOPED_TO_WINDOW", "true" if M5_GAP_SCOPED_TO_WINDOW else "false")
+        ALLOW_SECOND_ENTRY      = _env_bool("ALLOW_SECOND_ENTRY", "true" if ALLOW_SECOND_ENTRY else "false")
+        M5_SECOND_ENTRY_MIN_RETRACE_PCT = float(os.getenv("M5_SECOND_ENTRY_MIN_RETRACE_PCT", str(M5_SECOND_ENTRY_MIN_RETRACE_PCT)))
+
+        # (Các biến khác như EXTREME_* hoặc TP_TIME_HOURS, … dùng trực tiếp os.getenv ở nơi tiêu thụ
+        # để tránh phải khai báo global hết tại đây.)
     except Exception:
+        # Không crash auto loop nếu thiếu biến — chỉ bỏ qua cập nhật
         pass
+
 
 # ========= RISK-SENTINEL (Khoá AUTO nếu 2 SL liên tiếp ở 2 lần thủy triều khác nhau trong cùng ngày) =========
 AUTO_LOCK_ON_2_SL = (os.getenv("AUTO_LOCK_ON_2_SL", "true").strip().lower() in ("1","true","yes","on","y"))
@@ -675,4 +707,3 @@ async def place_order_with_retry(ex, pair: str, is_long: bool, qty: float, sl: f
             tries += 1
             continue
         return res
-
