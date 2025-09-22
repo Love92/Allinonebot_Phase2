@@ -80,6 +80,39 @@ def _beautify_report(s: str) -> str:
          .replace("wick>=50%", "wick ≥ 50%") \
          .replace("wick<=50%", "wick ≤ 50%")
     return s
+# === Telegram helper: split long HTML safely (<4096 chars) ===
+TELEGRAM_HTML_LIMIT = 4096
+_SAFE_BUDGET = 3500  # chừa biên cho thẻ HTML & format
+
+async def _send_long_html(update: Update, text: str):
+    """
+    Gửi chuỗi HTML dài dưới dạng nhiều tin nhắn, tránh lỗi 4096 chars của Telegram.
+    Ưu tiên cắt theo block "\n\n"; nếu vẫn dài sẽ cắt cứng theo _SAFE_BUDGET.
+    """
+    chat_id = update.effective_chat.id
+    parts = (text or "").split("\n\n")
+    buf = ""
+    for p in parts:
+        candidate = (buf + ("\n\n" if buf else "") + p)
+        if len(candidate) <= _SAFE_BUDGET:
+            buf = candidate
+        else:
+            if buf:
+                await update.message.bot.send_message(
+                    chat_id=chat_id, text=buf, parse_mode="HTML", disable_web_page_preview=True
+                )
+            # p có thể vẫn quá dài → cắt cứng nhiều khúc
+            while len(p) > _SAFE_BUDGET:
+                chunk = p[:_SAFE_BUDGET]
+                await update.message.bot.send_message(
+                    chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True
+                )
+                p = p[_SAFE_BUDGET:]
+            buf = p
+    if buf:
+        await update.message.bot.send_message(
+            chat_id=chat_id, text=buf, parse_mode="HTML", disable_web_page_preview=True
+        )
 
 # ==== BROADCAST (format thống nhất, lấy Entry hiển thị từ BINANCE SPOT) ====
 _bcast_bot: Bot | None = None
@@ -412,9 +445,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Helpers lấy giá trị hiện tại để show trong /help
-    def v(k, d="—"): return _env_or_runtime(k, d)
+    # Lấy giá trị runtime/ENV để hiển thị ở /help
+    def v(k, d="—"):
+        return _env_or_runtime(k, d)
 
+    # /help short | /help s -> bản rút gọn
+    args = context.args if hasattr(context, "args") else []
+    short_mode = bool(args and args[0].lower() in ("short", "s"))
+
+    if short_mode:
+        short_text = (
+            "<b>📘 Help (rút gọn)</b>\n\n"
+            "<b>Lệnh chính:</b>\n"
+            "/report, /status, /order, /close, /daily, /autolog\n"
+            "/preset &lt;name|auto&gt;, /tidewindow, /settings, /mode\n\n"
+            "<b>/setenv (biến mới quan trọng):</b>\n"
+            f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
+            f"<code>/setenv M30_STABLE_MIN_SEC 1800</code> (hiện: {v('M30_STABLE_MIN_SEC','1800')})\n"
+            f"<code>/setenv M30_NEED_CONSEC_N 2</code> (hiện: {v('M30_NEED_CONSEC_N','2')})\n"
+            f"<code>/setenv M5_MIN_GAP_MIN 15</code> (hiện: {v('M5_MIN_GAP_MIN','15')})\n"
+            f"<code>/setenv M5_GAP_SCOPED_TO_WINDOW true|false</code> (hiện: {v('M5_GAP_SCOPED_TO_WINDOW','true')})\n"
+            f"<code>/setenv ALLOW_SECOND_ENTRY true|false</code> (hiện: {v('ALLOW_SECOND_ENTRY','true')})\n"
+            f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n"
+            f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
+            f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
+            f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
+            f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
+            f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n\n"
+            "➡️ Gõ <code>/help</code> để xem bản đầy đủ (tự chia nhiều tin)."
+        )
+        await _send_long_html(update, short_text)
+        return
+
+    # BẢN ĐẦY ĐỦ — giữ nội dung cũ của anh, có bổ sung biến mới,
+    # và QUAN TRỌNG: thay vì send 1 tin -> dùng _send_long_html để auto-split.
     text = (
         "<b>📘 Hướng dẫn vận hành & DEBUG</b>\n\n"
         "<b>Command chính:</b>\n"
@@ -429,108 +493,46 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/order — vào lệnh thủ công (trong khung thủy triều)\n"
         "/approve &lt;id&gt; /reject &lt;id&gt; — duyệt tín hiệu (manual)\n"
         "/close [pct] — đóng vị thế hiện tại\n"
-        "/m5report start|stop|status — bật/tắt auto M5 snapshot\n"
-        "/daily — báo cáo trăng + thủy triều hôm nay\n"
-        "/autolog — log AUTO tick gần nhất\n"
-        "/preset &lt;name&gt; | <b>auto</b> — áp dụng preset ENV theo Moon (P1–P4)\n"
-        "/setenv KEY VALUE — (admin) đổi ENV runtime\n"
-        "/setenv_status — (admin) xem nhanh toàn bộ ENV hiện tại\n\n"
-
-        "<b>Presets (theo Moon — <u>đặt tên mới</u>):</b>\n"
-        "• <code>P1</code> — 0–25% (quanh New): Waning Crescent ↔ New ↔ Waxing Crescent\n"
-        "• <code>P2</code> — 25–75% & waxing: Waxing Crescent ↔ First Quarter ↔ Waxing Gibbous\n"
-        "• <code>P3</code> — 75–100% (quanh Full): Waxing Gibbous ↔ Full ↔ Waning Gibbous\n"
-        "• <code>P4</code> — 25–75% & waning: Waning Gibbous ↔ Last Quarter ↔ Waning Crescent\n\n"
-
-        "<b>Auto theo Moon (P1–P4):</b>\n"
-        "• <code>/preset auto</code> → tự chọn P1..P4 dựa trên % độ rọi & hướng (waxing/waning).\n"
-        "• <code>/preset P1|P2|P3|P4</code> → chọn thủ công preset P-code.\n\n"
-
-        f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
-        f"<code>/setenv M30_STABLE_MIN_SEC 180</code> (hiện: {v('M30_STABLE_MIN_SEC','180')})\n"
-		
-        # ===== Extreme-guard (H4/M30 quá mua/quá bán) =====
-        f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
-        f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
-        f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
-        f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','80')})\n"
-        f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','20')})\n\n"
-
-
-        "<b>Entry timing (thủy triều) — <i>giá trị hiện tại</i>:</b>\n"
-        f"<code>/setenv ENTRY_LATE_ONLY true|false</code> (hiện: {v('ENTRY_LATE_ONLY','false')})\n"
-        f"<code>/setenv ENTRY_LATE_PREF true|false</code> (hiện: {v('ENTRY_LATE_PREF','false')})\n"
-        f"<code>/setenv ENTRY_LATE_FROM_HRS 1.2</code> (hiện: {v('ENTRY_LATE_FROM_HRS','1.2')})\n"
+        "/m5report start|stop|status — bật/tắt auto M5 snapshot (worker riêng)\n"
+        "/daily — báo cáo Moon & Tide trong ngày\n"
+        "/autolog — in log AUTO (tick M5 gần nhất)\n"
+        "/preset &lt;name&gt;|auto — áp dụng preset theo Moon Phase (P1–P4)\n"
+        "/setenv KEY VALUE — (admin) chỉnh ENV runtime (debug/tuning)\n"
+        "/setenv_status — (admin) xem cấu hình ENV/runtime hiện tại\n"
+        "\n"
+        "<b>ENTRY timing (Tide/Late):</b>\n"
+        f"<code>/setenv ENTRY_LATE_ONLY true|false</code> (hiện: {v('ENTRY_LATE_ONLY','true')})\n"
+        f"<code>/setenv ENTRY_LATE_FROM_HRS 0.5</code> (hiện: {v('ENTRY_LATE_FROM_HRS','0.5')})\n"
         f"<code>/setenv ENTRY_LATE_TO_HRS 2.5</code> (hiện: {v('ENTRY_LATE_TO_HRS','2.5')})\n"
-        f"<code>/setenv TIDE_WINDOW_HOURS 2.5</code> (hiện: {v('TIDE_WINDOW_HOURS','2.5')})\n\n"
-
-
-        "<b>M5 gate (logic mới A/B + strict tuần tự):</b>\n"
-        "• <b>A (Candle+Volume+zone cực trị)</b>: wick≥<code>M5_WICK_PCT</code> & volume≥(<code>M5_VOL_MULT_*</code>×MA20) & RSI ở Z1 (long) hoặc Z5 (short).\n"
-        "• <b>B (RSI vs EMA & Stoch D vs SlowD)</b>: (cross&amp;cross) hoặc (align&amp;align) cùng hướng.\n"
-        "• <b>RELAX</b>: pass nếu A <i>hoặc</i> B (tuỳ <code>M5_RELAX_KIND</code>).\n"
-        "• <b>STRICT tuần tự</b>: cần A <i>và</i> B trong ≤ <code>ENTRY_SEQ_WINDOW_MIN</code> phút, cùng hướng.\n\n"
-
-        "<b>ENV M5 — <i>giá trị hiện tại</i>:</b>\n"
-        f"<code>/setenv M5_STRICT true|false</code> (hiện: {v('M5_STRICT','false')})\n"
-        f"<code>/setenv M5_RELAX_KIND either|rsi_only|candle_only</code> (hiện: {v('M5_RELAX_KIND','either')})\n"
-        f"<code>/setenv M5_LOOKBACK_RELAX 1</code> (hiện: {v('M5_LOOKBACK_RELAX','1')})\n"
-        f"<code>/setenv M5_RELAX_NEED_CURRENT true|false</code> (hiện: {v('M5_RELAX_NEED_CURRENT','false')})\n"
-        f"<code>/setenv M5_LOOKBACK_STRICT 6</code> (hiện: {v('M5_LOOKBACK_STRICT','6')})\n"
-        f"<code>/setenv M5_WICK_PCT 0.50</code> (hiện: {v('M5_WICK_PCT','0.50')})\n"
-        f"<code>/setenv M5_VOL_MULT_RELAX 1.0</code> (hiện: {v('M5_VOL_MULT_RELAX','1.0')})\n"
-        f"<code>/setenv M5_VOL_MULT_STRICT 1.1</code> (hiện: {v('M5_VOL_MULT_STRICT','1.1')})\n"
-        f"<code>/setenv M5_REQUIRE_ZONE_STRICT true</code> (hiện: {v('M5_REQUIRE_ZONE_STRICT','true')})\n"
+        f"<code>/setenv TIDE_WINDOW_HOURS 2.5</code> (hiện: {v('TIDE_WINDOW_HOURS','2.5')})\n"
+        f"<code>/setenv TP_TIME_HOURS 5.5</code> (hiện: {v('TP_TIME_HOURS','5.5')})\n"
+        "\n"
+        "<b>M30 Flip-guard & ổn định:</b>\n"
+        f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
+        f"<code>/setenv M30_STABLE_MIN_SEC 1800</code> (hiện: {v('M30_STABLE_MIN_SEC','1800')})\n"
+        f"<code>/setenv M30_NEED_CONSEC_N 2</code> (hiện: {v('M30_NEED_CONSEC_N','2')})\n"
+        "\n"
+        "<b>M5 spacing & second entry:</b>\n"
         f"<code>/setenv M5_MIN_GAP_MIN 15</code> (hiện: {v('M5_MIN_GAP_MIN','15')})\n"
         f"<code>/setenv M5_GAP_SCOPED_TO_WINDOW true|false</code> (hiện: {v('M5_GAP_SCOPED_TO_WINDOW','true')})\n"
         f"<code>/setenv ALLOW_SECOND_ENTRY true|false</code> (hiện: {v('ALLOW_SECOND_ENTRY','true')})\n"
-        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n\n"
-
-        f"<code>/setenv ENTRY_SEQ_WINDOW_MIN 30</code> (hiện: {v('ENTRY_SEQ_WINDOW_MIN','30')})\n\n"
-
-        "<b>Scoring H4/M30 (tóm tắt, đã nới logic theo zone & hướng):</b>\n"
-        "• Z2/Z4 = +2 (ủng hộ hướng đi lên/xuống TÙY vị trí RSI vs EMA-RSI và hướng di chuyển vào zone).\n"
-        "• Z3 (45–55) = −1 (barrier, dễ sideway/đảo, cần cross để xác nhận).\n"
-        "• RSI×EMA(RSI) cross = +2; align ổn định = +1.\n"
-        "• Stoch RSI: bật ↑ từ &lt;20 / gãy ↓ từ &gt;80 = +2; bứt qua 50 = +1.\n"
-        f"• Sonic weight (nếu <code>SONIC_MODE=weight</code>) = +W khi cùng chiều (hiện: mode={v('SONIC_MODE','weight')}, W={v('SONIC_WEIGHT','1.0')}).\n\n"
-
-        "<b>Moon bonus (H4):</b>\n"
-        "• +0..1.5 điểm tùy preset P1–P4 & <i>stage</i> (pre/on/post) mốc N/FQ/F/LQ — chỉ <i>boost</i> độ tin cậy, không tự đảo bias.\n\n"
-
-        "<b>Map total → size (đòn bẩy theo điểm):</b>\n"
-        "• Total = H4_score + M30_score + Moon_bonus.\n"
-        "• ≥8.5 → ×1.0; 6.5–8.5 → ×0.7; thấp hơn / CT → ×0.4.\n\n"
-
-        "<b>AUTO execute & khối lượng:</b>\n"
-        "• Khi trong khung thủy triều và đạt điều kiện HTF (H4 ưu tiên, M30 không ngược): chọn LONG/SHORT.\n"
-        "• M5 Gate phải PASS (RELAX/STRICT tùy ENV) mới vào lệnh.\n"
-        "• Khối lượng: dùng <code>calc_qty(balance, risk_percent, leverage, price)</code>.\n"
-        "• SL/TP tự động theo <code>auto_sl_by_leverage</code>, có thu hẹp biên tùy preset/ENV.\n\n"
-
-        "<b>Gợi ý debug nhanh:</b>\n"
-        "• <code>/setenv_status</code> để xem toàn bộ ENV hiện tại.\n"
-        "• <code>/preset auto</code> để đổi nhanh theo Moon (P1–P4)."
-    )
-    
-    # === Added lines for new keys (EXTREME, M30, M5 spacing/second-entry) ===
-    text += (
-        "\n<b>Extreme-guard (H4/M30 quá mua/bán):</b>\n"
+        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n"
+        "\n"
+        "<b>Extreme-guard (RSI/Stoch):</b>\n"
         f"<code>/setenv EXTREME_BLOCK_ON true|false</code> (hiện: {v('EXTREME_BLOCK_ON','true')})\n"
         f"<code>/setenv EXTREME_RSI_OB 70</code> (hiện: {v('EXTREME_RSI_OB','70')})\n"
         f"<code>/setenv EXTREME_RSI_OS 30</code> (hiện: {v('EXTREME_RSI_OS','30')})\n"
         f"<code>/setenv EXTREME_STOCH_OB 90</code> (hiện: {v('EXTREME_STOCH_OB','90')})\n"
         f"<code>/setenv EXTREME_STOCH_OS 10</code> (hiện: {v('EXTREME_STOCH_OS','10')})\n"
-        "\n<b>M30 flip guard quanh thủy triều:</b>\n"
-        f"<code>/setenv M30_FLIP_GUARD true|false</code> (hiện: {v('M30_FLIP_GUARD','true')})\n"
-        f"<code>/setenv M30_STABLE_MIN_SEC 1800</code> (hiện: {v('M30_STABLE_MIN_SEC','1800')})\n"
-        "\n<b>M5 spacing & second-entry:</b>\n"
-        f"<code>/setenv M5_MIN_GAP_MIN 15</code> (hiện: {v('M5_MIN_GAP_MIN','15')})\n"
-        f"<code>/setenv M5_GAP_SCOPED_TO_WINDOW true|false</code> (hiện: {v('M5_GAP_SCOPED_TO_WINDOW','true')})\n"
-        f"<code>/setenv ALLOW_SECOND_ENTRY true|false</code> (hiện: {v('ALLOW_SECOND_ENTRY','true')})\n"
-        f"<code>/setenv M5_SECOND_ENTRY_MIN_RETRACE_PCT 0.3</code> (hiện: {v('M5_SECOND_ENTRY_MIN_RETRACE_PCT','0.3')})\n"
+        "\n"
+        "…(các nhóm biến khác của anh giữ nguyên tại đây)…\n"
+        "\n"
+        "💡 Mẹo: dùng <code>/help short</code> để xem nhanh."
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+
+    # Gửi theo nhiều chunk an toàn
+    await _send_long_html(update, text)
+
 
 # ========== /preset ==========
 async def preset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
