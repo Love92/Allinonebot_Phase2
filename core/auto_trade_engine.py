@@ -44,6 +44,26 @@ async def _broadcast_html(text: str) -> None:
         )
     except Exception:
         pass
+		
+# ==== Slot guard để tránh tick trùng M5 ====
+_last_m5_slot = None
+
+def _m5_slot_locked(now: datetime) -> bool:
+    """Trả về True nếu slot M5 hiện tại đã chạy rồi"""
+    global _last_m5_slot
+    slot = now.replace(second=0, microsecond=0)
+    if _last_m5_slot == slot:
+        return True
+    return False
+
+def _mark_m5_slot(now: datetime) -> None:
+    """Đánh dấu slot M5 đã chạy"""
+    global _last_m5_slot
+    _last_m5_slot = now.replace(second=0, microsecond=0)
+# ==== END slot guard ====
+		
+		
+
 
 def _fmt_exec_broadcast(
     *, pair: str, side: str, acc_name: str, ex_id: str,
