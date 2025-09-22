@@ -451,7 +451,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/m5report start|stop — auto M5 snapshot mỗi 5 phút\n"
         "/daily — báo cáo Moon & Tide trong ngày\n"
         "/autolog — log AUTO (tick M5 gần nhất)\n"
-        "/preset <name>|auto — preset theo Moon Phase (P1–P4)\n"
+        "/preset &lt;name&gt;|auto — preset theo Moon Phase (P1–P4)\n"
         "/setenv KEY VALUE — chỉnh ENV runtime\n"
         "/setenv_status — xem cấu hình ENV/runtime\n\n"
         "💡 Dùng <code>/help</code> để xem hướng dẫn chi tiết.",
