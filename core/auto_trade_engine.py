@@ -6,84 +6,6 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
-# ==== [ADD] Helpers: bool env, broadcast & formatter ====
-import html as _html
-from typing import Optional as _Opt
-from telegram import Bot as _TgBot
-
-def _env_bool_rt(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1","true","yes","on","y")
-
-_TELEGRAM_BROADCAST_BOT_TOKEN = (os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN") or "").strip()
-_TELEGRAM_BROADCAST_CHAT_ID   = (os.getenv("TELEGRAM_BROADCAST_CHAT_ID") or "").strip()
-__bcast_bot: _Opt[_TgBot] = None
-if _TELEGRAM_BROADCAST_BOT_TOKEN:
-    try:
-        __bcast_bot = _TgBot(token=_TELEGRAM_BROADCAST_BOT_TOKEN)
-    except Exception:
-        __bcast_bot = None
-
-def _esc_html(s: object) -> str:
-    try:
-        return _html.escape(str(s or ""), quote=False)
-    except Exception:
-        return str(s)
-
-async def _broadcast_html(text: str) -> None:
-    if not (__bcast_bot and _TELEGRAM_BROADCAST_CHAT_ID):
-        return
-    try:
-        await __bcast_bot.send_message(
-            chat_id=int(_TELEGRAM_BROADCAST_CHAT_ID),
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
-		
-# ==== Slot guard để tránh tick trùng M5 ====
-_last_m5_slot = None
-
-def _m5_slot_locked(now: datetime) -> bool:
-    """Trả về True nếu slot M5 hiện tại đã chạy rồi"""
-    global _last_m5_slot
-    slot = now.replace(second=0, microsecond=0)
-    if _last_m5_slot == slot:
-        return True
-    return False
-
-def _mark_m5_slot(now: datetime) -> None:
-    """Đánh dấu slot M5 đã chạy"""
-    global _last_m5_slot
-    _last_m5_slot = now.replace(second=0, microsecond=0)
-# ==== END slot guard ====
-		
-		
-
-
-def _fmt_exec_broadcast(
-    *, pair: str, side: str, acc_name: str, ex_id: str,
-    lev: int, risk: float, qty: float, entry_spot: float,
-    sl: float | None, tp: float | None,
-    tide_label: str | None = None, mode_label: str = "AUTO",
-) -> str:
-    lines = [
-        f"🚀 <b>EXECUTED</b> | <b>{_esc_html(pair)}</b> <b>{_esc_html(side.upper())}</b>",
-        f"• Mode: {mode_label}",
-        f"• Account: {_esc_html(acc_name)} ({_esc_html(ex_id)})",
-        f"• Risk {risk:.1f}% | Lev x{lev}",
-        f"• Entry(SPOT)≈{entry_spot:.2f} | Qty={qty:.6f}",
-        f"• SL={sl:.2f}" if sl else "• SL=—",
-        f"• TP={tp:.2f}" if tp else "• TP=—",
-        f"• Tide: {tide_label}" if tide_label else "",
-    ]
-    return "\n".join([l for l in lines if l])
-# ==== [END ADD] ====
-
 
 # ========= Imports đồng bộ với /report =========
 # Lấy KẾT QUẢ CHUẨN H4/M30/Moon từ strategy.signal_generator.evaluate_signal()
@@ -152,6 +74,74 @@ async def _debug_send(app, uid: int, text: str) -> None:
         await app.bot.send_message(chat_id=uid, text=text)
     except Exception:
         pass
+
+# ========= [ADD] Broadcast helpers (đồng bộ format với /order) =========
+import html as _html
+from typing import cast
+try:
+    from telegram import Bot as _TGBot  # python-telegram-bot (async)
+except Exception:
+    _TGBot = None  # type: ignore
+
+def _esc(s: object) -> str:
+    try:
+        return _html.escape(str(s or ""), quote=False)
+    except Exception:
+        return str(s)
+
+_TELEGRAM_BROADCAST_BOT_TOKEN = (os.getenv("TELEGRAM_BROADCAST_BOT_TOKEN") or "").strip()
+_TELEGRAM_BROADCAST_CHAT_ID   = (os.getenv("TELEGRAM_BROADCAST_CHAT_ID") or "").strip()
+__bcast_bot = None
+if _TGBot and _TELEGRAM_BROADCAST_BOT_TOKEN:
+    try:
+        __bcast_bot = _TGBot(token=_TELEGRAM_BROADCAST_BOT_TOKEN)
+    except Exception:
+        __bcast_bot = None
+
+async def _broadcast_html(text: str) -> None:
+    """Gửi HTML vào broadcast group. Im lặng nếu thiếu token/chat id."""
+    if not (__bcast_bot and _TELEGRAM_BROADCAST_CHAT_ID):
+        return
+    try:
+        await cast(_TGBot, __bcast_bot).send_message(
+            chat_id=int(_TELEGRAM_BROADCAST_CHAT_ID),
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+def _fmt_exec_broadcast(
+    *, pair: str, side: str, acc_name: str, ex_id: str,
+    lev: int, risk: float, qty: float, entry_spot: float,
+    sl: float | None, tp: float | None,
+    tide_label: str | None = None, mode_label: str = "AUTO",
+) -> str:
+    lines = [
+        f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(side.upper())}</b>",
+        f"• Mode: {mode_label}",
+        f"• Account: {_esc(acc_name)} ({_esc(ex_id)})",
+        f"• Risk {risk:.1f}% | Lev x{lev}",
+        f"• Entry(SPOT)≈{entry_spot:.2f} | Qty={qty:.6f}",
+        f"• SL={sl:.2f}" if sl else "• SL=—",
+        f"• TP={tp:.2f}" if tp else "• TP=—",
+        f"• Tide: {tide_label}" if tide_label else "",
+    ]
+    return "\n".join([l for l in lines if l])
+
+def _binance_spot_entry(pair: str) -> float:
+    """Lấy giá hiển thị SPOT (Binance) để boardcard. Không dùng cho khớp lệnh."""
+    try:
+        from data.market_data import get_klines
+        sym = pair.replace("/", "").replace(":USDT", "")
+        df = get_klines(symbol=sym, interval="1m", limit=2)
+        if df is not None and len(df) > 0:
+            return float(df.iloc[-1]["close"])
+    except Exception:
+        pass
+    return 0.0
+# ========= [/ADD] ========================================================
 
 # ========= ENV & runtime knobs (có thể đổi bằng /setenv hoặc preset) =========
 def _env_bool(key: str, default: str = "false") -> bool:
@@ -385,18 +375,17 @@ class UserState:
 
 async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     """
-    Auto decision tick:
-      - Chặn trùng slot M5
-      - Lấy signal H4/M30/Moon giống /report (evaluate_signal)
-      - Late-window guard: nếu ENTRY_LATE_ONLY=true & ngoài late-window → SKIP
-      - (Tuỳ) Gate M5 lần cuối
-      - Đặt lệnh & lưu pos cho TP-by-time
-      - Broadcast EXECUTED (Mode: AUTO) nếu mở thật
-      - Trả về text để /autolog hiển thị
+    - Tick theo M5 close (chặn trùng slot)
+    - Đồng bộ H4/M30/Moon với /report bằng evaluate_signal()
+    - Tôn trọng res['skip'] và res['signal'] (NONE/LONG/SHORT)
+    - Kiểm tra late-window theo ENV (ENTRY_LATE_ONLY)
+    - (Tùy) M5 gate lần cuối (m5_entry_check) để an toàn
+    - Nếu OK: tính qty, SL/TP, mở lệnh (nếu ExchangeClient có sẵn)
+    - Lưu full text vào _last_decision_text để /autolog in lại
     """
     now = now_vn()
 
-    # 1) Lấy settings người dùng (giữ nguyên logic cũ, có fallback an toàn)
+    # 1) Lấy user settings
     try:
         st = storage.get_user(uid)
         pair_disp = st.settings.pair or "BTC/USDT"
@@ -408,6 +397,7 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         balance_usdt = float(getattr(st.settings, "balance_usdt", 100.0))
         tide_window_hours = float(getattr(st.settings, "tide_window_hours", TIDE_WINDOW_HOURS))
     except Exception:
+        # Fallback an toàn
         pair_disp = "BTC/USDT"
         symbol = "BTCUSDT"
         risk_percent = 10.0
@@ -418,30 +408,38 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         tide_window_hours = TIDE_WINDOW_HOURS
 
     if not auto_on:
-        if AUTO_DEBUG and AUTO_DEBUG_VERBOSE:
+        if AUTO_DEBUG and AUTO_DEBUG_VERBOSE:  # noqa: E713 (đảm bảo không văng nếu flake8)
             await _debug_send(app, uid, _one_line("SKIP", "auto_off", now))
         return None
 
-    # 1.1) Risk-sentinel: nếu đã LOCK trong ngày thì dừng
-    try:
-        if _rs_is_locked_today(storage, now):
-            if AUTO_LOCK_NOTIFY:
-                try:
-                    chat_id = int(AUTO_DEBUG_CHAT_ID) if str(AUTO_DEBUG_CHAT_ID).isdigit() else uid
-                except Exception:
-                    chat_id = uid
-                await app.bot.send_message(chat_id=chat_id, text=_one_line("LOCK", "auto_locked_today", now))
-            return None
-    except Exception:
-        pass
-
-    # 2) Chặn tick trùng slot M5
-    if _m5_slot_locked(now):
+    # === RISK-SENTINEL: chặn auto nếu hôm nay đã bị LOCK ===
+    if _rs_is_locked_today(storage, now):
+        if AUTO_LOCK_NOTIFY:
+            try:
+                chat_id = int(AUTO_DEBUG_CHAT_ID) if AUTO_DEBUG_CHAT_ID.isdigit() else uid
+                await app.bot.send_message(chat_id=chat_id, text=f"⚠️ Auto LOCKED hôm nay ({_rs_status_today(storage)['day']}). Yêu cầu kiểm tra thủ công.")
+            except Exception:
+                pass
         return None
-    _mark_m5_slot(now)
 
-    # 3) Lấy report chuẩn như /report
+    # 2) Chỉ xử lý ngay sau khi đóng nến M5
+    ts = int(now.timestamp())
+    slot = _floor_5m_epoch(ts)
+    boundary = slot * 300
+    delay = ts - boundary
+    if not (0 <= delay <= M5_MAX_DELAY_SEC):
+        if AUTO_DEBUG and AUTO_DEBUG_VERBOSE:
+            await _debug_send(app, uid, _one_line("SKIP", "not_m5_close", now, f"delay={delay}s"))
+        return None
+    if _last_m5_slot_sent.get(uid) == slot:
+        return None
+    _last_m5_slot_sent[uid] = slot
+
+    # 3) Evaluate report CHUẨN
     try:
+        res = evaluate_signal(pair_disp, tide_window_hours=tide_window_hours, balance_usdt=balance_usdt)
+    except TypeError:
+        # fallback nếu signature khác
         res = evaluate_signal(symbol)  # type: ignore
     except Exception as e:
         await _debug_send(app, uid, _one_line("ERR", "evaluate_signal_error", now, str(e)))
@@ -452,7 +450,7 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         await _debug_send(app, uid, _one_line("SKIP", "bad_report", now, reason))
         return None
 
-    # 4) Trích xuất thông tin cần thiết
+    # 4) Rút trích thông tin CHUẨN theo /report
     skip_report  = bool(res.get("skip", True))
     desired_side = str(res.get("signal", "NONE")).upper()
     confidence   = int(res.get("confidence", 0))
@@ -462,37 +460,22 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     m30          = frames.get("M30", {}) or {}
     m5f          = frames.get("M5", {}) or {}
 
-    # 5) Late-window (theo mốc thủy triều gần nhất)
+    # 5) Late-window theo mốc thủy triều gần nhất
     center = _nearest_tide_center(now)
     tau = None
     if isinstance(center, datetime):
         tau = (now - center).total_seconds() / 3600.0
-
-    # in_late: nếu chưa tính ở chỗ khác, tính nhanh ở đây theo ENV
-    try:
-        ENTRY_LATE_FROM_HRS = float(os.getenv("ENTRY_LATE_FROM_HRS", "0.5"))
-    except Exception:
-        ENTRY_LATE_FROM_HRS = 0.5
-    try:
-        ENTRY_LATE_TO_HRS = float(os.getenv("ENTRY_LATE_TO_HRS", "2.5"))
-    except Exception:
-        ENTRY_LATE_TO_HRS = 2.5
-
     in_late = (tau is not None) and (ENTRY_LATE_FROM_HRS <= tau <= ENTRY_LATE_TO_HRS)
 
-    # === Guard: ENTRY_LATE_ONLY (đọc trực tiếp từ ENV, để /setenv bật/tắt runtime) ===
-    ENTRY_LATE_ONLY = str(os.getenv("ENTRY_LATE_ONLY", "false")).strip().lower() in ("1","true","yes","on","y")
+    # === [ADD] Guard ENTRY_LATE_ONLY: chặn triệt để nếu bật và đang ngoài late-window
     if ENTRY_LATE_ONLY and not in_late:
-        msg = _one_line(
-            "SKIP", "late_only_block", now,
-            f"tau={tau:.2f}h, need {ENTRY_LATE_FROM_HRS}–{ENTRY_LATE_TO_HRS}h"
-        )
+        msg = _one_line("SKIP", "late_only_block", now, f"tau={tau:.2f}h, need {ENTRY_LATE_FROM_HRS}–{ENTRY_LATE_TO_HRS}h")
         _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
         if not AUTO_DEBUG_ONLY_WHEN_SKIP:
             await _debug_send(app, uid, msg)
         return msg
 
-    # 5.1) Quota theo cửa sổ thủy triều
+    # Mỗi cửa sổ thủy triều chỉ cho 1 số lệnh nhất định
     key_day = now.strftime("%Y-%m-%d")
     key_win = f"{center.strftime('%H:%M') if center else 'NA'}"
     st_user = _user_tide_state.setdefault(uid, {})
@@ -500,15 +483,15 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     st_key  = st_day.setdefault(key_win, {"trade_count": 0})
     if int(st_key.get("trade_count", 0)) >= MAX_TRADES_PER_WINDOW:
         msg = _one_line("SKIP", "reach_trade_limit_window", now, f"win={key_win}")
-        _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+        _last_decision_text[uid] = msg + "\n\n" + text_block
         if not AUTO_DEBUG_ONLY_WHEN_SKIP:
             await _debug_send(app, uid, msg)
         return msg
 
-    # 6) Tôn trọng skip của /report
+    # 6) Skip theo /report
     if skip_report:
         msg = _one_line("SKIP", "report_skip", now, text_block.splitlines()[0] if text_block else "")
-        _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+        _last_decision_text[uid] = msg + "\n\n" + text_block
         if not AUTO_DEBUG_ONLY_WHEN_SKIP:
             await _debug_send(app, uid, msg)
         return msg
@@ -516,62 +499,71 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     # 7) Không có tín hiệu
     if desired_side not in ("LONG", "SHORT"):
         msg = _one_line("SKIP", "no_signal", now, f"conf={confidence}")
-        _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+        _last_decision_text[uid] = msg + "\n\n" + text_block
         if not AUTO_DEBUG_ONLY_WHEN_SKIP:
             await _debug_send(app, uid, msg)
         return msg
 
-    # 8) Bắt buộc M5 khớp M30 (nếu bật)
+    # 8-NEW) Bắt buộc M5 cùng hướng với M30 (nếu bật ENFORCE_M5_MATCH_M30) ,Tắt: /setenv ENFORCE_M5_MATCH_M30 false
     side_m30 = str(m30.get("side", "NONE")).upper()
     if ENFORCE_M5_MATCH_M30:
         if side_m30 not in ("LONG", "SHORT"):
-            msg = _one_line("SKIP", "m30_none", now)
-            _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
-            if not AUTO_DEBUG_ONLY_WHEN_SKIP:
-                await _debug_send(app, uid, msg)
-            return msg
-        if desired_side != side_m30:
-            msg = _one_line("SKIP", "m5_must_match_m30", now, f"wanted={desired_side}, m30={side_m30}")
-            _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+            msg = _one_line("SKIP", "m30_side_none", now, "M30 không có hướng rõ ràng")
+            _last_decision_text[uid] = msg + "\n\n" + text_block
             if not AUTO_DEBUG_ONLY_WHEN_SKIP:
                 await _debug_send(app, uid, msg)
             return msg
 
-    # 9) (Tuỳ) Gate M5 lần cuối
+        if desired_side != side_m30:
+            msg = _one_line(
+                "SKIP", "desired_vs_m30_mismatch",
+                now, f"desired={desired_side} | m30={side_m30}"
+            )
+            _last_decision_text[uid] = msg + "\n\n" + text_block
+            if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                await _debug_send(app, uid, msg)
+            return msg
+
+    # 9) (Tùy) Gate M5 lần cuối (vẫn an toàn nếu strategy đã gate)
     if callable(m5_entry_check):
-        gate_side = desired_side if (desired_side in ("LONG", "SHORT")) else side_m30
+        # Dùng hướng M30 để gate M5 (đảm bảo M5==M30) khi bật rule;
+        # nếu tắt rule, dùng desired_side như cũ.
+        gate_side = side_m30 if (ENFORCE_M5_MATCH_M30 and side_m30 in ("LONG", "SHORT")) else desired_side
         ok, reason, m5_meta = m5_entry_check(symbol, gate_side)
         if not ok:
             msg = _one_line("SKIP", "m5_gate_fail", now, f"reason={reason}")
-            _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+            _last_decision_text[uid] = msg + "\n\n" + text_block
             if not AUTO_DEBUG_ONLY_WHEN_SKIP:
                 await _debug_send(app, uid, msg)
             return msg
 
-    # 10) Khớp lệnh (nếu có ExchangeClient)
+    # 10) Khớp lệnh (nếu có ExchangeClient). Nếu không, chạy mô phỏng và log.
     opened_real = False
     order_msg = "(simulation)"
-    close_price = None
-    qty = 0.0
-    sl_price = None
-    tp_price = None
     try:
         if callable(ExchangeClient) and callable(calc_qty) and callable(auto_sl_by_leverage):
             ex = ExchangeClient()
-            # giá gần nhất
+            # lấy số dư & giá tham chiếu
             try:
-                ticker = await ex._io(ex.client.fetch_ticker, pair_disp)
-                close_price = float(ticker.get("last") or ticker.get("close") or 0.0)
+                bal = await ex.balance_usdt()
+            except Exception:
+                bal = balance_usdt
+            close_price = None
+            try:
+                # ưu tiên close từ frames nếu có
+                close_price = float(m30.get("close") or h4.get("close"))
             except Exception:
                 close_price = None
             if close_price is None:
-                close_price = 0.0
+                try:
+                    ticker = await ex._io(ex.client.fetch_ticker, pair_disp)
+                    close_price = float(ticker.get("last") or ticker.get("close") or 0.0)
+                except Exception:
+                    close_price = 0.0
 
-            bal = balance_usdt
-            qty = calc_qty(bal, risk_percent, leverage, close_price)
+            qty = calc_qty(bal, risk_percent, leverage, close_price or 0.0)
             try:
-                SIZE_MULT = float(os.getenv("SIZE_MULT", "1.0"))
-                qty *= SIZE_MULT
+                qty *= float(os.getenv("SIZE_MULT", "1.0"))
             except Exception:
                 pass
 
@@ -584,82 +576,90 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     except Exception as e:
         order_msg = f"place_order_error:{e}"
 
-    # 11) Lưu pos để TP-by-time
-    center = center or now
+    # 11) Lưu trạng thái vị thế để TP-by-time
+    center = center or now  # tránh None
     tp_eta = center + timedelta(hours=_current_tp_hours())
+
+    # Risk-sentinel window key: định danh lần thủy triều gần nhất tại thời điểm vào lệnh
     try:
         tide_window_key = center.strftime("%Y-%m-%dT%H:%M")
     except Exception:
-        tide_window_key = now.strftime("%Y-%m-%dT%H:%M")
+        tide_window_key = str(center)
 
-    pos = {
-        "uid": uid,
-        "pair": pair_disp,
-        "side": desired_side,
-        "qty": float(qty or 0.0),
-        "entry_time": now,
-        "tide_center": center,
-        "tp_deadline": tp_eta,
+    _open_pos[uid] = {
+        "pair": pair_disp, "side": desired_side, "qty": None if not opened_real else "live",
+        "entry_time": now, "tide_center": center, "tp_deadline": tp_eta, "simulation": (not opened_real),
+        "sl_price": (sl_price if 'sl_price' in locals() else None),
         "tide_window_key": tide_window_key,
-        "sl_price": float(sl_price) if sl_price else None,
-        "tp_price": float(tp_price) if tp_price else None,
-        "simulation": not opened_real,
     }
-    _open_pos[uid] = pos
 
-    # 12) Cập nhật risk-sentinel khi đóng vị thế (nếu cần)
-    try:
-        if callable(ExchangeClient):
-            ex = ExchangeClient()
-            cur_pair = pos.get("pair", "BTC/USDT")
-            side_long_now, q_now = await ex.current_position(cur_pair)
-            if (q_now or 0.0) <= 1e-12:
-                last_price = None
-                try:
-                    ticker = await ex._io(ex.client.fetch_ticker, cur_pair)
-                    last_price = float(ticker.get("last") or ticker.get("close") or 0.0)
-                except Exception:
-                    last_price = None
+    st_key["trade_count"] = int(st_key.get("trade_count", 0)) + 1
+    order_seq = st_key["trade_count"]
 
-                result = "MANUAL"
-                sl_p = pos.get("sl_price")
-                side_opened = str(pos.get("side", "")).upper()
-                if sl_p and last_price:
-                    try:
-                        if side_opened == "LONG" and last_price <= float(sl_p) * 1.001:
-                            result = "SL"
-                        elif side_opened == "SHORT" and last_price >= float(sl_p) * 0.999:
-                            result = "SL"
-                    except Exception:
-                        pass
-
-                _rs_on_trade_close(
-                    storage=storage,
-                    result=result,
-                    window_key=pos.get("tide_window_key"),
-                    when=now,
-                )
-    except Exception:
-        pass
-
-    # 13) Tổng hợp text log & gửi debug
-    try:
-        start = (center - timedelta(hours=tide_window_hours/2)).strftime("%H:%M")
-        end   = (center + timedelta(hours=tide_window_hours/2)).strftime("%H:%M")
-        tide_label = f"{start}–{end}"
-    except Exception:
-        tide_label = ""
-
+    # 12) Build log /autolog
     header = (
         f"🤖 AUTO EXECUTE | {pair_disp} {desired_side}\n"
-        f"late_window={'YES' if in_late else 'NO'} | TP-by-time: {tp_eta.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"➡️ RESULT: {order_msg}"
+        f"Score H4/M30: {h4.get('score',0)} / {m30.get('score',0)} | Total≈{confidence}\n"
+        f"rule M5==M30: {'ON' if ENFORCE_M5_MATCH_M30 else 'OFF'} | m30={side_m30}\n"
+        f"late_window={'YES' if in_late else 'NO'} | "
+        f"TP-by-time: {tp_eta.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"➡️ EXECUTED: {desired_side} {pair_disp} | {order_msg}\n"
+        f"📣 Opened trade #{order_seq}/{MAX_TRADES_PER_WINDOW}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
-    final_text = header + "\n" + "━━━━━━━━━━━━━━━━━━━━━━━\n" + (text_block if text_block else "")
+    final_text = header + (text_block or "(no_report_block)")
     _last_decision_text[uid] = final_text
 
+    # 12.1) Broadcast boardcard EXECUTED (Mode: AUTO) giống /order — chỉ khi lệnh mở thật
+    if opened_real:
+        try:
+            entry_spot = _binance_spot_entry(pair_disp) or (close_price if 'close_price' in locals() else 0.0)  # type: ignore[name-defined]
+        except Exception:
+            entry_spot = (close_price if 'close_price' in locals() else 0.0)  # type: ignore[name-defined]
+
+        # Tạo nhãn tide hh:mm–hh:mm quanh center
+        try:
+            tw_hrs = float(os.getenv("TIDE_WINDOW_HOURS", str(tide_window_hours)))
+        except Exception:
+            tw_hrs = tide_window_hours
+        try:
+            start_hhmm = (center - timedelta(hours=tw_hrs/2)).strftime("%H:%M")
+            end_hhmm   = (center + timedelta(hours=tw_hrs/2)).strftime("%H:%M")
+            tide_label = f"{start_hhmm}–{end_hhmm}"
+        except Exception:
+            tide_label = None
+
+        # account/exchange id nếu client có expose
+        acc_name = "default"
+        ex_id = "binanceusdm"
+        try:
+            if 'ex' in locals() and getattr(ex, "exchange_id", None):  # type: ignore[name-defined]
+                ex_id = ex.exchange_id  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        try:
+            btxt = _fmt_exec_broadcast(
+                pair=pair_disp.replace(":USDT",""),
+                side=desired_side,
+                acc_name=acc_name,
+                ex_id=ex_id,
+                lev=int(leverage),
+                risk=float(risk_percent),
+                qty=float(qty if 'qty' in locals() else 0.0),
+                entry_spot=float(entry_spot or 0.0),
+                sl=(float(sl_price) if 'sl_price' in locals() and sl_price is not None else None),  # type: ignore[name-defined]
+                tp=(float(tp_price) if 'tp_price' in locals() and tp_price is not None else None),  # type: ignore[name-defined]
+                tide_label=tide_label,
+                mode_label="AUTO",
+            )
+            await _broadcast_html(btxt)
+        except Exception:
+            pass
+
+    # Gửi log ra kênh debug (hoặc user nếu không set)
     try:
-        chat_id = int(AUTO_DEBUG_CHAT_ID) if str(AUTO_DEBUG_CHAT_ID).isdigit() else uid
+        chat_id = int(AUTO_DEBUG_CHAT_ID) if AUTO_DEBUG_CHAT_ID.isdigit() else uid
     except Exception:
         chat_id = uid
     try:
@@ -667,46 +667,7 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     except Exception:
         pass
 
-    # 14) Broadcast EXECUTED (Mode: AUTO) nếu mở thật (nếu có helper)
-    if opened_real:
-        try:
-            # Nếu formatter/sender tồn tại → dùng, nếu không thì bỏ qua
-            entry_spot = float(close_price or 0.0)
-            acc_name = "default"
-            ex_id = "binanceusdm"
-            try:
-                if 'ex' in locals() and getattr(ex, "exchange_id", None):
-                    ex_id = ex.exchange_id  # type: ignore
-            except Exception:
-                pass
-
-            try:
-                btxt = _fmt_exec_broadcast(
-                    pair=pair_disp,
-                    side=desired_side,
-                    acc_name=acc_name,
-                    ex_id=ex_id,
-                    lev=int(leverage),
-                    risk=float(risk_percent),
-                    qty=float(qty or 0.0),
-                    entry_spot=entry_spot,
-                    sl=(float(sl_price) if sl_price is not None else None),
-                    tp=(float(tp_price) if tp_price is not None else None),
-                    tide_label=(tide_label or None),
-                    mode_label="AUTO",
-                )
-                try:
-                    await _broadcast_html(btxt)
-                except Exception:
-                    pass
-            except NameError:
-                # Chưa có helper → bỏ qua broadcast, không lỗi
-                pass
-        except Exception:
-            pass
-
     return final_text
-
 
 # ========= TP-by-time theo mốc thủy triều =========
 async def maybe_tp_by_time(uid: int, app, storage) -> Optional[str]:
