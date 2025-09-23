@@ -64,7 +64,6 @@ def auto_sl_by_leverage(entry: float, side: str, lev: int) -> Tuple[float, float
     Ví dụ:
       - LONG: SL ~ -1/lev * k; TP ~ +2/lev * k
       - SHORT: đối xứng
-    Có thể tinh chỉnh thêm ở nơi khác nếu cần.
     """
     try:
         entry = float(entry)
@@ -82,31 +81,6 @@ def auto_sl_by_leverage(entry: float, side: str, lev: int) -> Tuple[float, float
             return (entry * 0.99, entry * 1.02)
         else:
             return (entry * 1.01, entry * 0.98)
-            
-            
-# (Đặt trong class ExchangeClient, gần các helpers khác)
-@staticmethod
-def _as_side_long(v) -> bool:
-    """
-    Chuẩn hoá input chỉ hướng:
-    - bool: giữ nguyên
-    - str: 'long'/'buy'/'1'/'true' => True; 'short'/'sell'/'0'/'false'/'-1' => False
-    - int/float: >0 => True (long), <=0 => False (short)
-    - mặc định: False
-    """
-    try:
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            return float(v) > 0
-        s = str(v or "").strip().lower()
-        if s in ("long", "buy", "true", "1", "+1", "yes", "y"):
-            return True
-        if s in ("short", "sell", "false", "0", "-1", "no", "n"):
-            return False
-    except Exception:
-        pass
-    return False
 
 
 # ========== Exchange client (CCXT wrapper) ==========
@@ -212,6 +186,30 @@ class ExchangeClient:
             "beyond the limit",
         ]
         return any(k in s for k in keys)
+
+    # --- Helper: chuẩn hoá side_long từ bool/str/float/int ---
+    @staticmethod
+    def _as_side_long(v) -> bool:
+        """
+        Map:
+        - bool: giữ nguyên
+        - str: 'long'/'buy'/'1'/'true' => True; 'short'/'sell'/'0'/'false'/'-1' => False
+        - int/float: >0 => True (LONG), <=0 => False (SHORT)
+        - mặc định: False
+        """
+        try:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return float(v) > 0
+            s = str(v or "").strip().lower()
+            if s in ("long", "buy", "true", "1", "+1", "yes", "y"):
+                return True
+            if s in ("short", "sell", "false", "0", "-1", "no", "n"):
+                return False
+        except Exception:
+            pass
+        return False
 
     # ----- Fit quantity to exchange limits -----
     async def _fit_qty(self, symbol: str, qty: float, price: float) -> Tuple[float, dict]:
@@ -515,73 +513,70 @@ class ExchangeClient:
         except Exception as e:
             return OrderResult(False, f"open_market failed: {e}")
 
+    async def market_with_sl_tp(
+        self,
+        symbol: str,
+        side_long,                      # chấp nhận bool/str/float/int
+        qty: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+    ) -> OrderResult:
+        """
+        Lệnh market + đặt SL/TP reduceOnly (nếu sàn hỗ trợ).
+        - 'side_long' có thể là bool/str/float/int, sẽ được chuẩn hoá về bool.
+        """
+        try:
+            sym = self.normalize_symbol(symbol)
 
-# =========== market_with_sl_tp với side_long nhận về các biến =================================
-async def market_with_sl_tp(
-    self,
-    symbol: str,
-    side_long,                      # chấp nhận bool/str/float/int
-    qty: float,
-    sl_price: Optional[float],
-    tp_price: Optional[float],
-) -> OrderResult:
-    """
-    Lệnh market + đặt SL/TP reduceOnly (nếu sàn hỗ trợ).
-    - 'side_long' có thể là bool/str/float/int, sẽ được chuẩn hoá.
-    """
-    try:
-        sym = self.normalize_symbol(symbol)
+            # Chuẩn hoá hướng
+            is_long = self._as_side_long(side_long)
+            side = "buy" if is_long else "sell"
 
-        # Chuẩn hoá hướng
-        is_long = self._as_side_long(side_long)
-        side = "buy" if is_long else "sell"
+            # Giá hiện tại (để fit notional/limits)
+            px = await self.ticker_price(sym)
 
-        # Giá hiện tại (để fit notional/limits)
-        px = await self.ticker_price(sym)
+            # Fit khối lượng theo limits (min/max qty, step, min/max notional)
+            q_fit, meta = await self._fit_qty(sym, float(qty), float(px or 0))
+            if q_fit <= 0:
+                return OrderResult(False, f"entry_error: qty_fit=0 (limits={meta})")
 
-        # Fit khối lượng theo limits (min/max qty, step, min/max notional)
-        q_fit, meta = await self._fit_qty(sym, float(qty), float(px or 0))
-        if q_fit <= 0:
-            return OrderResult(False, f"entry_error: qty_fit=0 (limits={meta})")
+            # Vào lệnh thị trường (auto shrink nếu vướng giới hạn)
+            entry = await self._place_market_with_retries(sym, side, q_fit)
 
-        # Vào lệnh thị trường (auto shrink nếu vướng giới hạn)
-        entry = await self._place_market_with_retries(sym, side, q_fit)
+            # Post SL/TP reduceOnly
+            opp = "sell" if side == "buy" else "buy"
 
-        # Post SL/TP reduceOnly
-        opp = "sell" if side == "buy" else "buy"
+            # SL
+            if sl_price is not None:
+                try:
+                    sp = float(sl_price)
+                    params = {"reduceOnly": True, "stopPrice": sp}
+                    if self.exchange_id == "okx":
+                        # OKX yêu cầu trigger riêng
+                        params["slTriggerPx"] = sp
+                    await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
+                except Exception as e:
+                    logging.warning("Create SL order failed: %s", e)
 
-        # SL
-        if sl_price is not None:
-            try:
-                sp = float(sl_price)
-                params = {"reduceOnly": True, "stopPrice": sp}
-                if self.exchange_id == "okx":
-                    # OKX yêu cầu trigger riêng
-                    params["slTriggerPx"] = sp
-                await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
-            except Exception as e:
-                logging.warning("Create SL order failed: %s", e)
+            # TP
+            if tp_price is not None:
+                try:
+                    tp = float(tp_price)
+                    params = {"reduceOnly": True, "stopPrice": tp}
+                    tptype = "take_profit_market"  # một số sàn map nội bộ sang stop_market
+                    await self._io(self.client.create_order, sym, tptype, opp, q_fit, None, params)
+                except Exception as e:
+                    logging.warning("Create TP order failed: %s", e)
 
-        # TP
-        if tp_price is not None:
-            try:
-                tp = float(tp_price)
-                params = {"reduceOnly": True, "stopPrice": tp}
-                tptype = "take_profit_market"  # một số sàn map nội bộ sang stop_market
-                await self._io(self.client.create_order, sym, tptype, opp, q_fit, None, params)
-            except Exception as e:
-                logging.warning("Create TP order failed: %s", e)
+            return OrderResult(True, f"Live order placed: entry={entry.get('id')}",
+                               {"entry": entry})
 
-        return OrderResult(True, f"Live order placed: entry={getattr(entry, 'get', lambda k, d=None: None)('id') or entry.get('id')}",
-                           {"entry": entry})
-
-    except Exception as e:
-        # Chuẩn hoá thông điệp lỗi quen thuộc
-        msg = str(e)
-        if "min" in msg.lower() and "amount" in msg.lower():
+        except Exception as e:
+            # Chuẩn hoá thông điệp lỗi quen thuộc
+            msg = str(e)
+            if "min" in msg.lower() and "amount" in msg.lower():
+                return OrderResult(False, f"entry_error:{msg}")
             return OrderResult(False, f"entry_error:{msg}")
-        return OrderResult(False, f"entry_error:{msg}")
-
 
     async def close_percent(self, symbol: str, percent: float) -> OrderResult:
         """
