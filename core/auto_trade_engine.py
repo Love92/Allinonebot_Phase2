@@ -75,6 +75,23 @@ async def _debug_send(app, uid: int, text: str) -> None:
     except Exception:
         pass
 
+# [ADD] Chuẩn hoá side về 'buy'/'sell' cho an toàn (dùng nếu cần ở nơi khác)
+def _norm_side_txt(side_long_or_str) -> str:
+    if isinstance(side_long_or_str, bool):
+        return "buy" if side_long_or_str else "sell"
+    s = str(side_long_or_str).strip().upper()
+    if s in ("LONG", "BUY"):
+        return "buy"
+    if s in ("SHORT", "SELL"):
+        return "sell"
+    raise ValueError(f"Invalid side: {side_long_or_str}")
+
+# ========= [ADD] helper side cho open_market =========
+def _side_txt_from_bool(side_long: bool) -> str:
+    # True = LONG, False = SHORT
+    return "LONG" if bool(side_long) else "SHORT"
+# ========= [/ADD] ====================================
+
 # ========= [ADD] Broadcast helpers (đồng bộ format với /order) =========
 import html as _html
 from typing import cast
@@ -119,7 +136,8 @@ def _fmt_exec_broadcast(
     tide_label: str | None = None, mode_label: str = "AUTO",
 ) -> str:
     lines = [
-        f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(side.upper())}</b>",
+        # [EDIT] an toàn kiểu: str(side).upper()
+        f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(str(side).upper())}</b>",
         f"• Mode: {mode_label}",
         f"• Account: {_esc(acc_name)} ({_esc(ex_id)})",
         f"• Risk {risk:.1f}% | Lev x{lev}",
@@ -174,9 +192,6 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
     # Guards / filters mới:
     global M30_FLIP_GUARD, M30_STABLE_MIN_SEC, M30_NEED_CONSEC_N
     global M5_MIN_GAP_MIN, M5_GAP_SCOPED_TO_WINDOW, ALLOW_SECOND_ENTRY, M5_SECOND_ENTRY_MIN_RETRACE_PCT
-    # Các tham số khác có thể đã khai báo ở trên file:
-    # (TP_TIME_HOURS, M5_WICK_PCT, M5_VOL_MULT_RELAX/STRICT, EXTREME_* ...)
-    # Dùng os.getenv trực tiếp để tránh thiếu biến global
 
     for k, v in kv.items():
         os.environ[k] = str(v)
@@ -209,8 +224,6 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
         ALLOW_SECOND_ENTRY      = _env_bool("ALLOW_SECOND_ENTRY", "true" if ALLOW_SECOND_ENTRY else "false")
         M5_SECOND_ENTRY_MIN_RETRACE_PCT = float(os.getenv("M5_SECOND_ENTRY_MIN_RETRACE_PCT", str(M5_SECOND_ENTRY_MIN_RETRACE_PCT)))
 
-        # (Các biến khác như EXTREME_* hoặc TP_TIME_HOURS, … dùng trực tiếp os.getenv ở nơi tiêu thụ
-        # để tránh phải khai báo global hết tại đây.)
     except Exception:
         # Không crash auto loop nếu thiếu biến — chỉ bỏ qua cập nhật
         pass
@@ -360,6 +373,8 @@ _last_m5_slot_sent: Dict[int, int] = {}
 _user_tide_state: Dict[int, Dict[str, Any]] = {}
 # Vị thế đang mở (theo UID) để xử lý TP-by-time
 _open_pos: Dict[int, Dict[str, Any]] = {}
+# [ADD] Mốc thời gian vào lệnh gần nhất (gap guard)
+_LAST_EXEC_TS: Dict[int, float] = {}  # key=uid, val=epoch seconds
 
 def get_last_decision_text(uid: int) -> Optional[str]:
     return _last_decision_text.get(uid)
@@ -408,7 +423,7 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         tide_window_hours = TIDE_WINDOW_HOURS
 
     if not auto_on:
-        if AUTO_DEBUG and AUTO_DEBUG_VERBOSE:  # noqa: E713 (đảm bảo không văng nếu flake8)
+        if AUTO_DEBUG and AUTO_DEBUG_VERBOSE:  # noqa: E713
             await _debug_send(app, uid, _one_line("SKIP", "auto_off", now))
         return None
 
@@ -467,7 +482,7 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         tau = (now - center).total_seconds() / 3600.0
     in_late = (tau is not None) and (ENTRY_LATE_FROM_HRS <= tau <= ENTRY_LATE_TO_HRS)
 
-    # === [ADD] Guard ENTRY_LATE_ONLY: chặn triệt để nếu bật và đang ngoài late-window
+    # === [EDIT] Guard ENTRY_LATE_ONLY: chặn triệt để nếu bật và đang ngoài late-window
     if ENTRY_LATE_ONLY and not in_late:
         msg = _one_line("SKIP", "late_only_block", now, f"tau={tau:.2f}h, need {ENTRY_LATE_FROM_HRS}–{ENTRY_LATE_TO_HRS}h")
         _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
@@ -537,6 +552,27 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
                 await _debug_send(app, uid, msg)
             return msg
 
+    # [ADD] M5 gap guard — chặn vào lệnh quá gần nhau theo phút (dựa vào ENV M5_MIN_GAP_MIN)
+    try:
+        gap_min = int(float(os.getenv("M5_MIN_GAP_MIN", os.getenv("ENTRY_SEQ_WINDOW_MIN", "0"))))
+    except Exception:
+        gap_min = 0
+    if gap_min > 0:
+        import time
+        now_sec = time.time()
+        last = _LAST_EXEC_TS.get(uid)
+        if last and (now_sec - last) < gap_min * 60:
+            need_m = int(gap_min - (now_sec - last) / 60.0 + 0.999)
+            note = _one_line("SKIP", "m5_gap_guard", now, f"need≥{gap_min}m, còn≈{need_m}m")
+            _last_decision_text[uid] = note + ("\n\n" + text_block if text_block else "")
+            if AUTO_DEBUG and not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                await _debug_send(app, uid, note)
+            return note
+        # qua được guard -> ghi mốc NGAY khi quyết định (kể cả sau đó sàn lỗi)
+        from time import time as _now_s
+        _LAST_EXEC_TS[uid] = _now_s()
+    # [/ADD]
+
     # 10) Khớp lệnh (nếu có ExchangeClient). Nếu không, chạy mô phỏng và log.
     opened_real = False
     order_msg = "(simulation)"
@@ -570,9 +606,17 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
             sl_price, tp_price = auto_sl_by_leverage(close_price or 0.0, desired_side, leverage)
             side_long = (desired_side == "LONG")
             await ex.set_leverage(pair_disp, leverage)
-            res = await ex.market_with_sl_tp(pair_disp, side_long, qty, sl_price, tp_price)
+
+            # ========= [EDIT] Dùng open_market y như /order (thay cho market_with_sl_tp) =========
+            try:
+                # open_market(pair: str, side_txt: "LONG"/"SHORT", qty: float, sl: float|None, tp: float|None)
+                res = await ex.open_market(pair_disp, desired_side, qty, sl_price, tp_price)
+            except AttributeError:
+                # Trường hợp client phiên bản cũ: fallback về market_with_sl_tp nếu có
+                res = await ex.market_with_sl_tp(pair_disp, side_long, qty, sl_price, tp_price)  # type: ignore
+            # ==========================================================================
             order_msg = getattr(res, "message", str(res))
-            opened_real = True
+            opened_real = bool(getattr(res, "ok", False))
     except Exception as e:
         order_msg = f"place_order_error:{e}"
 
@@ -798,37 +842,5 @@ async def start_auto_loop(app, storage):
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 # ----------------------- /core/auto_trade_engine.py -----------------------
 
-async def place_order_with_retry(ex, pair: str, is_long: bool, qty: float, sl: float, tp: float):
-    """Đặt market + SL/TP và tự co-qty nếu gặp limit sàn. Retry tối đa 2 lần."""
-    # Round theo lot step nếu client có
-    try:
-        if hasattr(ex, "round_qty"):
-            qty = ex.round_qty(pair, qty)
-    except Exception:
-        pass
-
-    cap_phrases = (
-        "Exceeded the maximum",           # Binance
-        "maximum position value",         # BingX
-        "Position size exceeds",
-        "POSITION_SIZE_LIMIT",
-    )
-    tries = 0
-    while True:
-        res = await ex.market_with_sl_tp(pair, is_long, qty, sl, tp)
-        ok  = bool(getattr(res, "ok", False))
-        msg = str(getattr(res, "message", ""))
-        if ok:
-            return res
-        if tries >= 2:
-            return res
-        if any(p.lower() in msg.lower() for p in cap_phrases):
-            qty = max(qty * 0.85, 0.0001)
-            try:
-                if hasattr(ex, "round_qty"):
-                    qty = ex.round_qty(pair, qty)
-            except Exception:
-                pass
-            tries += 1
-            continue
-        return res
+# (Gỡ bỏ helper place_order_with_retry dùng market_with_sl_tp ở bản cũ;
+# nếu anh vẫn muốn retry với co-qty, có thể viết bản mới gọi ex.open_market(...).)
