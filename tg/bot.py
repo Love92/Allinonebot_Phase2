@@ -1183,110 +1183,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(
         f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
         f"⏱ Tide window: {tide_label}\n" + "\n".join(results)
-
-    # ---------- Entry hiển thị từ BINANCE SPOT ----------
-    try:
-        entry_spot = _binance_spot_entry(logic_pair)  # helper có sẵn trong dự án
-    except Exception:
-        entry_spot = None
-
-    # ---------- Chạy từng sàn ----------
-    results = []
-    for acc in uniq:
-        try:
-            exid   = str(acc.get("exchange") or "").lower()
-            name   = acc.get("name","default")
-            api    = acc.get("api_key") or ""
-            secret = acc.get("api_secret") or ""
-            testnet= bool(acc.get("testnet", False))
-            pair   = (acc.get("pair") or logic_pair).strip()
-
-            # KHỞI TẠO CLIENT ĐÚNG CHỮ KÝ HIỆN TẠI (không có account_name)
-            cli = ExchangeClient(exid, api, secret, testnet)
-
-            # Giá futures hiện tại
-            try:
-                px  = await cli.ticker_price(pair)
-            except Exception:
-                px = 0.0
-            if not px or px <= 0:
-                results.append(f"• {name} | {exid} | {pair} → ERR: Không lấy được giá futures.")
-                continue
-
-            # Sizing
-            try:
-                bal = await cli.get_balance_quote()  # tên hàm mới trong trade_executor
-            except Exception:
-                bal = 0.0
-
-            if qty_arg and qty_arg > 0:
-                qty = float(qty_arg)
-            else:
-                lot_min = float(os.getenv("LOT_STEP_FALLBACK", "0.0"))  # tuỳ sàn
-                qty = calc_qty(
-                    balance_usdt=bal,
-                    risk_percent=risk_percent,
-                    leverage=leverage,
-                    entry_price=px,
-                    min_qty=lot_min
-                )
-
-            # SL/TP: nếu thiếu thì auto theo leverage
-            if sl_arg is None or tp_arg is None:
-                sl_auto, tp_auto = auto_sl_by_leverage(
-                    entry=px,
-                    side=("LONG" if side_long else "SHORT"),
-                    lev=leverage
-                )
-                sl_use = sl_arg if sl_arg is not None else sl_auto
-                tp_use = tp_arg if tp_arg is not None else tp_auto
-            else:
-                sl_use, tp_use = sl_arg, tp_arg
-
-            # Set leverage (nếu sàn hỗ trợ qua ccxt)
-            try:
-                # ccxt: set_leverage(leverage, symbol) (tùy sàn/tùy version)
-                await cli._io(cli.client.set_leverage, int(leverage), cli.normalize_symbol(pair))
-            except Exception:
-                pass
-
-            # VÀO LỆNH: dùng method market_with_sl_tp của ExchangeClient
-            r = await cli.market_with_sl_tp(pair, side_long, float(qty), sl_use, tp_use)
-            results.append(f"• {name} | {exid} | {pair} → {r.message}")
-
-            # Broadcast khi OK
-            if getattr(r, "ok", False):
-                side_label = "LONG" if side_long else "SHORT"
-                btxt = _fmt_exec_broadcast(
-                    pair=pair.replace(":USDT",""),
-                    side=side_label,
-                    acc_name=name, ex_id=exid,
-                    lev=leverage, risk=risk_percent, qty=qty,
-                    entry_spot=(entry_spot or px),
-                    sl=sl_use, tp=tp_use,
-                    tide_label=tide_label, mode_label="Thủ công ORDER",
-                )
-                try:
-                    await _broadcast_html(btxt)
-                except Exception:
-                    # nếu broadcast bot riêng bị lỗi thì vẫn tiếp tục
-                    pass
-
-        except Exception as e:
-            results.append(f"• {acc.get('name','?')} | ERR: {e}")
-
-    # ---------- QUOTA commit (một lần sau vòng lặp) ----------
-    try:
-        _quota_commit(st, tkey, used, uid)
-    except Exception:
-        pass
-
-    # ---------- Phản hồi ----------
-    await msg.reply_text(
-        f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
-        f"⏱ Tide window: {tide_label}\n" + "\n".join(results)
     )
-
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -2016,4 +1913,3 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-
