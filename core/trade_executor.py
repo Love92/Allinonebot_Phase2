@@ -5,6 +5,7 @@
 # - Market entry + kèm SL/TP reduceOnly
 # - Hàm public chính: ExchangeClient.market_with_sl_tp(...)
 # - Kèm calc_qty, auto_sl_by_leverage, close helpers (đa tài khoản)
+# - BỔ SUNG: qty guard (min_amount, min_notional, max_notional), market_with_sl_tp_risk
 # ======================================================================
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ class OrderResult:
 
 
 # ======================================================================
-# Helper cơ bản
+# Helper cơ bản (backward compatible)
 # ======================================================================
 def calc_qty(
     balance_usdt: float,
@@ -48,7 +49,7 @@ def calc_qty(
 ) -> float:
     """
     Tính khối lượng theo % vốn * leverage, chia cho entry_price.
-    Có clamp min_qty nếu sàn yêu cầu.
+    (Giữ lại để tương thích cũ; KHÔNG kiểm tra min_notional/max_notional)
     """
     balance_usdt = max(float(balance_usdt or 0.0), 0.0)
     risk_percent = max(float(risk_percent or 0.0), 0.0)
@@ -73,8 +74,7 @@ def auto_sl_by_leverage(
     k: float = 0.75,
 ) -> Tuple[float, float]:
     """
-    Tính SL/TP gợi ý dựa vào leverage.
-    Ý tưởng: khoảng chịu lỗ ~ (k / lev) theo tỷ lệ %, TP đối xứng 1:1.
+    Tính SL/TP gợi ý dựa vào leverage (đối xứng).
     - LONG: SL = entry * (1 - k/lev/100), TP = entry * (1 + k/lev/100)
     - SHORT: SL = entry * (1 + k/lev/100), TP = entry * (1 - k/lev/100)
     """
@@ -91,7 +91,7 @@ def auto_sl_by_leverage(
         if s in ("SELL",):
             s = "SHORT"
 
-    pct = (k / lev) / 100.0  # về fraction
+    pct = (k / lev) / 100.0  # fraction
     if entry <= 0.0 or pct <= 0.0:
         return entry, entry
 
@@ -152,7 +152,8 @@ class ExchangeClient:
 
         # Một số sàn cần options
         if hasattr(ex, "options") and isinstance(ex.options, dict):
-            ex.options.setdefault("defaultType", "swap")  # ưu tiên futures/swap
+            # Binance futures thường dùng defaultType="future" hoặc "swap"
+            ex.options.setdefault("defaultType", "swap")
         return ex
 
     # ------------------------- Utils -------------------------
@@ -167,7 +168,7 @@ class ExchangeClient:
         """
         Chuẩn hoá cặp theo sàn:
         - binanceusdm: 'BTC/USDT'
-        - bingx/okx: 'BTC/USDT:USDT' (nếu không có suffix thì thêm)
+        - bingx/okx:   'BTC/USDT:USDT' (nếu không có suffix thì thêm)
         """
         s = str(symbol).upper().replace(" ", "")
         if self.exchange_id in ("bingx", "okx", "okex"):
@@ -191,7 +192,7 @@ class ExchangeClient:
 
     async def _fit_qty(self, symbol: str, qty: float) -> float:
         """
-        Fit khối lượng theo bước lot/precision của sàn.
+        Fit khối lượng theo bước lot/precision của sàn (giữ lại để tương thích).
         """
         sym = self.normalize_symbol(symbol)
         mkt = await self._io(self.client.load_markets)
@@ -215,8 +216,116 @@ class ExchangeClient:
 
         return float(qty)
 
+    # ===== NEW: Market metadata & snapping (để guard min/max) =====
+    async def _get_market_info(self, symbol: str) -> dict:
+        """Đọc market info đã load để lấy precision/limits/filters."""
+        sym = self.normalize_symbol(symbol)
+        markets = await self._io(self.client.load_markets)
+        m = markets.get(sym) or {}
+        limits = m.get("limits") or {}
+        info = m.get("info") or {}
+        step_amt = None
+        # lấy step từ filters nếu có (Binance/BingX)
+        for f in (info.get("filters") or []):
+            if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                try:
+                    step_amt = float(f.get("stepSize") or 0) or step_amt
+                except Exception:
+                    pass
+        return {
+            "precision": m.get("precision") or {},
+            "limits": limits,
+            "min_amt": (limits.get("amount") or {}).get("min"),
+            "min_notional": (limits.get("cost") or {}).get("min"),
+            "step_amt": step_amt,
+        }
+
+    @staticmethod
+    def _amount_to_precision_sync(market_info: dict, qty: float) -> float:
+        prec = (market_info.get("precision") or {}).get("amount")
+        if isinstance(prec, int):
+            return float(f"{float(qty):.{max(0, prec)}f}")
+        return float(qty)
+
+    @staticmethod
+    def _snap_step_sync(qty: float, step: float | None) -> float:
+        if not step or step <= 0:
+            return float(qty)
+        return float(math.floor(float(qty) / float(step)) * float(step))
+
+    @staticmethod
+    def _ceil_to_step_sync(qty: float, step: float | None) -> float:
+        if not step or step <= 0:
+            return float(qty)
+        return float(math.ceil(float(qty) / float(step)) * float(step))
+
+    # ===== NEW: Guarded qty từ risk% & lev =====
+    async def calc_order_qty_guarded(
+        self,
+        symbol: str,
+        price: float,
+        balance_usdt: float,
+        risk_pct: float,
+        leverage: float,
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """
+        notional_target = balance * risk% * lev
+        + snap precision/step
+        + đảm bảo >= min_notional & min_amount
+        + kiểm tra <= max_notional
+        + chống qty siêu nhỏ (e-13)
+        """
+        price = float(price)
+        balance_usdt = float(balance_usdt)
+        risk_pct = float(risk_pct)
+        leverage = float(leverage)
+
+        if price <= 0 or balance_usdt <= 0 or risk_pct <= 0 or leverage <= 0:
+            return None, "invalid_inputs"
+
+        notional_target = balance_usdt * (risk_pct / 100.0) * leverage
+        if notional_target <= 0:
+            return None, "notional_target_non_positive"
+
+        mi = await self._get_market_info(symbol)
+        min_amt = float(mi.get("min_amt") or 0.0)
+        min_notional = float(mi.get("min_notional") or 0.0)
+        step_amt = mi.get("step_amt")
+        max_notional = balance_usdt * leverage
+
+        # qty thô
+        qty = notional_target / price
+        # snap precision/step
+        qty = self._amount_to_precision_sync(mi, qty)
+        qty = self._snap_step_sync(qty, step_amt)
+        qty = self._amount_to_precision_sync(mi, qty)
+
+        # đảm bảo min_notional
+        if min_notional > 0 and qty * price < min_notional:
+            qty_need = self._ceil_to_step_sync(min_notional / price, step_amt)
+            qty = self._amount_to_precision_sync(mi, qty_need)
+
+        # đảm bảo min_amount (ví dụ 0.001 BTC)
+        if min_amt > 0 and qty < min_amt:
+            qty_need = self._ceil_to_step_sync(min_amt, step_amt)
+            qty = self._amount_to_precision_sync(mi, qty_need)
+
+        # guard max_notional
+        if qty <= 0:
+            return None, f"qty_not_valid:{qty}"
+        notional = qty * price
+        if notional > max_notional + 1e-9:
+            return None, f"exceed_max_notional:notional={notional:.6f}>max={max_notional:.6f}"
+
+        # chống siêu nhỏ (trường hợp e-13 trên BingX)
+        tiny_floor = max(1e-6, (min_amt or 0) * 0.1)
+        if qty < tiny_floor:
+            return None, f"qty_too_small_after_snap:{qty}"
+
+        return float(qty), None
+
     # ==================================================================
-    # 1) MARKET ENTRY + SL/TP (theo yêu cầu)
+    # 1) MARKET ENTRY + SL/TP (được nâng cấp fit & tối thiểu hoá lỗi qty)
     # ==================================================================
     async def market_with_sl_tp(
         self,
@@ -230,6 +339,7 @@ class ExchangeClient:
         Vào lệnh MARKET rồi đặt SL/TP reduceOnly (nếu truyền).
         - side_long: True/'LONG'/'BUY' => long; False/'SHORT'/'SELL' => short
         - Trả OrderResult(ok, message)
+        - NÂNG CẤP: fit qty theo precision/step và nếu < min_amount sẽ đẩy lên min_amount (nếu có)
         """
         # --- Chuẩn hoá side ---
         if isinstance(side_long, bool):
@@ -246,9 +356,19 @@ class ExchangeClient:
         side_txt = "buy" if is_long else "sell"
         sym = self.normalize_symbol(symbol)
 
-        # --- Fit qty & tạo lệnh market ---
+        # --- Fit qty & tối thiểu hoá lỗi min_amount ---
         try:
+            # fit theo precision/step
             q_fit = await self._fit_qty(sym, float(qty))
+            # nếu vẫn quá nhỏ, thử nâng lên min_amount (nếu có)
+            mi = await self._get_market_info(sym)
+            min_amt = float(mi.get("min_amt") or 0.0)
+            if min_amt > 0 and q_fit < min_amt:
+                q_fit = max(q_fit, min_amt)
+                # snap lại theo step nếu cần
+                q_fit = self._snap_step_sync(q_fit, mi.get("step_amt"))
+                q_fit = self._amount_to_precision_sync(mi, q_fit)
+
             if q_fit <= 0:
                 return OrderResult(False, f"qty_not_valid:{qty}")
 
@@ -260,15 +380,13 @@ class ExchangeClient:
         created = {"entry": entry}
         try:
             if self.exchange_id in ("okx", "okex"):
-                # OKX: tạo lệnh reduceOnly kèm stopLossPrice/takeProfitPrice qua params
-                params_sl = {"reduceOnly": True}
-                params_tp = {"reduceOnly": True}
+                # OKX: có thể dùng params stopLossPrice/takeProfitPrice
                 if sl:
                     try:
                         o_sl = await self._io(
                             self.client.create_order, sym, "market",
                             ("sell" if is_long else "buy"), q_fit, None,
-                            {**params_sl, "stopLossPrice": float(sl)}
+                            {"reduceOnly": True, "stopLossPrice": float(sl)}
                         )
                         created["sl"] = o_sl
                     except Exception as e2:
@@ -278,7 +396,7 @@ class ExchangeClient:
                         o_tp = await self._io(
                             self.client.create_order, sym, "market",
                             ("sell" if is_long else "buy"), q_fit, None,
-                            {**params_tp, "takeProfitPrice": float(tp)}
+                            {"reduceOnly": True, "takeProfitPrice": float(tp)}
                         )
                         created["tp"] = o_tp
                     except Exception as e3:
@@ -319,6 +437,29 @@ class ExchangeClient:
         return OrderResult(True, created)
 
     # ==================================================================
+    # 1b) MARKET ENTRY theo risk%/lev (MỚI) — tự tính qty hợp lệ rồi entry
+    # ==================================================================
+    async def market_with_sl_tp_risk(
+        self,
+        symbol: str,
+        side_long: Union[str, bool],
+        balance_usdt: float,
+        risk_pct: float,
+        leverage: float,
+        sl: Optional[float],
+        tp: Optional[float],
+        price_for_calc: Optional[float] = None,
+    ) -> OrderResult:
+        """
+        Entry theo risk% & leverage: tự tính qty hợp lệ (snap + min + max_notional).
+        """
+        price = float(price_for_calc or (await self.ticker_price(symbol)))
+        qty, reason = await self.calc_order_qty_guarded(symbol, price, balance_usdt, risk_pct, leverage)
+        if reason:
+            return OrderResult(False, reason)
+        return await self.market_with_sl_tp(symbol, side_long, qty, sl, tp)
+
+    # ==================================================================
     # 2) MARKET ENTRY tối giản (nếu nơi khác cần)
     # ==================================================================
     async def open_market(
@@ -348,13 +489,11 @@ class ExchangeClient:
         try:
             if leverage:
                 if self.exchange_id.startswith("binance"):
-                    # ccxt: set_leverage(leverage, symbol) (một số version cần params khác)
                     await self._io(self.client.set_leverage, int(leverage), self.normalize_symbol(symbol))
                 # bingx/okx: có thể không cần/không hỗ trợ unified — bỏ qua
         except Exception:
             pass
 
-        # gọi hàm chính
         return await self.market_with_sl_tp(symbol, is_long, qty, stop_loss, None)
 
     # ==================================================================
