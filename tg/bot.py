@@ -1043,19 +1043,19 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /order <LONG|SHORT> [risk%?] [lev?] [account_name?]
     - Nếu không truyền risk/lev thì lấy trong user settings.
-    - Gọi open_market() (thay cho market_with_sl_tp bản cũ).
-    - Có broadcast như trước.
+    - Dùng ExchangeClient.open_market() (không import open_market từ module).
+    - Broadcast giống định dạng cũ.
     """
     from math import isfinite
-    # import cục bộ tránh xung đột file cấu trúc
+    # import cục bộ tránh xung đột file cấu trúc (không import open_market)
     try:
-        from trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage, open_market
+        from trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
     except Exception:
-        from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage, open_market  # type: ignore
+        from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage  # type: ignore
 
     uid = _uid(update)
     st = storage.get_user(uid)
-    pair = st.settings.pair or os.getenv("PAIR", "BTC/USDT")
+    pair = (getattr(st.settings, "pair", None) or os.getenv("PAIR", "BTC/USDT")).strip()
     args = context.args if hasattr(context, "args") else []
 
     if not args:
@@ -1071,9 +1071,16 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # map BUY/LONG -> long, SELL/SHORT -> short (ExchangeClient nhận 'long'/'short'/'buy'/'sell')
     side_norm = "long" if side_s in ("LONG", "BUY") else "short"
 
-    # risk & lev (tuỳ chọn)
-    risk_pct = float(st.settings.risk_percent or 20.0)
-    lev = int(st.settings.leverage or 1)
+    # risk & lev (tuỳ chọn, fallback từ settings)
+    try:
+        risk_pct = float(getattr(st.settings, "risk_percent", 20.0))
+    except Exception:
+        risk_pct = 20.0
+    try:
+        lev = int(str(getattr(st.settings, "leverage", 1)).lstrip("xX"))
+    except Exception:
+        lev = 1
+
     if len(args) >= 2:
         try:
             risk_pct = float(args[1])
@@ -1081,17 +1088,17 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     if len(args) >= 3:
         try:
-            lev = int(args[2].lstrip("xX"))
+            lev = int(str(args[2]).lstrip("xX"))
         except Exception:
             pass
 
     # account (tuỳ chọn)
-    account_name = args[3] if len(args) >= 4 else "default"
+    account_name = args[3] if len(args) >= 4 else (getattr(st.settings, "account", None) or "default")
 
     # khởi tạo client
     ex = ExchangeClient(account_name=account_name)
 
-    # lấy giá gần nhất để tính SL/TP nhanh (nếu cần)
+    # lấy giá gần nhất để tính qty/SL nhanh (nếu cần)
     last_px = None
     try:
         t = await ex._io(ex.client.fetch_ticker, pair)
@@ -1104,66 +1111,67 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = await ex.get_balance_quote()  # USDT
     except Exception:
         bal = 0.0
-    price_for_qty = last_px or 0.0
+    price_for_qty = float(last_px or 0.0)
     qty = calc_qty(balance=bal, risk_percent=risk_pct, leverage=lev, price=price_for_qty)
 
-    # SL/TP tự động (nếu muốn), ở đây chỉ minh hoạ tính SL theo leverage
+    # SL/TP tự động (nếu muốn). open_market hiện đảm bảo SL (reduceOnly),
+    # còn TP anh đang quản lý bằng report/TP-by-time → ở đây vẫn tính để hiển thị.
     sl_price, tp_price = None, None
     try:
         if last_px and isfinite(last_px) and lev > 0:
-            sl_price, tp_price = auto_sl_by_leverage(side_norm, last_px, lev)
+            # LƯU Ý: hàm auto_sl_by_leverage của dự án nhận tham số: side trước, rồi price, rồi leverage
+            sl_price, tp_price = auto_sl_by_leverage(side_norm, float(last_px), int(lev))
     except Exception:
         sl_price, tp_price = None, None
 
-    # Đặt lệnh thị trường
-    ok, info = await open_market(
-        pair=pair,
-        side=side_norm,       # 'long'/'short'
-        qty=qty,
-        leverage=lev,
-        account_name=account_name,
-        sl_price=sl_price,
-        tp_price=tp_price,
-        comment="manual /order"
-    )
-
-    # build thông điệp trả về
-    if ok:
-        # entry spot để hiển thị
-        try:
-            entry_spot = float(info.get("avgPrice") or info.get("price") or last_px or 0.0)
-        except Exception:
-            entry_spot = float(last_px or 0.0)
-
-        # broadcast giống định dạng trước
-        try:
-            tide_hrs = float(os.getenv("TIDE_WINDOW_HOURS", st.settings.tide_window_hours or 2.5))
-            now = now_vn()
-            start_hhmm = (now - timedelta(hours=tide_hrs/2)).strftime("%H:%M")
-            end_hhmm   = (now + timedelta(hours=tide_hrs/2)).strftime("%H:%M")
-            tide_label = f"{start_hhmm}–{end_hhmm}"
-        except Exception:
-            tide_label = None
-
-        btxt = (
-            f"🚀 EXECUTED | {pair} {side_s}\n"
-            f"• Mode: Thủ công ORDER\n"
-            f"• Account: {account_name} ({ex.exchange_id})\n"
-            f"• Risk {risk_pct:.1f}% | Lev x{lev}\n"
-            f"• Entry(SPOT)≈{entry_spot:.2f} | Qty={qty:.6f}\n"
-            f"• SL={sl_price:.2f}" if sl_price else "• SL=—"
+    # Đặt lệnh thị trường qua method của ExchangeClient (KHÔNG import open_market từ module)
+    try:
+        res = await ex.open_market(
+            symbol=pair,
+            side=side_norm,       # 'long'/'short'
+            qty=float(qty),
+            leverage=int(lev),
+            stop_loss=(float(sl_price) if sl_price is not None else None),  # TP nếu muốn thì xử lý ở lớp khác
         )
-        # ghép TP & Tide nếu có
-        if tp_price:
-            btxt += f"\n• TP={tp_price:.2f}"
-        if tide_label:
-            btxt += f"\n• Tide: {tide_label}"
+        ok = bool(getattr(res, "ok", False))
+        info = getattr(res, "message", res)
+    except Exception as e:
+        ok = False
+        info = f"{e}"
 
-        # gửi về chat hiện tại
-        await update.message.reply_text(btxt)
-        # (nếu anh đang dùng kênh broadcast thì phần auto_trade_engine đã có _broadcast_html; /order có thể giữ nguyên cách anh đang bắn)
+    # build thông điệp trả về (tránh lỗi concat điều kiện trong tuple)
+    lines = [
+        f"🚀 EXECUTED | {pair} {side_s}",
+        "• Mode: Thủ công ORDER",
+        f"• Account: {account_name} ({getattr(ex, 'exchange_id', '—')})",
+        f"• Risk {risk_pct:.1f}% | Lev x{lev}",
+        f"• Entry(SPOT)≈{(last_px or 0.0):.2f} | Qty={qty:.6f}",
+        (f"• SL={sl_price:.2f}" if sl_price is not None else "• SL=—"),
+        (f"• TP={tp_price:.2f}" if tp_price is not None else None),
+    ]
+
+    # Tide label (nếu muốn hiển thị)
+    tide_label = None
+    try:
+        tide_hrs = float(os.getenv("TIDE_WINDOW_HOURS", getattr(st.settings, "tide_window_hours", 2.5) or 2.5))
+        now = now_vn()
+        start_hhmm = (now - timedelta(hours=tide_hrs/2)).strftime("%H:%M")
+        end_hhmm   = (now + timedelta(hours=tide_hrs/2)).strftime("%H:%M")
+        tide_label = f"{start_hhmm}–{end_hhmm}"
+    except Exception:
+        tide_label = None
+    if tide_label:
+        lines.append(f"• Tide: {tide_label}")
+
+    text = "\n".join([l for l in lines if l])
+
+    if ok:
+        await update.message.reply_text(text)
+        # (nếu anh có kênh broadcast riêng, gọi hàm broadcast ở đây)
+        # await broadcast_signal(text)
     else:
         await update.message.reply_text(f"❌ Không đặt được lệnh: {info}")
+
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1472,47 +1480,76 @@ async def autolog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📜 Auto log gần nhất:\n{txt}")
 
-
 # ================== /approve (manual) ==================
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /approve <id>
-    - Lấy thông tin pending theo id (anh đang lưu ở đâu giữ nguyên),
-      sau đó gọi open_market() thay cho market_with_sl_tp bản cũ.
+    /approve <id> [account_name?]
+    - Dùng cho chế độ manual: duyệt tín hiệu đang pending và vào lệnh.
+    - KHÔNG import open_market ở mức module; gọi ex.open_market(...) của ExchangeClient.
     """
+    from math import isfinite
+    # Import cục bộ (không import open_market)
     try:
-        from trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage, open_market
+        from trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
     except Exception:
-        from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage, open_market  # type: ignore
+        from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage  # type: ignore
 
     uid = _uid(update)
+    st = storage.get_user(uid)
+
+    # Chỉ cho phép khi đang manual (tuỳ hệ thống anh, có thể bỏ chặn này nếu muốn)
+    try:
+        mode = str(getattr(st.settings, "mode", "manual")).lower()
+    except Exception:
+        mode = "manual"
+    if mode != "manual":
+        await update.message.reply_text("⚠️ Chỉ dùng /approve trong chế độ manual.")
+        return
+
     args = context.args if hasattr(context, "args") else []
     if not args:
-        await update.message.reply_text("Cú pháp: /approve <id>")
+        await update.message.reply_text("Cú pháp: /approve <id> [account]")
         return
-    pid = args[0]
 
-    # === Lấy pending signal theo id (tuỳ struct hiện có của anh) ===
-    pending = _get_pending_signal(pid)  # giữ nguyên hàm anh đang dùng
+    sig_id_raw = args[0]
+    try:
+        sig_id = int(sig_id_raw)
+    except Exception:
+        # nếu hệ thống của anh dùng id dạng string thì giữ nguyên
+        sig_id = sig_id_raw
+
+    # account (tuỳ chọn)
+    account_name = args[1] if len(args) >= 2 else (getattr(st.settings, "account", None) or "default")
+
+    # === Lấy pending signal theo id (hàm của dự án — giữ nguyên) ===
+    pending = _get_pending_signal(sig_id)  # noqa: F821  (hàm có sẵn trong code gốc của anh)
     if not pending:
-        await update.message.reply_text(f"Không tìm thấy pending id={pid}")
+        await update.message.reply_text(f"⚠️ Không tìm thấy pending id={sig_id}.")
         return
 
-    pair = pending.get("pair") or "BTC/USDT"
-    # Chuẩn hoá side
-    side_s = str(pending.get("side","")).strip().upper()
-    if side_s not in ("LONG","SHORT","BUY","SELL"):
-        await update.message.reply_text(f"Pending id={pid} có side không hợp lệ.")
+    # Pair / side / risk / leverage
+    pair = (pending.get("pair") or getattr(st.settings, "pair", None) or os.getenv("PAIR", "BTC/USDT")).strip()
+
+    side_s = str(pending.get("side", "")).strip().upper()
+    if side_s not in ("LONG", "SHORT", "BUY", "SELL"):
+        await update.message.reply_text(f"⚠️ Pending id={sig_id} có side không hợp lệ.")
         return
-    side_norm = "long" if side_s in ("LONG","BUY") else "short"
+    side_norm = "long" if side_s in ("LONG", "BUY") else "short"  # cho ExchangeClient
 
-    account_name = pending.get("account") or "default"
-    risk_pct = float(pending.get("risk_percent") or storage.get_user(uid).settings.risk_percent or 20.0)
-    lev = int(pending.get("leverage") or storage.get_user(uid).settings.leverage or 1)
+    try:
+        risk_pct = float(pending.get("risk_percent", getattr(st.settings, "risk_percent", 20.0)))
+    except Exception:
+        risk_pct = 20.0
 
+    try:
+        lev = int(str(pending.get("leverage", getattr(st.settings, "leverage", 1))).lstrip("xX"))
+    except Exception:
+        lev = 1
+
+    # Khởi tạo client theo account
     ex = ExchangeClient(account_name=account_name)
 
-    # giá tham chiếu
+    # Giá tham chiếu để sizing và auto SL/TP
     last_px = None
     try:
         t = await ex._io(ex.client.fetch_ticker, pair)
@@ -1520,34 +1557,61 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         last_px = None
 
-    # qty theo risk
+    # Khối lượng theo risk/leverage
     try:
-        bal = await ex.get_balance_quote()
+        bal = await ex.get_balance_quote()  # USDT
     except Exception:
         bal = 0.0
-    qty = calc_qty(balance=bal, risk_percent=risk_pct, leverage=lev, price=(last_px or 0.0))
+    qty = calc_qty(balance=bal, risk_percent=risk_pct, leverage=lev, price=float(last_px or 0.0))
 
-    # SL/TP nếu pending đã có thì dùng, nếu không thì auto theo leverage
+    # SL/TP: ưu tiên từ pending; nếu thiếu thì auto theo leverage
     sl_price = pending.get("sl")
     tp_price = pending.get("tp")
-    if sl_price is None and last_px:
-        try:
-            sl_price, tp_auto = auto_sl_by_leverage(side_norm, last_px, lev)
+    try:
+        if (sl_price is None or tp_price is None) and last_px and isfinite(last_px) and lev > 0:
+            auto_sl, auto_tp = auto_sl_by_leverage(side_norm, float(last_px), int(lev))
+            if sl_price is None:
+                sl_price = auto_sl
             if tp_price is None:
-                tp_price = tp_auto
-        except Exception:
-            pass
+                tp_price = auto_tp
+    except Exception:
+        pass
 
-    ok, info = await open_market(
-        pair=pair, side=side_norm, qty=qty, leverage=lev,
-        account_name=account_name, sl_price=sl_price, tp_price=tp_price,
-        comment=f"manual approve {pid}"
-    )
+    # Đặt lệnh thị trường qua method của ExchangeClient
+    try:
+        res = await ex.open_market(
+            symbol=pair,
+            side=side_norm,           # 'long'/'short'
+            qty=float(qty),
+            leverage=int(lev),
+            stop_loss=(float(sl_price) if sl_price is not None else None),
+        )
+        ok = bool(getattr(res, "ok", False))
+        info = getattr(res, "message", res)
+    except Exception as e:
+        ok = False
+        info = f"{e}"
+
     if ok:
-        await update.message.reply_text(f"✅ ĐÃ DUYỆT & VÀO LỆNH id={pid} | {pair} {side_s} | Lev x{lev} | Qty={qty:.6f}")
-        _mark_pending_done(pid)  # giữ nguyên cơ chế xoá/đánh dấu
+        # Build message gọn
+        lines = [
+            f"✅ APPROVED | {pair} {side_s}",
+            f"• Account: {account_name} ({getattr(ex, 'exchange_id', '—')})",
+            f"• Risk {risk_pct:.1f}% | Lev x{lev}",
+            f"• Entry≈{(last_px or 0.0):.2f} | Qty={qty:.6f}",
+            (f"• SL={float(sl_price):.2f}" if sl_price is not None else "• SL=—"),
+            (f"• TP={float(tp_price):.2f}" if tp_price is not None else None),
+            f"(ID={sig_id})",
+        ]
+        text = "\n".join([l for l in lines if l])
+
+        await update.message.reply_text(text)
+        # Đánh dấu pending đã xử lý (hàm gốc của dự án — giữ nguyên)
+        _mark_pending_done(sig_id)  # noqa: F821
+        # (Nếu có kênh broadcast riêng, gọi ở đây)
+        # await broadcast_signal(text)
     else:
-        await update.message.reply_text(f"❌ Duyệt thất bại id={pid}: {info}")
+        await update.message.reply_text(f"❌ Duyệt thất bại id={sig_id}: {info}")
 
 
 
