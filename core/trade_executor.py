@@ -530,4 +530,203 @@ def auto_sl_by_leverage(entry: float, side: str, lev: int, rr_mult: float = None
         sl = float(entry) + dist
         tp = float(entry) - rr_mult * dist
     return sl, tp
+
+# =====================[ ADDITIONS FOR /close + sizing helpers ]=====================
+
+# Bot cũ dùng tên get_balance_quote -> alias cho balance_usdt
+async def get_balance_quote_alias(self) -> float:
+    return await self.balance_usdt()
+# bind alias lên class nếu chưa có
+if not hasattr(ExchangeClient, "get_balance_quote"):
+    setattr(ExchangeClient, "get_balance_quote", get_balance_quote_alias)
+
+def _floor_step_local(x: float, step: float) -> float:
+    import math as _m
+    if step and step > 0:
+        return _m.floor(x / step) * step
+    return x
+
+def calc_qty(
+    balance_usdt: float,
+    risk_percent: float,
+    leverage: int,
+    entry_price: float,
+    min_qty: float = None,
+) -> float:
+    """
+    Tính contract qty từ %risk * leverage (đơn giản hóa, đồng nhất bot cũ):
+    notional = balance * (risk_pct/100) * leverage
+    qty = notional / entry_price
+    """
+    try:
+        bal = max(0.0, float(balance_usdt))
+        rp  = max(0.0, float(risk_percent))
+        lev = max(1,   int(leverage))
+        px  = max(0.0, float(entry_price))
+        if px <= 0 or rp <= 0 or bal <= 0:
+            return 0.0
+        notional = bal * (rp / 100.0) * lev
+        qty = notional / px
+        # Làm tròn về step fallback nếu có
+        lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
+        qty = _floor_step_local(qty, lot_step)
+        if min_qty is not None:
+            qty = max(qty, float(min_qty))
+        return max(qty, lot_step)
+    except Exception:
+        return 0.0
+
+def auto_sl_by_leverage(entry: float, side: str, lev: int) -> tuple[float, float]:
+    """
+    Tạo SL/TP tương đối theo leverage (giữ đúng chữ ký bot đang dùng).
+    Quy ước mặc định (dễ hiểu, an toàn):
+      - biên SL % ≈ 100 / (lev * 4)
+      - biên TP % ≈ 100 / (lev * 2)  (RR ~ 2:1)
+    """
+    e  = float(entry)
+    lv = max(1, int(lev))
+    side = (side or "").upper()
+    sl_pct = 100.0 / (lv * 4.0)
+    tp_pct = 100.0 / (lv * 2.0)
+
+    if side == "LONG":
+        sl = e * (1.0 - sl_pct / 100.0)
+        tp = e * (1.0 + tp_pct / 100.0)
+    else:
+        sl = e * (1.0 + sl_pct / 100.0)
+        tp = e * (1.0 - tp_pct / 100.0)
+    return (sl, tp)
+
+# ---------------- multi-account close helpers ----------------
+def _gather_accounts_from_settings(default_pair: str):
+    """
+    Đọc SINGLE_ACCOUNT và ACCOUNTS trong config.settings.
+    Trả về list các dict account hợp lệ: [{name, exchange, api_key, api_secret, testnet, pair}, ...]
+    """
+    try:
+        from config import settings as _S
+    except Exception:
+        return []
+
+    base = []
+    # SINGLE_ACCOUNT (nếu có)
+    try:
+        sa = getattr(_S, "SINGLE_ACCOUNT", None)
+        if isinstance(sa, dict) and sa.get("api_key"):
+            base.append(sa)
+    except Exception:
+        pass
+
+    # ACCOUNTS (danh sách)
+    try:
+        accs = getattr(_S, "ACCOUNTS", [])
+        if isinstance(accs, list):
+            base.extend([a for a in accs if isinstance(a, dict) and a.get("api_key")])
+    except Exception:
+        pass
+
+    # Bổ sung pair mặc định nếu account chưa có
+    out, seen = [], set()
+    for a in base:
+        try:
+            exid = str(a.get("exchange","")).lower()
+            key  = (exid, a.get("api_key",""))
+            if key in seen:
+                continue
+            seen.add(key)
+            item = {
+                "name": a.get("name") or "default",
+                "exchange": exid or "binanceusdm",
+                "api_key": a.get("api_key") or "",
+                "api_secret": a.get("api_secret") or "",
+                "testnet": bool(a.get("testnet", False)),
+                "pair": (a.get("pair") or default_pair or "BTC/USDT"),
+            }
+            out.append(item)
+        except Exception:
+            continue
+    return out
+
+async def close_position_on_account(account_name: str, pair: str, percent: float = 100.0) -> dict:
+    """
+    Đóng vị thế theo % trên MỘT account (reduceOnly), đồng thời hủy TP/SL còn chờ nếu đóng 100%.
+    Trả về: {"ok": bool, "message": str}
+    """
+    try:
+        from config.settings import PAIR as DEFAULT_PAIR  # nếu có
+    except Exception:
+        DEFAULT_PAIR = "BTC/USDT"
+
+    percent = max(0.0, min(100.0, float(percent)))
+    if percent == 0.0:
+        return {"ok": True, "message": "0% — không thực hiện."}
+
+    accounts = _gather_accounts_from_settings(DEFAULT_PAIR)
+    # tìm account theo name
+    picked = None
+    for a in accounts:
+        if str(a.get("name")).strip().lower() == str(account_name).strip().lower():
+            picked = a
+            break
+    if not picked:
+        return {"ok": False, "message": f"Không tìm thấy account '{account_name}' trong cấu hình."}
+
+    cli = ExchangeClient(
+        exchange_id=picked.get("exchange"),
+        api_key=picked.get("api_key"),
+        api_secret=picked.get("api_secret"),
+        testnet=picked.get("testnet"),
+    )
+    symbol = picked.get("pair") or (pair or DEFAULT_PAIR)
+
+    # Nếu 100%: hủy TP/SL trước cho sạch
+    if percent >= 99.999:
+        try:
+            _ = await cli.cancel_all_orders_symbol(symbol)
+        except Exception:
+            pass
+
+    # Đóng theo %
+    res = await cli.close_position_pct(symbol, percent)
+    return {"ok": bool(res.ok), "message": res.message}
+
+async def close_position_on_all(pair: str, percent: float = 100.0):
+    """
+    Đóng vị thế theo % trên TẤT CẢ account đã cấu hình.
+    Trả về list kết quả: [{"ok": bool, "message": str, "account": name}, ...]
+    """
+    try:
+        from config.settings import PAIR as DEFAULT_PAIR
+    except Exception:
+        DEFAULT_PAIR = "BTC/USDT"
+
+    results = []
+    accounts = _gather_accounts_from_settings(DEFAULT_PAIR)
+    if not accounts:
+        return [{"ok": False, "message": "Không tìm thấy account trong cấu hình.", "account": "-"}]
+
+    # chạy tuần tự để dễ đọc log (có thể tối ưu song song sau)
+    for a in accounts:
+        try:
+            cli = ExchangeClient(
+                exchange_id=a.get("exchange"),
+                api_key=a.get("api_key"),
+                api_secret=a.get("api_secret"),
+                testnet=a.get("testnet"),
+            )
+            symbol = a.get("pair") or pair or DEFAULT_PAIR
+
+            # 100% -> hủy TP/SL trước
+            if percent >= 99.999:
+                try:
+                    _ = await cli.cancel_all_orders_symbol(symbol)
+                except Exception:
+                    pass
+
+            res = await cli.close_position_pct(symbol, float(percent))
+            results.append({"ok": bool(res.ok), "message": res.message, "account": a.get("name","default")})
+        except Exception as e:
+            results.append({"ok": False, "message": f"{e}", "account": a.get("name","default")})
+    return results
+
 # ----------------------- /core/trade_executor.py -----------------------
