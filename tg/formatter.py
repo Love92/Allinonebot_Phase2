@@ -174,7 +174,7 @@ def _safe_html(raw_text: str) -> str:
     return _beautify_report(html.escape(str(raw_text), quote=False))
 
 
-# === NEW: Progress theo HƯỚNG range in ra ===
+# === NEW (giữ lại): tiến độ theo HƯỚNG range in ra (không dùng để in chính, giữ làm helper) ===
 def _directed_progress_from_range(left_range, current_pct, right_range) -> str:
     """
     Tính progress % (0..100) theo HƯỚNG hiển thị của preset_range.
@@ -217,9 +217,9 @@ def _resolve_direction(preset_code: str, stage_label: str, direction_hint: str) 
     # Suy luận theo stage
     # - New Moon: pre (trước N) → waning; post (sau N) → waxing
     if "new moon" in stage:
-        if "pre" in stage:  # trước NM
+        if "pre" in stage:
             return "waning"
-        if "post" in stage: # sau NM
+        if "post" in stage:
             return "waxing"
     # - First Quarter: cả hai phía đều đang waxing
     if "first quarter" in stage:
@@ -262,6 +262,49 @@ def _infer_micro_phase(dir_str: str, illum_pct):
     if d == "waxing":
         return "Waxing Gibbous" if x > 50.0 else "Waxing Crescent"
     return "Waning Crescent" if x < 50.0 else "Waning Gibbous"
+
+
+# === NEW: Tiến độ 0–100% trong PHẠM VI PRESET (2 nửa mỗi preset, mỗi nửa 50%) ===
+def preset_progress_0_100(pcode: str, stage_label: str, illum_pct: float) -> float:
+    """
+    Mapping:
+      P1: pre 25→0 (0–50), post 0→25 (50–100)
+      P2: pre 25→50 (0–50), post 50→75 (50–100)          [waxing]
+      P3: pre 75→100 (0–50), post 100→75 (50–100)        [pre=waxing, post=waning]
+      P4: pre 75→50 (0–50), post 50→25 (50–100)          [waning]
+    """
+    p = (pcode or "").upper()
+    s = (stage_label or "").lower().strip()
+    x = float(illum_pct)
+
+    def clamp(v): return max(0.0, min(100.0, v))
+
+    if p == "P1":
+        if "pre" in s:   # 25 -> 0
+            return clamp(((25.0 - x) / 25.0) * 50.0)
+        else:             # 0 -> 25
+            return clamp(50.0 + ((x - 0.0) / 25.0) * 50.0)
+
+    if p == "P2":
+        if "pre" in s:   # 25 -> 50
+            return clamp(((x - 25.0) / 25.0) * 50.0)
+        else:             # 50 -> 75
+            return clamp(50.0 + ((x - 50.0) / 25.0) * 50.0)
+
+    if p == "P3":
+        if "pre" in s:   # 75 -> 100
+            return clamp(((x - 75.0) / 25.0) * 50.0)
+        else:             # 100 -> 75 (giảm)
+            return clamp(50.0 + ((100.0 - x) / 25.0) * 50.0)
+
+    if p == "P4":
+        if "pre" in s:   # 75 -> 50 (giảm)
+            return clamp(((75.0 - x) / 25.0) * 50.0)
+        else:             # 50 -> 25 (giảm)
+            return clamp(50.0 + ((50.0 - x) / 25.0) * 50.0)
+
+    # fallback nếu preset lạ
+    return 0.0
 
 
 def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_WINDOW_HOURS) -> str:
@@ -361,8 +404,13 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
     ma_cur = _num_of(ma_cur, "?")
     ma_max = _num_of(ma_max, "?")
 
-    # === Progress: theo hướng range đã quyết ===
-    progress_str = _directed_progress_from_range(left_range, illum_i, right_range)
+    # === Progress: TIẾN ĐỘ 0–100% TRONG PHẠM VI PRESET (theo yêu cầu) ===
+    try:
+        preset_prog = preset_progress_0_100(preset_code, stage, float(illum_i))
+        progress_str = f"{int(round(preset_prog))}"
+    except Exception:
+        # fallback cũ (trong nửa range) nếu có sự cố
+        progress_str = _directed_progress_from_range(left_range, illum_i, right_range)
 
     # --- Tide ---
     tide_lines = get_tide_events(vn_date) or []
