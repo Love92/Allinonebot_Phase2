@@ -1,8 +1,7 @@
 # ----------------------- tg/formatter.py -----------------------
 from __future__ import annotations
 from datetime import datetime, timedelta
-import html
-import re  # NEW: for _code_of
+import html, re
 
 # === Imports robust theo nhiều cấu trúc dự án ===
 # moon_tide
@@ -144,28 +143,6 @@ def _pick(src: dict, *keys, default=None):
             return src[k]
     return default
 
-# NEW: lấy mã preset an toàn từ string | dict | label
-def _code_of(x, fallback_label=None) -> str:
-    """
-    Trả về mã preset 'P1'...'P4' từ nhiều kiểu dữ liệu:
-    - x là string: 'P1'
-    - x là dict: {'code': 'P1', ...} (hoặc 'id'/'key'/'name'/'value')
-    - nếu vẫn không có, cố gắng parse từ fallback_label kiểu 'P1: ...'
-    """
-    if isinstance(x, dict):
-        for k in ("code", "id", "key", "name", "value", "preset"):
-            v = x.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    if isinstance(x, str) and x.strip():
-        return x.strip()
-
-    if isinstance(fallback_label, str) and fallback_label.strip():
-        m = re.match(r"\s*(P[1-4])\b", fallback_label.strip(), re.I)
-        if m:
-            return m.group(1).upper()
-    return ""
-
 
 def _beautify_report(s: str) -> str:
     """
@@ -210,15 +187,15 @@ def _directed_progress_from_range(left_range, current_pct, right_range) -> str:
         rp = float(right_range)
         span = abs(rp - lp)
         if span <= 0:
-            return "0.0"
+            return "0"
         if rp >= lp:
             frac = (cp - lp) / span
         else:
             frac = (lp - cp) / span
         pct = max(0.0, min(1.0, frac)) * 100.0
-        return f"{pct:.1f}".rstrip("0").rstrip(".")
+        return f"{pct:.0f}"
     except Exception:
-        return "?"
+        return "0"
 
 
 # === NEW: xác định HƯỚNG (waxing/waning) ưu tiên dữ liệu stage/direction ===
@@ -238,32 +215,25 @@ def _resolve_direction(preset_code: str, stage_label: str, direction_hint: str) 
     pc = (preset_code or "").strip().upper()
 
     # Suy luận theo stage
-    # - New Moon: pre (trước N) → waning; post (sau N) → waxing
     if "new moon" in stage:
         if "pre" in stage:
             return "waning"
         if "post" in stage:
             return "waxing"
-    # - First Quarter: cả hai phía đều đang waxing
     if "first quarter" in stage:
         return "waxing"
-    # - Full Moon: pre → waxing; post → waning
     if "full moon" in stage:
         if "pre" in stage:
             return "waxing"
         if "post" in stage:
             return "waning"
-    # - Last Quarter: cả hai phía đều waning
     if "last quarter" in stage:
         return "waning"
 
-    # Fallback theo preset
     if pc.startswith("P2"):
         return "waxing"
     if pc.startswith("P4"):
         return "waning"
-
-    # P1/P3 nếu không có stage → giữ mặc định "waxing" để tránh flip sai khi label chứa chữ 'WANING' ở mô tả
     return "waxing"
 
 
@@ -330,25 +300,62 @@ def preset_progress_0_100(pcode: str, stage_label: str, illum_pct: float) -> flo
     return 0.0
 
 
+# === NEW: Chuẩn hoá mã preset để không bị rơi vào mặc định 0 ===
+def _normalize_preset_code(raw_code: str, preset_label: str, pr_min, pr_max) -> str:
+    """
+    Cố gắng suy ra 'P1|P2|P3|P4' từ:
+      - raw_code (nếu đã chuẩn)
+      - prefix trong preset_label (vd: 'P1: ...')
+      - cặp range {min,max}
+    """
+    code = (raw_code or "").strip().upper()
+    if code in ("P1", "P2", "P3", "P4"):
+        return code
+
+    m = re.match(r"\s*(P[1-4])\b", str(preset_label or "").strip(), flags=re.I)
+    if m:
+        return m.group(1).upper()
+
+    try:
+        a = float(pr_min)
+        b = float(pr_max)
+        s = {a, b}
+        if s == {0.0, 25.0}:
+            return "P1"
+        if s == {25.0, 50.0}:
+            return "P2"
+        if s == {50.0, 75.0}:
+            return "P2"  # nửa sau của P2
+        if s == {75.0, 100.0}:
+            return "P3"
+        if s == {50.0, 25.0}:
+            return "P4"
+        if s == {75.0, 50.0}:
+            return "P4"
+    except Exception:
+        pass
+    return ""  # không đoán được
+
+
 def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_WINDOW_HOURS) -> str:
     # --- Moon (phase + illum) ---
     phase, illum = get_moon_phase(vn_date)
-    # Chuẩn hóa: dùng illum_f(float) để tính, illum_i(int) để hiển thị
-    illum_f = float(_num_of(illum, 0))
-    illum_i = int(round(illum_f))
+    try:
+        illum_i = int(_num_of(illum, 0))
+    except Exception:
+        illum_i = _num_of(illum, "?")
 
     m2 = moon_context_v2(
         phase,
-        illum_i,
+        int(illum_i) if isinstance(illum_i, (int, float)) else illum_i,
         vn_date
     ) or {}
 
-    # preset label + code (robust)
+    # preset label
     preset_label = _label_of(_pick(m2, "preset_label", "presetName", "preset_name", "preset", default="?"))
-    raw_preset   = _pick(m2, "preset_code", "presetCode", "preset", "presetObj", default=None)
-    preset_code  = _code_of(raw_preset, fallback_label=preset_label).upper()
 
-    # direction / stage
+    # preset code / direction / stage
+    preset_code_raw = str(_pick(m2, "preset", "preset_code", "presetCode", default="")).upper()
     direction_hint = str(_pick(m2, "direction", "dir", default="")).lower()
     stage = _label_of(_pick(m2, "stage", "stage_label", "stageLabel", "progress_stage", default="?"))
     if not stage or stage == "?":
@@ -365,7 +372,7 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
     pr_max = _num_of(pr_max, "?")
 
     # === Quyết định hướng thật sự để IN RANGE cho đúng ===
-    resolved_dir = _resolve_direction(preset_code, stage, direction_hint)
+    resolved_dir = _resolve_direction(preset_code_raw, stage, direction_hint)
     if resolved_dir == "waning":
         left_range, right_range = pr_max, pr_min
     else:
@@ -428,11 +435,15 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
     ma_max = _num_of(ma_max, "?")
 
     # === Progress: TIẾN ĐỘ 0–100% TRONG PHẠM VI PRESET (theo yêu cầu) ===
-    try:
-        preset_prog = preset_progress_0_100(preset_code, stage, float(illum_f))
-        progress_str = f"{int(round(preset_prog))}"
-    except Exception:
-        # fallback cũ (trong nửa range) nếu có sự cố
+    code_norm = _normalize_preset_code(preset_code_raw, preset_label, left_range, right_range)
+    if code_norm in ("P1", "P2", "P3", "P4"):
+        try:
+            preset_prog = preset_progress_0_100(code_norm, stage, float(illum_i))
+            progress_str = f"{int(round(preset_prog))}"
+        except Exception:
+            progress_str = _directed_progress_from_range(left_range, illum_i, right_range)
+    else:
+        # Nếu vẫn không đoán được preset code → fallback theo hướng hiển thị
         progress_str = _directed_progress_from_range(left_range, illum_i, right_range)
 
     # --- Tide ---
