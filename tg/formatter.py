@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
 import html
+import re  # NEW: for _code_of
 
 # === Imports robust theo nhiều cấu trúc dự án ===
 # moon_tide
@@ -142,6 +143,28 @@ def _pick(src: dict, *keys, default=None):
         if k in src and src[k] not in (None, ""):
             return src[k]
     return default
+
+# NEW: lấy mã preset an toàn từ string | dict | label
+def _code_of(x, fallback_label=None) -> str:
+    """
+    Trả về mã preset 'P1'...'P4' từ nhiều kiểu dữ liệu:
+    - x là string: 'P1'
+    - x là dict: {'code': 'P1', ...} (hoặc 'id'/'key'/'name'/'value')
+    - nếu vẫn không có, cố gắng parse từ fallback_label kiểu 'P1: ...'
+    """
+    if isinstance(x, dict):
+        for k in ("code", "id", "key", "name", "value", "preset"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if isinstance(x, str) and x.strip():
+        return x.strip()
+
+    if isinstance(fallback_label, str) and fallback_label.strip():
+        m = re.match(r"\s*(P[1-4])\b", fallback_label.strip(), re.I)
+        if m:
+            return m.group(1).upper()
+    return ""
 
 
 def _beautify_report(s: str) -> str:
@@ -310,22 +333,22 @@ def preset_progress_0_100(pcode: str, stage_label: str, illum_pct: float) -> flo
 def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_WINDOW_HOURS) -> str:
     # --- Moon (phase + illum) ---
     phase, illum = get_moon_phase(vn_date)
-    try:
-        illum_i = int(_num_of(illum, 0))
-    except Exception:
-        illum_i = _num_of(illum, "?")
+    # Chuẩn hóa: dùng illum_f(float) để tính, illum_i(int) để hiển thị
+    illum_f = float(_num_of(illum, 0))
+    illum_i = int(round(illum_f))
 
     m2 = moon_context_v2(
         phase,
-        int(illum_i) if isinstance(illum_i, (int, float)) else illum_i,
+        illum_i,
         vn_date
     ) or {}
 
-    # preset label
+    # preset label + code (robust)
     preset_label = _label_of(_pick(m2, "preset_label", "presetName", "preset_name", "preset", default="?"))
+    raw_preset   = _pick(m2, "preset_code", "presetCode", "preset", "presetObj", default=None)
+    preset_code  = _code_of(raw_preset, fallback_label=preset_label).upper()
 
-    # preset code / direction / stage
-    preset_code = str(_pick(m2, "preset", "preset_code", "presetCode", default="")).upper()
+    # direction / stage
     direction_hint = str(_pick(m2, "direction", "dir", default="")).lower()
     stage = _label_of(_pick(m2, "stage", "stage_label", "stageLabel", "progress_stage", default="?"))
     if not stage or stage == "?":
@@ -406,7 +429,7 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
 
     # === Progress: TIẾN ĐỘ 0–100% TRONG PHẠM VI PRESET (theo yêu cầu) ===
     try:
-        preset_prog = preset_progress_0_100(preset_code, stage, float(illum_i))
+        preset_prog = preset_progress_0_100(preset_code, stage, float(illum_f))
         progress_str = f"{int(round(preset_prog))}"
     except Exception:
         # fallback cũ (trong nửa range) nếu có sự cố
