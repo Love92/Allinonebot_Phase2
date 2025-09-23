@@ -3,7 +3,7 @@
 """
 Admin guard cho tg/bot.py
 
-- Lấy danh sách admin từ ENV: JOIN_GATE_ADMIN_IDS
+- Lấy danh sách admin từ ENV: ADMIN_Bot_Allinone
 - Hàm enforce_admin_for_all_commands(app, allowlist={...})
   -> Bọc tất cả CommandHandler thành admin-only
 """
@@ -30,7 +30,7 @@ def _parse_ids(raw: str) -> list[int]:
     return ids
 
 # Lấy admin IDs từ ENV
-ADMIN_IDS: list[int] = _parse_ids(os.getenv("JOIN_GATE_ADMIN_IDS", ""))
+ADMIN_IDS: list[int] = _parse_ids(os.getenv("ADMIN_Bot_Allinone", ""))
 
 def is_admin(uid: Optional[int]) -> bool:
     return bool(uid and uid in ADMIN_IDS)
@@ -95,3 +95,4 @@ def enforce_admin_for_all_commands(app, allowlist: set[str] | None = None):
                 if any((c not in allowlist) for c in cmd_names):
                     if getattr(h, "callback", None):
                         h.callback = _wrap_callback(h.callback)
+
