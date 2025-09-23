@@ -174,6 +174,69 @@ def _safe_html(raw_text: str) -> str:
         return ""
     return _beautify_report(html.escape(str(raw_text), quote=False))
 
+
+# ===== [PATCH] Helpers cho Preset Range & Progress (half-scale 0–50–100) =====
+def _preset_range_by_stage(pcode: str, stage: str, pr_min: float, pr_max: float):
+    """
+    Chọn (left, right) để in 'L – Hiện tại x% – R' theo đúng preset + stage:
+      P1: pre  -> 25 – x – 0      | post -> 0 – x – 25
+      P2: pre  -> 25 – x – 50     | post -> 50 – x – 75
+      P3: pre  -> 75 – x – 100    | post -> 100 – x – 75
+      P4: pre  -> 75 – x – 50     | post -> 50 – x – 25
+    Fallback: nếu preset lạ, dùng min/max theo pre/post.
+    """
+    p = (pcode or "").upper()
+    st = (stage or "").strip().lower()
+    is_pre = st.startswith("pre")
+
+    if p == "P1":
+        return (25.0, 0.0) if is_pre else (0.0, 25.0)
+    if p == "P2":
+        return (25.0, 50.0) if is_pre else (50.0, 75.0)
+    if p == "P3":
+        return (75.0, 100.0) if is_pre else (100.0, 75.0)
+    if p == "P4":
+        return (75.0, 50.0) if is_pre else (50.0, 25.0)
+
+    # fallback an toàn
+    return (float(pr_min), float(pr_max)) if is_pre else (float(pr_max), float(pr_min))
+
+
+def preset_progress_half_scale(pcode: str, stage: str, illum_pct: float) -> float:
+    """
+    Tính 'Progress' theo logic half-scale (em recommend):
+      - Pre  map vào 0..50
+      - Post map vào 50..100
+    Trả về giá trị đã clamp [0..100].
+    """
+    st = (stage or "").strip().lower()
+    is_pre = st.startswith("pre")
+
+    # left/right theo preset+stage, nhưng chỉ dùng để tính tỉ lệ cục bộ của nửa-range
+    if pcode.upper() == "P1":
+        L, R = (25.0, 0.0) if is_pre else (0.0, 25.0)
+    elif pcode.upper() == "P2":
+        L, R = (25.0, 50.0) if is_pre else (50.0, 75.0)
+    elif pcode.upper() == "P3":
+        L, R = (75.0, 100.0) if is_pre else (100.0, 75.0)
+    elif pcode.upper() == "P4":
+        L, R = (75.0, 50.0) if is_pre else (50.0, 25.0)
+    else:
+        # fallback một nửa quanh anchor 50%
+        L, R = (0.0, 50.0) if is_pre else (50.0, 100.0)
+
+    cur = float(illum_pct)
+    span = abs(R - L) or 1.0
+    if R >= L:
+        frac = (cur - L) / span
+    else:
+        frac = (L - cur) / span
+    frac = max(0.0, min(1.0, frac))  # clamp 0..1
+
+    base = 0.0 if is_pre else 50.0
+    return max(0.0, min(100.0, round(base + frac * 50.0, 2)))
+
+
 # === NEW: chỉ sửa hiển thị Progress theo hướng preset_range ===
 def _directed_progress_from_range(left_range, current_pct, right_range) -> str:
     """
@@ -226,20 +289,14 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
     pr_min = _num_of(pr_min, "?")
     pr_max = _num_of(pr_max, "?")
 
-    # --- Đảo chiều hiển thị nếu là P4/waning (giảm dần độ rọi) ---
+    # --- [PATCH] Chọn hướng range theo preset + stage (pre/post) ---
     preset_code = str(_pick(m2, "preset", "preset_code", "presetCode", default="")).upper()
-    direction   = str(_pick(m2, "direction", "dir", default="")).lower()
-    label_upper = str(preset_label if preset_label not in (None, "?") else preset_code).upper()
-    is_waning = (
-        "P4" in label_upper or
-        "WANING" in label_upper or
-        "LAST QUARTER" in label_upper or
-        preset_code.startswith("P4") or
-        direction == "waning"
-    )
-    left_range, right_range = (pr_max, pr_min) if is_waning else (pr_min, pr_max)
+    stage_label = _label_of(_pick(m2, "stage", "stage_label", "stageLabel", "progress_stage", default="?"))
+    left_range, right_range = _preset_range_by_stage(preset_code, stage_label, pr_min, pr_max)
 
     # --- Infer micro-phase từ direction + %illum, override nếu context sai ---
+    direction   = str(_pick(m2, "direction", "dir", default="")).lower()
+
     def _infer_micro_phase(dir_str: str, illum_pct):
         try:
             x = float(illum_pct)
@@ -321,13 +378,9 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
     ma_cur = _num_of(ma_cur, "?")
     ma_max = _num_of(ma_max, "?")
 
-    # --- Progress & Stage ---
-    # Lấy 'stage' như cũ
-    stage = _pick(m2, "stage", "stage_label", "stageLabel", "progress_stage", default="?")
-    stage = _label_of(stage) if stage not in (None, "") else "?"
-
-    # === HOTFIX: Progress hiển thị theo preset_range có hướng (KHÔNG sửa gì khác)
-    progress_str = _directed_progress_from_range(left_range, illum_i, right_range)
+    # --- Progress & Stage (half-scale 0–50–100, anchor=50%) ---
+    stage = stage_label if stage_label not in (None, "") else "?"
+    progress_val = preset_progress_half_scale(preset_code, stage, float(illum_i))
 
     # --- Tide ---
     tide_lines = get_tide_events(vn_date) or []
@@ -345,13 +398,20 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
 
     tide_block = "\n   • " + "\n   • ".join(tide_lines) if tide_lines else ""
 
+    # ép kiểu hiển thị đẹp
+    def _i(x):
+        try:
+            return int(float(x))
+        except Exception:
+            return x
+
     raw = (
         f"📅 Ngày: {vn_date}\n"
         f"🌙 Preset: {preset_label}\n"
-        f" └─ Preset range (%): {left_range} – Hiện tại {illum_i}% – {right_range}\n"
+        f" └─ Preset range (%): {_i(left_range)} – Hiện tại {_i(illum_i)}% – {_i(right_range)}\n"
         f" └─ Micro-phase: {micro_phase}\n"
         f" └─ Micro-age (days): {ma_min} – Hiện tại {ma_cur} – {ma_max}\n"
-        f" └─ Progress: {progress_str} | Stage: {stage}\n"
+        f" └─ Progress: {_i(progress_val)} | Stage: {stage}\n"
         f" └─ Suggestion(s):\n{('\n'.join([f'   • {str(s)}' for s in (_pick(m2, 'suggestions', 'suggest', default=[]) or [])]) or '   • (no suggestion)')}\n"
         f"{nxt_str}\n\n"
         f"🌊 Thủy triều trong ngày:{tide_block}\n\n"
@@ -359,7 +419,6 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
         f"{tw_line}"
     )
     return _safe_html(raw)
-
 
 
 
