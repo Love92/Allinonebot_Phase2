@@ -2,33 +2,96 @@
 from __future__ import annotations
 import asyncio, logging, math, os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 from dotenv import load_dotenv
 import ccxt  # type: ignore
 
+# ========== Load basic settings ==========
 from config.settings import EXCHANGE_ID, API_KEY, API_SECRET, TESTNET
 
 load_dotenv()
 logging.getLogger(__name__).setLevel(logging.INFO)
 
+
+# ========== Simple result container ==========
 @dataclass
 class OrderResult:
     ok: bool
     message: str
+    data: Optional[dict] = None
 
 
+# ========== Async helper ==========
 def _to_thread(fn, *args, **kwargs):
     return asyncio.to_thread(fn, *args, **kwargs)
 
 
+# ========== Risk sizing (SINGLE calc_qty) ==========
+def calc_qty(
+    balance_usdt: float,
+    risk_percent: float,
+    leverage: int,
+    entry_price: float,
+    min_qty: float = 0.0,
+) -> float:
+    """
+    Tính số lượng hợp đồng theo:
+        notional = balance * (risk%/100) * leverage
+        qty = notional / entry_price
+    Có ép min_qty (nếu có) và bảo vệ khi thiếu dữ liệu.
+    """
+    try:
+        bal = max(0.0, float(balance_usdt))
+        rp = max(0.0, float(risk_percent)) / 100.0
+        lev = max(1, int(leverage))
+        px = float(entry_price)
+        if px <= 0 or bal <= 0 or rp <= 0:
+            return 0.0
+        notional = bal * rp * lev
+        qty = notional / px
+        if min_qty and qty < min_qty:
+            qty = min_qty
+        return float(qty)
+    except Exception:
+        return 0.0
+
+
+# ========== Auto SL/TP helper ==========
+def auto_sl_by_leverage(entry: float, side: str, lev: int) -> Tuple[float, float]:
+    """
+    Quy tắc mặc định: khoảng SL/TP theo đòn bẩy (giản lược, đủ dùng).
+    Ví dụ:
+      - LONG: SL ~ -1/lev * k; TP ~ +2/lev * k
+      - SHORT: đối xứng
+    Có thể tinh chỉnh thêm ở nơi khác nếu cần.
+    """
+    try:
+        entry = float(entry)
+        lev = max(1, int(lev))
+        k = 100.0  # hệ số co giãn (tuỳ chỉnh nhanh)
+        pct_sl = 1.0 / lev
+        pct_tp = 2.0 / lev
+        if str(side).upper() == "LONG":
+            return (entry * (1 - pct_sl / k), entry * (1 + pct_tp / k))
+        else:
+            return (entry * (1 + pct_sl / k), entry * (1 - pct_tp / k))
+    except Exception:
+        # fallback 1% / 2%
+        if str(side).upper() == "LONG":
+            return (entry * 0.99, entry * 1.02)
+        else:
+            return (entry * 1.01, entry * 0.98)
+
+
+# ========== Exchange client (CCXT wrapper) ==========
 class ExchangeClient:
     """
-    Wrapper CCXT đa sàn (Binance/OKX/BingX):
-    - Chọn đúng thị trường futures (future/swap linear).
-    - Chuẩn hóa symbol (OKX/BingX: BTC/USDT:USDT).
-    - Fit khối lượng theo limits (min/max qty, stepSize, min/max notional).
-    - Retry tự động khi gặp lỗi 'max quantity / max position value / notional'.
+    Wrapper CCXT đa sàn (Binance USDM / OKX / BingX):
+    - Chọn đúng thị trường futures (future / swap linear).
+    - Chuẩn hoá symbol (OKX/BingX cần dạng BTC/USDT:USDT).
+    - Fit khối lượng theo limits: min/max qty, stepSize, min/max notional.
+    - Tự giảm size & retry khi gặp lỗi “max quantity / max position value / notional”.
     """
 
     def __init__(
@@ -37,6 +100,7 @@ class ExchangeClient:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         testnet: Optional[bool] = None,
+        **kwargs: Any,  # giữ tương thích nơi khác gọi bằng account_name=...
     ):
         self.exchange_id = (exchange_id or EXCHANGE_ID).lower()
         self.api_key = api_key or API_KEY
@@ -44,7 +108,7 @@ class ExchangeClient:
         self.testnet = TESTNET if testnet is None else bool(testnet)
 
         ex_class = getattr(ccxt, self.exchange_id)
-        params = {
+        params: Dict[str, Any] = {
             "apiKey": self.api_key,
             "secret": self.api_secret,
             "enableRateLimit": True,
@@ -80,7 +144,7 @@ class ExchangeClient:
         self.client = ex_class(params)
         self._markets_loaded = False
 
-    # ------------- markets / symbol -------------
+    # ----- Markets / Symbol -----
     async def _ensure_markets(self):
         if not self._markets_loaded:
             await _to_thread(self.client.load_markets)
@@ -101,7 +165,7 @@ class ExchangeClient:
         except Exception:
             return {}
 
-    # ------------- helpers -------------
+    # ----- Generic async I/O -----
     async def _io(self, func, *args, **kwargs):
         return await _to_thread(func, *args, **kwargs)
 
@@ -124,9 +188,11 @@ class ExchangeClient:
         ]
         return any(k in s for k in keys)
 
+    # ----- Fit quantity to exchange limits -----
     async def _fit_qty(self, symbol: str, qty: float, price: float) -> Tuple[float, dict]:
         """
-        Trả về (qty_fit, meta_limits)
+        Trả về (qty_fit, meta_limits).
+        Xử lý min/max qty, stepSize, min/max notional (cost).
         """
         mkt = await self._market(symbol)
         info = mkt.get("info", {}) if isinstance(mkt, dict) else {}
@@ -137,7 +203,7 @@ class ExchangeClient:
         max_qty = None
         step = precision.get("amount")
 
-        # ccxt unified
+        # unified limits
         amt = limits.get("amount") or {}
         min_qty = amt.get("min", min_qty)
         max_qty = amt.get("max", max_qty)
@@ -148,7 +214,7 @@ class ExchangeClient:
         min_cost = cost.get("min", min_cost)
         max_cost = cost.get("max", max_cost)
 
-        # raw filters (Binance USDM)
+        # raw Binance filters
         try:
             for f in info.get("filters", []):
                 t = f.get("filterType")
@@ -167,16 +233,17 @@ class ExchangeClient:
         except Exception:
             pass
 
-        # Fit theo max_cost trước (nếu có)
         q = float(qty)
+
+        # Max notional → co bớt
         if max_cost and price:
             q = min(q, float(max_cost) / float(price))
 
-        # Fit theo max_qty
+        # Max qty
         if max_qty:
             q = min(q, float(max_qty))
 
-        # Rounding theo step
+        # Snap theo step
         if step:
             q = self._floor_step(q, float(step))
 
@@ -200,15 +267,17 @@ class ExchangeClient:
         }
         return (float(q), meta)
 
+    # ----- Place market with retries (shrink on limit errors) -----
     async def _place_market_with_retries(
         self, sym: str, side: str, qty: float, *, max_retries: int = 3
     ):
         """
-        Tạo lệnh market với chiến lược giảm size dần nếu bị lỗi giới hạn.
+        Tạo lệnh market, nếu lỗi do limit thì tự giảm size và thử lại.
         """
         attempt = 0
-        last_err = None
+        last_err: Optional[Exception] = None
         q = float(qty)
+        lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
 
         while attempt <= max_retries:
             try:
@@ -217,8 +286,7 @@ class ExchangeClient:
                 last_err = e
                 if not self._should_shrink_on_error(e):
                     break
-                # Giảm size và thử lại
-                q = max(self._floor_step(q * 0.7, float(os.getenv("LOT_STEP_FALLBACK", "0.001"))), 0.0)
+                q = max(self._floor_step(q * 0.7, lot_step), 0.0)
                 attempt += 1
 
         raise last_err if last_err else Exception("create_order failed")
@@ -244,6 +312,9 @@ class ExchangeClient:
         return 0.0
 
     async def balance_usdt(self) -> float:
+        """
+        Tổng/free USDT (ưu tiên free). Có fallback theo trường info/availableBalance.
+        """
         try:
             bal = await self._io(self.client.fetch_balance)
         except Exception:
@@ -255,8 +326,12 @@ class ExchangeClient:
                 return float(free.get(key, total.get(key, 0.0)))
         return float((bal.get("info") or {}).get("availableBalance", 0) or 0)
 
+    # Alias cho code cũ:
+    async def get_balance_quote(self) -> float:
+        return await self.balance_usdt()
+
     # ---------------- Position helpers ----------------
-    async def current_position(self, symbol: str):
+    async def current_position(self, symbol: str) -> Tuple[Optional[bool], float]:
         """
         Returns (side_long: Optional[bool], qty: float)
         """
@@ -377,6 +452,9 @@ class ExchangeClient:
         leverage: Optional[int] = None,
         stop_loss: Optional[float] = None,
     ) -> OrderResult:
+        """
+        Vào lệnh thị trường. Tự fit qty theo limit; tự đặt SL reduceOnly nếu được truyền.
+        """
         try:
             sym = self.normalize_symbol(symbol)
             if leverage is not None and hasattr(self.client, "set_leverage"):
@@ -385,7 +463,6 @@ class ExchangeClient:
                 except Exception:
                     pass
 
-            # dùng ticker nếu giá chưa có để fit notional
             px = await self.ticker_price(sym)
             s = (side or "").upper()
             if s not in ("LONG", "SHORT"):
@@ -407,326 +484,174 @@ class ExchangeClient:
                 try:
                     _ = await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
                 except Exception as e:
-                    try:
-                        _ = await self._io(self.client.create_order, sym, "STOP", opp, q_fit, None, params)
-                    except Exception:
-                        return OrderResult(True, f"Entry ok (orderId={entry.get('id')}) | SL create error: {e}")
+                    logging.warning("Create SL order failed: %s", e)
 
-            return OrderResult(True, f"Entry ok (orderId={entry.get('id')})")
+            return OrderResult(True, f"Live order placed: entry={entry.get('id')}", {"entry": entry})
         except Exception as e:
-            return OrderResult(False, f"Order failed: {e}")
+            return OrderResult(False, f"open_market failed: {e}")
 
-    async def close_position(self, symbol: str) -> OrderResult:
-        try:
-            sym = self.normalize_symbol(symbol)
-            side_long, qty = await self.current_position(sym)
-            if (side_long is None and qty == 0) or qty <= 0:
-                return OrderResult(True, "Không có vị thế mở.")
-            side = "sell" if side_long else "buy"
-            params = {"reduceOnly": True}
-            order = await self._io(self.client.create_order, sym, "market", side, qty, None, params)
-            oid = (order or {}).get("id", "N/A")
-
-            await asyncio.sleep(0.7)
-            _ = await self.cancel_all_orders_symbol(sym)
-            return OrderResult(True, f"Đã đóng toàn bộ vị thế (orderId={oid})")
-        except Exception as e:
-            return OrderResult(False, f"Close thất bại: {e}")
-
-    async def close_position_pct(self, symbol: str, pct: float) -> OrderResult:
+    async def market_with_sl_tp(
+        self,
+        symbol: str,
+        side_long: bool,
+        qty: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+    ) -> OrderResult:
         """
-        Đóng theo phần trăm vị thế hiện tại (reduceOnly).
+        Lệnh market + đặt SL/TP reduceOnly (nếu sàn hỗ trợ).
         """
         try:
-            pct = max(0.0, min(100.0, float(pct)))
-            if pct == 0.0:
-                return OrderResult(True, "Không có gì để đóng (0%).")
-
             sym = self.normalize_symbol(symbol)
-            side_long, qty = await self.current_position(sym)
-            if (side_long is None and qty == 0) or qty <= 0:
-                return OrderResult(True, "Không có vị thế mở.")
-
-            close_qty = qty * (pct / 100.0)
-            # làm tròn nhẹ theo LOT_STEP_FALLBACK để tránh lỗi step
-            lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
-            close_qty = max(self._floor_step(close_qty, lot_step), lot_step)
-
-            side = "sell" if side_long else "buy"
-            params = {"reduceOnly": True}
-            order = await self._io(self.client.create_order, sym, "market", side, close_qty, None, params)
-            oid = (order or {}).get("id", "N/A")
-            return OrderResult(True, f"Đã đóng {pct:.1f}% vị thế (orderId={oid})")
-        except Exception as e:
-            return OrderResult(False, f"Close% thất bại: {e}")
-
-    async def market_with_sl_tp(self, symbol: str, side_long: bool, qty: float, sl: float, tp: float) -> OrderResult:
-        try:
-            sym = self.normalize_symbol(symbol)
+            side = "buy" if side_long else "sell"
             px = await self.ticker_price(sym)
-
             q_fit, meta = await self._fit_qty(sym, float(qty), float(px or 0))
             if q_fit <= 0:
-                return OrderResult(False, f"Order failed: qty_fit=0 (limits={meta})")
+                return OrderResult(False, f"entry_error: qty_fit=0 (limits={meta})")
 
-            side = "buy" if side_long else "sell"
             entry = await self._place_market_with_retries(sym, side, q_fit)
 
-            params = {"reduceOnly": True}
+            # Post SL/TP reduceOnly
             opp = "sell" if side == "buy" else "buy"
-
-            # SL
-            try:
-                sl_params = {**params, "stopPrice": float(sl)}
+            if sl_price is not None:
+                params = {"reduceOnly": True, "stopPrice": float(sl_price)}
                 if self.exchange_id == "okx":
-                    sl_params["slTriggerPx"] = float(sl)
+                    params["slTriggerPx"] = float(sl_price)
                 try:
-                    _ = await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, sl_params)
-                except Exception:
-                    _ = await self._io(self.client.create_order, sym, "STOP", opp, q_fit, None, sl_params)
-            except Exception:
-                pass
+                    _ = await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
+                except Exception as e:
+                    logging.warning("Create SL order failed: %s", e)
 
-            # TP
-            try:
-                tp_params = {**params, "stopPrice": float(tp)}
-                if self.exchange_id == "okx":
-                    tp_params["tpTriggerPx"] = float(tp)
+            if tp_price is not None:
+                params = {"reduceOnly": True, "stopPrice": float(tp_price)}
+                tptype = "take_profit_market"
+                # Trên vài sàn, vẫn là 'stop_market' với tham số khác; ccxt sẽ map nội bộ
                 try:
-                    _ = await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, tp_params)
-                except Exception:
-                    _ = await self._io(self.client.create_order, sym, "TAKE_PROFIT", opp, q_fit, None, tp_params)
-            except Exception:
-                pass
+                    _ = await self._io(self.client.create_order, sym, tptype, opp, q_fit, None, params)
+                except Exception as e:
+                    logging.warning("Create TP order failed: %s", e)
 
-            return OrderResult(True, f"Live order placed: entry={entry.get('id')}")
+            return OrderResult(True, f"Live order placed: entry={entry.get('id')}",
+                               {"entry": entry})
         except Exception as e:
-            return OrderResult(False, f"Order failed: {e}")
+            # Chuẩn hoá thông báo thường gặp (ví dụ qty nhỏ hơn min)
+            msg = str(e)
+            if "min" in msg.lower() and "amount" in msg.lower():
+                return OrderResult(False, f"entry_error:{msg}")
+            return OrderResult(False, f"entry_error:{msg}")
 
-
-# ----------- sizing helpers ---------------
-def calc_qty(balance_usdt: float, risk_percent: float, leverage: int, entry_price: float, lot_step: float = 0.001) -> float:
-    """
-    Sizing cơ bản theo risk% * leverage / price (trước khi fit theo limits sàn).
-    """
-    notional = balance_usdt * max(risk_percent, 0) / 100.0 * max(leverage, 1)
-    qty_raw = notional / max(entry_price, 1e-9)
-    qty = int(qty_raw / lot_step) * lot_step
-    return max(qty, lot_step)
-
-
-def auto_sl_by_leverage(entry: float, side: str, lev: int, rr_mult: float = None):
-    lev = max(int(lev), 1)
-    try:
-        if rr_mult is None:
-            rr_mult = float(os.getenv("TP_RR_MULT", "2.0"))
-    except Exception:
-        rr_mult = 2.0
-    dist = float(entry) * (0.5 / float(lev))
-    if str(side).upper() == "LONG":
-        sl = float(entry) - dist
-        tp = float(entry) + rr_mult * dist
-    else:
-        sl = float(entry) + dist
-        tp = float(entry) - rr_mult * dist
-    return sl, tp
-
-# =====================[ ADDITIONS FOR /close + sizing helpers ]=====================
-
-# Bot cũ dùng tên get_balance_quote -> alias cho balance_usdt
-async def get_balance_quote_alias(self) -> float:
-    return await self.balance_usdt()
-# bind alias lên class nếu chưa có
-if not hasattr(ExchangeClient, "get_balance_quote"):
-    setattr(ExchangeClient, "get_balance_quote", get_balance_quote_alias)
-
-def _floor_step_local(x: float, step: float) -> float:
-    import math as _m
-    if step and step > 0:
-        return _m.floor(x / step) * step
-    return x
-
-def calc_qty(
-    balance_usdt: float,
-    risk_percent: float,
-    leverage: int,
-    entry_price: float,
-    min_qty: float = None,
-) -> float:
-    """
-    Tính contract qty từ %risk * leverage (đơn giản hóa, đồng nhất bot cũ):
-    notional = balance * (risk_pct/100) * leverage
-    qty = notional / entry_price
-    """
-    try:
-        bal = max(0.0, float(balance_usdt))
-        rp  = max(0.0, float(risk_percent))
-        lev = max(1,   int(leverage))
-        px  = max(0.0, float(entry_price))
-        if px <= 0 or rp <= 0 or bal <= 0:
-            return 0.0
-        notional = bal * (rp / 100.0) * lev
-        qty = notional / px
-        # Làm tròn về step fallback nếu có
-        lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
-        qty = _floor_step_local(qty, lot_step)
-        if min_qty is not None:
-            qty = max(qty, float(min_qty))
-        return max(qty, lot_step)
-    except Exception:
-        return 0.0
-
-def auto_sl_by_leverage(entry: float, side: str, lev: int) -> tuple[float, float]:
-    """
-    Tạo SL/TP tương đối theo leverage (giữ đúng chữ ký bot đang dùng).
-    Quy ước mặc định (dễ hiểu, an toàn):
-      - biên SL % ≈ 100 / (lev * 4)
-      - biên TP % ≈ 100 / (lev * 2)  (RR ~ 2:1)
-    """
-    e  = float(entry)
-    lv = max(1, int(lev))
-    side = (side or "").upper()
-    sl_pct = 100.0 / (lv * 4.0)
-    tp_pct = 100.0 / (lv * 2.0)
-
-    if side == "LONG":
-        sl = e * (1.0 - sl_pct / 100.0)
-        tp = e * (1.0 + tp_pct / 100.0)
-    else:
-        sl = e * (1.0 + sl_pct / 100.0)
-        tp = e * (1.0 - tp_pct / 100.0)
-    return (sl, tp)
-
-# ---------------- multi-account close helpers ----------------
-def _gather_accounts_from_settings(default_pair: str):
-    """
-    Đọc SINGLE_ACCOUNT và ACCOUNTS trong config.settings.
-    Trả về list các dict account hợp lệ: [{name, exchange, api_key, api_secret, testnet, pair}, ...]
-    """
-    try:
-        from config import settings as _S
-    except Exception:
-        return []
-
-    base = []
-    # SINGLE_ACCOUNT (nếu có)
-    try:
-        sa = getattr(_S, "SINGLE_ACCOUNT", None)
-        if isinstance(sa, dict) and sa.get("api_key"):
-            base.append(sa)
-    except Exception:
-        pass
-
-    # ACCOUNTS (danh sách)
-    try:
-        accs = getattr(_S, "ACCOUNTS", [])
-        if isinstance(accs, list):
-            base.extend([a for a in accs if isinstance(a, dict) and a.get("api_key")])
-    except Exception:
-        pass
-
-    # Bổ sung pair mặc định nếu account chưa có
-    out, seen = [], set()
-    for a in base:
+    async def close_percent(self, symbol: str, percent: float) -> OrderResult:
+        """
+        Đóng percent% vị thế hiện có (giữ chiều ngược lại).
+        100% sẽ close hết. Giữ reduceOnly.
+        """
         try:
-            exid = str(a.get("exchange","")).lower()
-            key  = (exid, a.get("api_key",""))
-            if key in seen:
-                continue
-            seen.add(key)
-            item = {
-                "name": a.get("name") or "default",
-                "exchange": exid or "binanceusdm",
-                "api_key": a.get("api_key") or "",
-                "api_secret": a.get("api_secret") or "",
-                "testnet": bool(a.get("testnet", False)),
-                "pair": (a.get("pair") or default_pair or "BTC/USDT"),
-            }
-            out.append(item)
+            pct = max(0.0, min(100.0, float(percent)))
+            side_long, qty = await self.current_position(symbol)
+            if qty <= 0 or side_long is None:
+                return OrderResult(True, "Không có vị thế mở.")
+
+            sym = self.normalize_symbol(symbol)
+            close_qty = qty * (pct / 100.0)
+            lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
+            close_qty = self._floor_step(close_qty, lot_step)
+            if close_qty <= 0:
+                return OrderResult(True, "Không có khối lượng để đóng (sau khi fit step).")
+
+            side = "sell" if side_long else "buy"
+            try:
+                _ = await self._io(self.client.create_order, sym, "market", side, close_qty, None, {"reduceOnly": True})
+            except Exception as e:
+                # nếu lỗi do limit -> thử giảm size
+                if self._should_shrink_on_error(e):
+                    close_qty = max(self._floor_step(close_qty * 0.7, lot_step), 0.0)
+                    if close_qty > 0:
+                        _ = await self._io(self.client.create_order, sym, "market", side, close_qty, None, {"reduceOnly": True})
+                else:
+                    raise
+
+            return OrderResult(True, f"Closed {pct:.0f}% position.")
+        except Exception as e:
+            return OrderResult(False, f"close_percent failed: {e}")
+
+
+# ========== Multi-account close helpers (for /close_cmd) ==========
+async def close_position_on_account(account_name: str, pair: str, percent: float) -> Dict[str, Any]:
+    """
+    Đóng vị thế trên 1 account (theo env/config hiện tại).
+    • Return: {"ok": bool, "message": str}
+    """
+    try:
+        # Với bản hiện tại, account_name chỉ để hiển thị/log.
+        # Nếu bạn có nhiều key/secret theo account, hãy map ở đây (ENV hoặc settings).
+        exid = os.getenv("EXCHANGE_ID", EXCHANGE_ID)
+        api = os.getenv("API_KEY", API_KEY)
+        sec = os.getenv("API_SECRET", API_SECRET)
+        testnet = (os.getenv("TESTNET", "false").lower() in ("1","true","yes","on"))
+
+        cli = ExchangeClient(exid, api, sec, testnet)
+        res = await cli.close_percent(pair, percent)
+        return {"ok": bool(res.ok), "message": res.message}
+    except Exception as e:
+        return {"ok": False, "message": f"{e}"}
+
+
+async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any]]:
+    """
+    Đóng vị thế trên TẤT CẢ account (SINGLE_ACCOUNT + ACCOUNTS_JSON nếu có).
+    • Return: list[{"ok": bool, "message": str}]
+    """
+    import json
+    from config import settings as _S
+
+    results: List[Dict[str, Any]] = []
+
+    # danh sách account từ settings / ENV
+    try:
+        ACCOUNTS = getattr(_S, "ACCOUNTS", [])
+        if not isinstance(ACCOUNTS, list):
+            ACCOUNTS = []
+    except Exception:
+        try:
+            ACCOUNTS = json.loads(os.getenv("ACCOUNTS_JSON", "[]"))
+            if not isinstance(ACCOUNTS, list):
+                ACCOUNTS = []
         except Exception:
+            ACCOUNTS = []
+
+    SINGLE_ACCOUNT = getattr(_S, "SINGLE_ACCOUNT", None)
+    base = ([SINGLE_ACCOUNT] if SINGLE_ACCOUNT else []) + ACCOUNTS
+
+    uniq: List[dict] = []
+    seen = set()
+    for acc in base:
+        if not isinstance(acc, dict):
             continue
-    return out
+        exid = str(acc.get("exchange", "")).lower()
+        key = (exid, acc.get("api_key", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(acc)
 
-async def close_position_on_account(account_name: str, pair: str, percent: float = 100.0) -> dict:
-    """
-    Đóng vị thế theo % trên MỘT account (reduceOnly), đồng thời hủy TP/SL còn chờ nếu đóng 100%.
-    Trả về: {"ok": bool, "message": str}
-    """
-    try:
-        from config.settings import PAIR as DEFAULT_PAIR  # nếu có
-    except Exception:
-        DEFAULT_PAIR = "BTC/USDT"
+    if not uniq:
+        # Fallback: dùng account mặc định của ENV hiện tại
+        r = await close_position_on_account("default", pair, percent)
+        results.append(r)
+        return results
 
-    percent = max(0.0, min(100.0, float(percent)))
-    if percent == 0.0:
-        return {"ok": True, "message": "0% — không thực hiện."}
-
-    accounts = _gather_accounts_from_settings(DEFAULT_PAIR)
-    # tìm account theo name
-    picked = None
-    for a in accounts:
-        if str(a.get("name")).strip().lower() == str(account_name).strip().lower():
-            picked = a
-            break
-    if not picked:
-        return {"ok": False, "message": f"Không tìm thấy account '{account_name}' trong cấu hình."}
-
-    cli = ExchangeClient(
-        exchange_id=picked.get("exchange"),
-        api_key=picked.get("api_key"),
-        api_secret=picked.get("api_secret"),
-        testnet=picked.get("testnet"),
-    )
-    symbol = picked.get("pair") or (pair or DEFAULT_PAIR)
-
-    # Nếu 100%: hủy TP/SL trước cho sạch
-    if percent >= 99.999:
+    for acc in uniq:
         try:
-            _ = await cli.cancel_all_orders_symbol(symbol)
-        except Exception:
-            pass
+            exid = str(acc.get("exchange") or EXCHANGE_ID).lower()
+            api = acc.get("api_key") or API_KEY
+            sec = acc.get("api_secret") or API_SECRET
+            testnet = bool(acc.get("testnet", TESTNET))
+            name = acc.get("name", "default")
 
-    # Đóng theo %
-    res = await cli.close_position_pct(symbol, percent)
-    return {"ok": bool(res.ok), "message": res.message}
-
-async def close_position_on_all(pair: str, percent: float = 100.0):
-    """
-    Đóng vị thế theo % trên TẤT CẢ account đã cấu hình.
-    Trả về list kết quả: [{"ok": bool, "message": str, "account": name}, ...]
-    """
-    try:
-        from config.settings import PAIR as DEFAULT_PAIR
-    except Exception:
-        DEFAULT_PAIR = "BTC/USDT"
-
-    results = []
-    accounts = _gather_accounts_from_settings(DEFAULT_PAIR)
-    if not accounts:
-        return [{"ok": False, "message": "Không tìm thấy account trong cấu hình.", "account": "-"}]
-
-    # chạy tuần tự để dễ đọc log (có thể tối ưu song song sau)
-    for a in accounts:
-        try:
-            cli = ExchangeClient(
-                exchange_id=a.get("exchange"),
-                api_key=a.get("api_key"),
-                api_secret=a.get("api_secret"),
-                testnet=a.get("testnet"),
-            )
-            symbol = a.get("pair") or pair or DEFAULT_PAIR
-
-            # 100% -> hủy TP/SL trước
-            if percent >= 99.999:
-                try:
-                    _ = await cli.cancel_all_orders_symbol(symbol)
-                except Exception:
-                    pass
-
-            res = await cli.close_position_pct(symbol, float(percent))
-            results.append({"ok": bool(res.ok), "message": res.message, "account": a.get("name","default")})
+            cli = ExchangeClient(exid, api, sec, testnet)
+            res = await cli.close_percent(acc.get("pair", pair), percent)
+            results.append({"ok": bool(res.ok), "message": f"{name} | {exid} → {res.message}"})
         except Exception as e:
-            results.append({"ok": False, "message": f"{e}", "account": a.get("name","default")})
-    return results
+            results.append({"ok": False, "message": f"{acc.get('name','?')} | {e}"})
 
-# ----------------------- /core/trade_executor.py -----------------------
+    return results
