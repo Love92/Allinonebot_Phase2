@@ -14,7 +14,7 @@ from config.settings import (
     TELEGRAM_BROADCAST_BOT_TOKEN,
     TELEGRAM_BROADCAST_CHAT_ID,
 )
-
+from tg.admin_bot import enforce_admin_for_all_commands # quản lý quyền botallinone
 from utils.storage import Storage
 from utils.time_utils import now_vn, TOKYO_TZ
 from strategy.signal_generator import evaluate_signal, tide_window_now
@@ -1835,6 +1835,9 @@ def build_app():
     app.add_handler(CommandHandler("journal", journal_command))
     app.add_handler(CommandHandler("recovery_checklist", recovery_command))
     app.add_error_handler(_on_error)
+	# Chỉ cho phép /status public, còn lại admin-only
+    enforce_admin_for_all_commands(app, {"status"})
+
     return app
 
 
@@ -1913,5 +1916,6 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
+
 
 
