@@ -1645,7 +1645,6 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mark_done(storage, pid, "REJECTED")
     await update.effective_message.reply_text(f"Đã từ chối pending `{pid}`.")
-    
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1654,25 +1653,26 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /close bingx_test     -> đóng 100% riêng account 'bingx_test'
     /close 25 bingx_test  -> đóng 25% riêng 'bingx_test' (hoặc: /close bingx_test 25)
     """
+    from core.trade_executor import close_position_on_account, close_position_on_all
+
     msg = update.effective_message
     uid = _uid(update)
 
-    # --- Lấy pair ưu tiên từ user settings, fallback ENV/DEFAULT ---
+    # Lấy pair ưu tiên từ user settings, fallback ENV/DEFAULT
     try:
         st = storage.get_user(uid)
         pair = (getattr(st.settings, "pair", None) or os.getenv("PAIR") or "BTC/USDT")
     except Exception:
         pair = os.getenv("PAIR", "BTC/USDT")
 
-    # --- Parse args: chấp nhận cả "pct acc" lẫn "acc pct" ---
+    # Parse args: chấp nhận cả "pct acc" lẫn "acc pct"
     args = context.args if hasattr(context, "args") else []
     percent: float = 100.0
     account: Optional[str] = None
 
     def _is_percent(s: str) -> bool:
         try:
-            x = float(s)
-            return 0.0 < x <= 100.0
+            x = float(s); return 0.0 < x <= 100.0
         except Exception:
             return False
 
@@ -1687,93 +1687,7 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(args) >= 2 and _is_percent(str(args[1]).strip()):
                 percent = float(args[1])
 
-    # --- Helpers: dựng client theo tên account / single default ---
-    def _list_accounts() -> list[dict]:
-        try:
-            from config import settings as _S
-            accs = getattr(_S, "ACCOUNTS", [])
-            if isinstance(accs, list) and accs:
-                return accs
-        except Exception:
-            pass
-        try:
-            accs = json.loads(os.getenv("ACCOUNTS_JSON", "[]"))
-            return accs if isinstance(accs, list) else []
-        except Exception:
-            return []
-
-    def _find_account_by_name(name: str) -> Optional[dict]:
-        for a in _list_accounts():
-            if str(a.get("name", "")).strip() == name:
-                return a
-        return None
-
-    async def _get_client_for(acc: Optional[dict]):
-        # Import ở đây để không phá cấu trúc file hiện tại
-        from core.exchange import ExchangeClient  # dự án đang dùng client này
-        if acc:
-            exid = str(acc.get("exchange") or os.getenv("EXCHANGE_ID", "bingx")).lower()
-            api  = acc.get("api_key")    or os.getenv("API_KEY", "")
-            sec  = acc.get("api_secret") or os.getenv("API_SECRET", "")
-            tnet = bool(acc.get("testnet", os.getenv("TESTNET", "false").lower() in ("1","true","yes")))
-            return ExchangeClient(exid, api, sec, tnet)
-        else:
-            # single/default từ ENV
-            exid = os.getenv("EXCHANGE_ID", "bingx").lower()
-            api  = os.getenv("API_KEY", "")
-            sec  = os.getenv("API_SECRET", "")
-            tnet = os.getenv("TESTNET", "false").lower() in ("1","true","yes")
-            return ExchangeClient(exid, api, sec, tnet)
-
-    async def _close_on_account(acc_name: Optional[str], pct: float) -> dict:
-        try:
-            acc_cfg = _find_account_by_name(acc_name) if acc_name else None
-            cli = await _get_client_for(acc_cfg)
-            # Lấy vị thế hiện tại
-            pos = await cli.position(pair)
-            sz  = float(pos.get("size", 0.0) or 0.0)
-            if sz <= 0:
-                return {"ok": False, "message": "no-open-position"}
-            side_long = str(pos.get("side", "")).upper() == "LONG"
-
-            # Tính số lượng đóng
-            close_qty = max(0.0, round(sz * (pct/100.0), 6))
-            if close_qty <= 0:
-                return {"ok": False, "message": "qty<=0"}
-
-            # Đóng bằng lệnh market reduce-only
-            res = await cli.market_close(pair, close_qty, reduce_only=True, side_long=side_long)
-            if not getattr(res, "ok", False):
-                return {"ok": False, "message": getattr(res, "message", "order_fail")}
-            return {"ok": True, "message": f"closed {close_qty}"}
-        except Exception as e:
-            return {"ok": False, "message": f"{e}"}
-
-    async def _cancel_tp_sl_for(acc_name: Optional[str]) -> None:
-        # Hủy tất cả TP/SL đang treo cho cặp này
-        try:
-            acc_cfg = _find_account_by_name(acc_name) if acc_name else None
-            cli = await _get_client_for(acc_cfg)
-            # Nếu client có shortcut hủy TP/SL
-            if hasattr(cli, "cancel_all_tp_sl"):
-                try:
-                    await cli.cancel_all_tp_sl(pair)
-                    return
-                except Exception:
-                    pass
-            # Fallback: duyệt open orders và cancel các order loại TP/SL
-            orders = await cli.open_orders(pair)
-            for od in (orders or []):
-                typ = str(od.get("type","")).upper()
-                if typ in ("STOP","TAKE_PROFIT","STOP_MARKET","TAKE_PROFIT_MARKET","STOP_LOSS","TAKEPROFIT"):
-                    try:
-                        await cli.cancel_order(pair, od["id"])
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    # --- Thực thi đóng ---
+    # Chuẩn hoá percent
     try:
         percent = float(percent)
         percent = 100.0 if percent > 100.0 else (1.0 if percent <= 0 else percent)
@@ -1783,43 +1697,27 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if account:
             # Đóng riêng 1 account
-            res = await _close_on_account(account, percent)
-            lines = [f"🔧 Close {percent:.0f}% | {pair} | account: <b>{_esc(account)}</b>",
-                     f"• {'OK' if res.get('ok') else 'FAIL'} { _esc(res.get('message','')) }"]
+            res = await close_position_on_account(account, pair, percent)
+            lines = [
+                f"🔧 Close {percent:.0f}% | {pair} | account: <b>{_esc(account)}</b>",
+                f"• {'OK' if res.get('ok') else 'FAIL'} {_esc(res.get('message',''))}"
+            ]
             if percent >= 100.0:
-                await _cancel_tp_sl_for(account)
                 lines.append("🧹 TP/SL đã hủy.")
             await msg.reply_text("\n".join(lines), parse_mode="HTML")
         else:
-            # Đóng tất cả account (nếu không cấu hình account → coi như 'single')
-            accs = _list_accounts()
-            results = []
-            if accs:
-                for a in accs:
-                    name = str(a.get("name","")).strip() or "(acc)"
-                    r = await _close_on_account(name, percent)
-                    results.append((name, r))
-                    # Nếu 100% → hủy TP/SL sau khi đóng xong
-                    if percent >= 100.0:
-                        await _cancel_tp_sl_for(name)
-                lines = [f"🔧 Close {percent:.0f}% | {pair} | ALL accounts"]
-                for name, r in results:
-                    lines.append(f"• { _esc(name) }: {'OK' if r.get('ok') else 'FAIL'} { _esc(r.get('message','')) }")
-                if percent >= 100.0:
-                    lines.append("🧹 TP/SL đã hủy.")
-                await msg.reply_text("\n".join(lines), parse_mode="HTML")
-            else:
-                # single/default
-                r = await _close_on_account(None, percent)
-                lines = [f"🔧 Close {percent:.0f}% | {pair} | single",
-                         f"• {'OK' if r.get('ok') else 'FAIL'} { _esc(r.get('message','')) }"]
-                if percent >= 100.0:
-                    await _cancel_tp_sl_for(None)
-                    lines.append("🧹 TP/SL đã hủy.")
-                await msg.reply_text("\n".join(lines), parse_mode="HTML")
+            # Đóng tất cả account
+            results = await close_position_on_all(pair, percent)  # list[dict]
+            lines = [f"🔧 Close {percent:.0f}% | {pair} | ALL accounts"]
+            for r in results or []:
+                # mỗi r thường có 'message' đã bao gồm tên account/chi tiết sàn
+                lines.append(f"• { _esc(r.get('message','')) }")
+            if percent >= 100.0:
+                lines.append("🧹 TP/SL đã hủy.")
+            await msg.reply_text("\n".join(lines), parse_mode="HTML")
     except Exception as e:
         await msg.reply_text(f"❌ Lỗi /close: {_esc(str(e))}", parse_mode="HTML")
-
+    
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
@@ -2049,6 +1947,7 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
+
 
 
 
