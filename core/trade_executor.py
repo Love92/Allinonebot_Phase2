@@ -77,6 +77,35 @@ def auto_sl_by_leverage(entry: float, side: str, lev: int, rr_mult: float | None
         tp = entry - rr_mult * dist
     return sl, tp
 
+# ===== Strict casting helpers (avoid side/float glitches) =====
+def _force_is_long(side) -> bool:
+    """
+    Chuẩn hoá hướng vào lệnh thành bool:
+    - 'LONG'/'long'/'buy'/True/1/+1 → True
+    - 'SHORT'/'short'/'sell'/False/0/-1 → False
+    - Mặc định False nếu không nhận diện được
+    """
+    try:
+        if isinstance(side, bool):
+            return side
+        if isinstance(side, (int, float)):
+            return float(side) > 0
+        s = str(side or "").strip().lower()
+        if s in ("long", "buy", "true", "1", "+1", "yes", "y"):
+            return True
+        if s in ("short", "sell", "false", "0", "-1", "no", "n"):
+            return False
+    except Exception:
+        pass
+    return False
+
+
+def _force_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
 
 # ===================== Exchange Client =====================
 class ExchangeClient:
@@ -703,7 +732,12 @@ except Exception:
         if sl is None or tp is None:
             sl, tp = auto_sl_by_leverage(px, side, lev)
 
-        is_long = True if str(side).upper() == "LONG" else False
+        # --- EP KIỂU RÕ RÀNG (trước khi gọi client) ---
+        is_long = _force_is_long(side)
+        qty = _force_float(qty, 0.0)
+        sl  = _force_float(sl,  None)
+        tp  = _force_float(tp,  None)
+
         res = await cli.market_with_sl_tp(symbol, is_long, qty, sl, tp)
 
         if not res.ok:
@@ -773,7 +807,12 @@ except Exception:
                 if sl is None or tp is None:
                     sl, tp = auto_sl_by_leverage(px, side, lev)
 
-                is_long = True if str(side).upper() == "LONG" else False
+                # --- EP KIỂU RÕ RÀNG (trước khi gọi client) ---
+                is_long = _force_is_long(side)
+                qty = _force_float(qty, 0.0)
+                sl  = _force_float(sl,  None)
+                tp  = _force_float(tp,  None)
+
                 res = await cli.market_with_sl_tp(pair, is_long, qty, sl, tp)
 
                 if not res.ok:
@@ -840,4 +879,3 @@ async def execute_order_flow(app, storage, *,
     return opened_real, result
 
 # =====================================================================
-
