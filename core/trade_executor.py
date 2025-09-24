@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio, logging, math, os, json
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
+from typing import Literal
+
 
 from dotenv import load_dotenv
 import ccxt  # type: ignore
@@ -657,3 +659,185 @@ async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any
             results.append({"ok": False, "message": f"{acc.get('name','?')} | {e}"})
 
     return results
+
+# ========== [ADD] Shim adapters if not provided elsewhere ==========
+try:
+    # Nếu a đã có 2 hàm này ở module khác, import ở đây và BỎ các shim bên dưới.
+    from core.order_ops import open_single_account_order, open_multi_account_orders  # type: ignore
+except Exception:
+    async def open_single_account_order(app, storage, *, symbol: str, side: str,
+                                       qty_cfg: dict, risk_cfg: dict, meta: dict):
+        """
+        Adapter tối thiểu cho SINGLE ACCOUNT.
+        Trả về: (ok: bool, info: dict với 'entry_id' nếu mở thành công)
+        """
+        from config import settings as _S
+        exid = getattr(_S, "EXCHANGE_ID", EXCHANGE_ID)
+        api  = getattr(_S, "API_KEY", API_KEY)
+        sec  = getattr(_S, "API_SECRET", API_SECRET)
+        tnet = getattr(_S, "TESTNET", TESTNET)
+
+        cli = ExchangeClient(exid, api, sec, tnet)
+
+        # Lấy giá hiện tại
+        px = await cli.ticker_price(symbol)
+        if px <= 0:
+            return False, {"error": "ticker_price<=0"}
+
+        # Tính qty:
+        qty = float(qty_cfg.get("qty") or 0)
+        if qty <= 0:
+            # fallback theo balance, risk%, lev
+            bal = await cli.balance_usdt()
+            risk_percent = float(risk_cfg.get("risk_percent", getattr(_S, "RISK_PERCENT", 1.0)))
+            lev = int(risk_cfg.get("leverage", getattr(_S, "LEVERAGE", 10)))
+            qty = calc_qty(bal, risk_percent, lev, px)
+
+        if qty <= 0:
+            return False, {"error": "qty<=0"}
+
+        # SL/TP (nếu chưa có thì auto theo leverage)
+        lev = int(risk_cfg.get("leverage", getattr(_S, "LEVERAGE", 10)))
+        sl = qty_cfg.get("sl")
+        tp = qty_cfg.get("tp")
+        if sl is None or tp is None:
+            sl, tp = auto_sl_by_leverage(px, side, lev)
+
+        is_long = True if str(side).upper() == "LONG" else False
+        res = await cli.market_with_sl_tp(symbol, is_long, qty, sl, tp)
+
+        if not res.ok:
+            return False, {"error": res.message}
+
+        entry = (res.data or {}).get("entry", {})
+        entry_id = entry.get("id")
+        return True, {"opened": True, "entry_id": entry_id, "qty": qty, "price": px, "sl": sl, "tp": tp}
+
+    async def open_multi_account_orders(app, storage, *, symbol: str, side: str,
+                                       accounts_cfg: dict, qty_cfg: dict, risk_cfg: dict, meta: dict):
+        """
+        Adapter tối thiểu cho MULTI ACCOUNT.
+        Trả về: (ok: bool, mapping account_name -> info dict)
+        """
+        from config import settings as _S
+
+        # Lấy danh sách account từ settings.ACCOUNTS hoặc ENV ACCOUNTS_JSON
+        try:
+            ACCOUNTS = getattr(_S, "ACCOUNTS", [])
+            if not isinstance(ACCOUNTS, list):
+                ACCOUNTS = []
+        except Exception:
+            try:
+                ACCOUNTS = json.loads(os.getenv("ACCOUNTS_JSON", "[]"))
+                if not isinstance(ACCOUNTS, list):
+                    ACCOUNTS = []
+            except Exception:
+                ACCOUNTS = []
+
+        results = {}
+        any_ok = False
+
+        for acc in ACCOUNTS:
+            try:
+                name = acc.get("name", "acc")
+                exid = str(acc.get("exchange") or EXCHANGE_ID).lower()
+                api  = acc.get("api_key") or API_KEY
+                sec  = acc.get("api_secret") or API_SECRET
+                tnet = bool(acc.get("testnet", TESTNET))
+                pair = acc.get("pair", symbol)
+
+                cli = ExchangeClient(exid, api, sec, tnet)
+
+                # giá hiện tại
+                px = await cli.ticker_price(pair)
+                if px <= 0:
+                    results[name] = {"opened": False, "error": "ticker_price<=0"}
+                    continue
+
+                # qty theo acc (ưu tiên qty_cfg['qty_per_account'] nếu có)
+                qty = float(qty_cfg.get("qty_per_account") or qty_cfg.get("qty") or 0)
+                if qty <= 0:
+                    bal = await cli.balance_usdt()
+                    risk_percent = float(risk_cfg.get("risk_percent", acc.get("risk_percent", getattr(_S, "RISK_PERCENT", 1.0))))
+                    lev = int(risk_cfg.get("leverage", acc.get("leverage", getattr(_S, "LEVERAGE", 10))))
+                    qty = calc_qty(bal, risk_percent, lev, px)
+
+                if qty <= 0:
+                    results[name] = {"opened": False, "error": "qty<=0"}
+                    continue
+
+                # SL/TP
+                lev = int(risk_cfg.get("leverage", acc.get("leverage", getattr(_S, "LEVERAGE", 10))))
+                sl = qty_cfg.get("sl")
+                tp = qty_cfg.get("tp")
+                if sl is None or tp is None:
+                    sl, tp = auto_sl_by_leverage(px, side, lev)
+
+                is_long = True if str(side).upper() == "LONG" else False
+                res = await cli.market_with_sl_tp(pair, is_long, qty, sl, tp)
+
+                if not res.ok:
+                    results[name] = {"opened": False, "error": res.message}
+                else:
+                    entry = (res.data or {}).get("entry", {})
+                    results[name] = {"opened": True, "entry_id": entry.get("id"), "qty": qty, "price": px, "sl": sl, "tp": tp}
+                    any_ok = True
+            except Exception as e:
+                results[name] = {"opened": False, "error": f"{e}"}
+
+        return any_ok, results
+        
+# ========== [ADD] Unified execute hub (no breaking change) ==========
+
+async def execute_order_flow(app, storage, *,
+                            symbol: str, side: Literal["LONG","SHORT"],
+                            qty_cfg: dict, risk_cfg: dict, accounts_cfg: dict,
+                            meta: dict, origin: Literal["AUTO","MANUAL","ORDER"]) -> Tuple[bool, dict]:
+    """
+    Return:
+      - opened_real: bool
+      - result: { 'entry_ids': [...], 'per_account': {...}, 'origin': origin, 'side': side, 'symbol': symbol }
+    Ghi chú:
+      - Không tự broadcast ở đây; caller sẽ dùng formatter để gửi boardcard EXECUTED (đồng bộ 1 nguồn).
+    """
+    entry_ids = []
+    per_account = {}
+
+    # --- tài khoản đơn (nếu project của anh không dùng, shim sẽ tự xử lý) ---
+    try:
+        ok, info = await open_single_account_order(
+            app, storage, symbol=symbol, side=side,
+            qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
+        )
+        if ok and isinstance(info, dict) and "entry_id" in info:
+            entry_ids.append(info["entry_id"])
+            per_account["single"] = info
+    except Exception as e:
+        per_account["single_error"] = str(e)
+
+    # --- đa tài khoản (nếu bật) ---
+    try:
+        if accounts_cfg and accounts_cfg.get("enabled"):
+            ok2, multi = await open_multi_account_orders(
+                app, storage, symbol=symbol, side=side,
+                accounts_cfg=accounts_cfg, qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
+            )
+            per_account["multi"] = multi
+            for acc_name, d in (multi or {}).items():
+                if isinstance(d, dict) and d.get("opened") and "entry_id" in d:
+                    entry_ids.append(d["entry_id"])
+    except Exception as e:
+        per_account["multi_error"] = str(e)
+
+    opened_real = len(entry_ids) > 0
+    result = {
+        "entry_ids": entry_ids,
+        "per_account": per_account,
+        "origin": origin,
+        "side": side,
+        "symbol": symbol,
+    }
+    return opened_real, result
+
+# =====================================================================
+
