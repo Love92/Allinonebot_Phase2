@@ -11,7 +11,7 @@ from data.moon_tide import get_tide_events
 from strategy.signal_generator import evaluate_signal
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
 from tg.formatter import _beautify_report  # dùng lại beautify để tránh Markdown/HTML lỗi
-from core.approval_flow import create_pending
+from core.approval_flow import create_pending_v2 # (unused)
 
 # NEW: vòng lặp M5 riêng
 from core.m5_reporter import m5_report_loop
