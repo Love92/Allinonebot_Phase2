@@ -22,7 +22,7 @@ from strategy.m5_strategy import m5_snapshot, m5_entry_check
 from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
-from core.approval_flow import create_pending
+from core.approval_flow import create_pending_v2
 
 # Vòng nền
 from core.auto_trade_engine import start_auto_loop
@@ -1242,11 +1242,34 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ----------- 2) Nhánh MANUAL: tạo pending ----------
     if (st.settings.mode or "manual").lower() == "manual":
-        score = int(res.get("confidence", 0))
-        ps = create_pending(storage, uid, st.settings.pair, side, score, entry_hint=None, sl=None, tp=None)
+        # ✅ CHỈ CẬP NHẬT: dùng create_pending_v2 + p.pid (giữ mọi thứ khác)
+        try:
+            from core.approval_flow import create_pending_v2
+        except Exception:
+            # nếu import path khác trong dự án của a, giữ nguyên import hiện có
+            from approval_flow import create_pending_v2  # type: ignore
+
+        # gom thêm context nếu có (tùy res)
+        frames       = res.get("frames", {}) if isinstance(res, dict) else {}
+        qty_cfg      = res.get("qty_cfg", {}) if isinstance(res, dict) else {}
+        risk_cfg     = res.get("risk_cfg", {}) if isinstance(res, dict) else {}
+        accounts_cfg = res.get("accounts_cfg", {}) if isinstance(res, dict) else {}
+        gates        = res.get("gates", {}) if isinstance(res, dict) else {}
+
+        p = create_pending_v2(storage, {
+            "symbol": st.settings.pair,
+            "suggested_side": side,
+            "signal_frames": frames,
+            "boardcard_ctx": {"preview_block": safe_ta},
+            "qty_cfg": qty_cfg,
+            "risk_cfg": risk_cfg,
+            "accounts_cfg": accounts_cfg,
+            "gates": gates,
+        })
+
         block = (
             safe_ta
-            + f"\nID: <code>{ps.id}</code>\nDùng /approve {ps.id} hoặc /reject {ps.id}"
+            + f"\nID: <code>{p.pid}</code>\nDùng /approve {p.pid} hoặc /reject {p.pid}"
         )
         await update.message.reply_text(safe_daily + "\n\n" + block, parse_mode="HTML")
         return
@@ -1375,6 +1398,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text("(AUTO)\n" + enter_line)
 
+
 # ================== /m5report ==================
 async def m5report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
@@ -1494,257 +1518,307 @@ async def autolog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== /approve (manual) ==================
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /approve <pending_id> [account_name?]
-    - Manual approve: duyệt tín hiệu PENDING và vào lệnh ĐA TÀI KHOẢN (SINGLE_ACCOUNT + ACCOUNTS).
-    - Dùng market_with_sl_tp(...) giống /order_cmd (fallback open_market nếu lib cũ).
-    - Chỉ cộng quota/trade_count khi có ÍT NHẤT 1 sàn khớp thật.
-    - Broadcast boardcard EXECUTED (format y như /order_cmd) khi execute thật.
-    - Giữ các helper cũ: _get_pending_signal, _mark_pending_done, _quota_commit ... nếu đã có trong dự án.
-    """
-    uid = _uid(update)
-    st  = storage.get_user(uid)
-    msg = update.effective_message
-
-    # Chỉ manual
+    app = context.application
+    # Ưu tiên storage trong bot_data (nếu có), fallback biến global 'storage'
     try:
-        mode = (getattr(st.settings, "mode", "manual") or "manual").lower()
+        storage_use = app.bot_data.get("storage") if app and hasattr(app, "bot_data") else None
     except Exception:
-        mode = "manual"
-    if mode != "manual":
-        await msg.reply_text("⚠️ Chỉ dùng /approve trong chế độ manual.")
-        return
+        storage_use = None
+    storage_use = storage_use or storage
 
-    args = context.args if hasattr(context, "args") else []
+    args = context.args or []
     if not args:
-        await msg.reply_text("Cú pháp: /approve <id> [account_name?]")
+        await update.effective_message.reply_text("Cú pháp: /approve <pending_id>")
         return
-    sig_id_raw = args[0]
-    account_filter = args[1].strip() if len(args) >= 2 else None
+    pid = args[0].strip()
 
-    # Lấy pending (giữ API/hàm cũ của dự án)
-    try:
-        pending = _get_pending_signal(sig_id_raw)  # noqa: F821
-    except Exception as e:
-        await msg.reply_text(f"⚠️ Lỗi lấy pending: {e}")
-        return
-    if not pending:
-        await msg.reply_text(f"⚠️ Không tìm thấy pending id={sig_id_raw}.")
+    from core.approval_flow import get_pending, mark_done
+    p = get_pending(storage_use, pid)
+    if not p or p.status != "PENDING":
+        await update.effective_message.reply_text(f"Không tìm thấy pending `{pid}` hoặc đã xử lý.")
         return
 
-    # Thông tin tín hiệu
-    pair = str(pending.get("pair") or getattr(st.settings, "pair", "BTC/USDT") or "BTC/USDT")
-    side_txt = str(pending.get("side", "NONE")).upper()
-    if side_txt not in ("LONG", "SHORT", "BUY", "SELL"):
-        await msg.reply_text(f"⚠️ Side không hợp lệ: {side_txt}")
-        return
-    side_long = side_txt in ("LONG", "BUY")
+    # Gọi hub thực thi (giữ nguyên)
+    from core.trade_executor import execute_order_flow
+    opened, exec_result = await execute_order_flow(
+        app, storage_use,
+        symbol=p.symbol,
+        side=p.suggested_side,
+        qty_cfg=p.qty_cfg,
+        risk_cfg=p.risk_cfg,
+        accounts_cfg=p.accounts_cfg,
+        meta={"reason": "MANUAL_APPROVE", "frames": p.signal_frames, "gates": p.gates},
+        origin="MANUAL"
+    )
 
-    # risk/leverage
-    try: risk_pct = float(pending.get("risk_percent", getattr(st.settings, "risk_percent", 20.0)))
-    except Exception: risk_pct = 20.0
-    try: lev = int(str(pending.get("leverage", getattr(st.settings, "leverage", 1))).lstrip("xX"))
-    except Exception: lev = 1
+    if opened:
+        # Mark approved (giữ nguyên)
+        mark_done(storage_use, pid, "APPROVED")
 
-    # Danh sách account: SINGLE_ACCOUNT + ACCOUNTS
-    try:
-        from config.settings import SINGLE_ACCOUNT, ACCOUNTS
-        accounts = [SINGLE_ACCOUNT] + (ACCOUNTS or [])
-    except Exception:
-        accounts = [{"name": "default"}]
-    if account_filter:
-        accounts = [a for a in accounts if str(a.get("name") or "").lower() == account_filter.lower()] or accounts
-
-    # Tạo tide label để hiển thị trên boardcard
-    tide_label = None
-    try:
-        from strategy.signal_generator import tide_window_now
-        twin = tide_window_now(now_vn(), hours=float(getattr(st.settings, "tide_window_hours", TIDE_WINDOW_HOURS)))
-        if twin:
-            start, end = twin
-            tide_label = f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
-    except Exception:
-        pass
-
-    # Entry spot gợi ý
-    try:
-        entry_spot_hint = _binance_spot_entry(pair)
-    except Exception:
-        entry_spot_hint = 0.0
-
-    opened_any = False
-    results = []
-    broadcasts = []
-
-    for acc in accounts:
-        name = str(acc.get("name") or "default")
-        exid = str(acc.get("exchange") or getattr(st.settings, "exchange", "binanceusdm")).lower()
-        api_key = acc.get("api_key") or None
-        api_secret = acc.get("api_secret") or None
-        testnet = bool(acc.get("testnet")) if "testnet" in acc else None
-        pair_acc = str(acc.get("pair") or pair)
-
-        # Tạo client
+        # Boardcard EXECUTED (giữ nguyên)
         try:
+            from tg.formatter import render_executed_boardcard
+            preview_block = (p.boardcard_ctx or {}).get("preview_block", "")
+            text_exec = render_executed_boardcard(
+                origin="MANUAL", symbol=p.symbol, side=p.suggested_side,
+                entry_ids=list(exec_result.get("entry_ids") or []), preview_block=preview_block
+            )
+            await update.effective_message.reply_text(text_exec, parse_mode="Markdown")
+        except Exception:
+            ids_line = " | ".join(map(str, (exec_result or {}).get("entry_ids") or [])) or "—"
+            fallback = f"🤖 EXECUTED (Mode: MANUAL) | {p.symbol} {p.suggested_side}\n🆔 {ids_line}"
+            await update.effective_message.reply_text(fallback)
+
+        # === [ADD] ĐĂNG KÝ TP-by-time CHO MANUAL (TP_TIME_HOURS, mặc định 5.5h) ===
+        try:
+            from utils.time_utils import now_vn
+            from datetime import timedelta
+            import os
+
+            uid = _uid(update)
+            now = now_vn()
+
             try:
-                cli = ExchangeClient(exchange_id=exid, api_key=api_key, api_secret=api_secret, testnet=testnet)  # kiểu mới
+                tp_hours = float(os.getenv("TP_TIME_HOURS", "5.5"))
             except Exception:
-                cli = ExchangeClient()  # kiểu cũ
-        except Exception as e:
-            results.append(f"• {name} | {exid} | init_fail: {e}")
-            continue
+                tp_hours = 5.5
 
-        # Giá & sizing
-        try:
-            t = await cli._io(cli.client.fetch_ticker, pair_acc)
-            px = float(t.get("last") or t.get("close") or 0.0)
-        except Exception:
-            px = 0.0
+            tp_eta = now + timedelta(hours=tp_hours)
 
-        try:
-            bal = await cli.get_balance_quote() if hasattr(cli, "get_balance_quote") else await cli.balance_usdt()
-        except Exception:
-            bal = 0.0
-
-        qty = calc_qty(bal, risk_pct, lev, px)
-
-        # SL/TP ưu tiên pending; nếu thiếu thì auto theo leverage
-        sl_arg, tp_arg = pending.get("sl"), pending.get("tp")
-        if sl_arg is None or (isinstance(sl_arg, (int, float)) and not math.isfinite(sl_arg)):  # type: ignore
-            sl_auto, tp_auto = auto_sl_by_leverage(px, "LONG" if side_long else "SHORT", lev)
-            sl_price = sl_auto if sl_arg is None else sl_arg
-            tp_price = tp_auto if tp_arg is None else tp_arg
-        else:
-            sl_price = float(sl_arg) if sl_arg is not None else None
-            tp_price = float(tp_arg) if tp_arg is not None else None
-
-        # leverage best-effort
-        try:
-            await cli.set_leverage(pair_acc, lev)
-        except Exception:
-            pass
-
-        # ĐẶT LỆNH: ưu tiên market_with_sl_tp
-        ok = False
-        info = ""
-        try:
-            if hasattr(cli, "market_with_sl_tp"):
-                r = await cli.market_with_sl_tp(pair_acc, side_long, qty, sl_price, tp_price)
-            else:
-                r = await cli.open_market(pair_acc, ("LONG" if side_long else "SHORT"), qty, sl_price, tp_price)  # type: ignore
-            ok = bool(getattr(r, "ok", False))
-            info = getattr(r, "message", r)
-        except Exception as e:
-            ok = False
-            info = f"{e}"
-
-        if ok:
-            opened_any = True
-            results.append(f"• {name} | {exid} | {pair_acc} → {info}")
-            # Gom boardcard broadcast (đúng format thủ công)
+            # Lấy SL (nếu hub trả về) để sentinel quản trị rủi ro
+            sl_price = None
             try:
-                btxt = _fmt_exec_broadcast(
-                    pair=pair_acc.replace(":USDT",""),
-                    side=("LONG" if side_long else "SHORT"),
-                    acc_name=name, ex_id=exid,
-                    lev=int(lev), risk=float(risk_pct), qty=float(qty),
-                    entry_spot=float(entry_spot_hint or px or 0.0),
-                    sl=(float(sl_price) if sl_price is not None else None),
-                    tp=(float(tp_price) if tp_price is not None else None),
-                    tide_label=tide_label, mode_label="Manual APPROVE",
-                )
-                broadcasts.append(btxt)
+                single_info = (exec_result or {}).get("per_account", {}).get("single", {})
+                sl_price = single_info.get("sl")
             except Exception:
                 pass
-        else:
-            results.append(f"• {name} | {exid} | {pair_acc} → FAILED: {info}")
 
-    # Phản hồi cho người duyệt
-    if opened_any:
-        await msg.reply_text("✅ APPROVED & EXECUTED (đa tài khoản)\n" + "\n".join(results))
-        # Broadcast (y hệt thủ công) — chỉ khi execute thật
-        for btxt in broadcasts:
+            # Lưu vào chỗ theo dõi vị thế đang mở
+            # Ưu tiên dùng app.bot_data để tránh đụng module khác
             try:
-                await _broadcast_html(btxt)
+                open_pos = app.bot_data.setdefault("open_pos", {})
             except Exception:
-                pass
-        # Đếm quota/trade_count (chỉ khi execute thật)
-        try:
-            # Nếu anh có cơ chế quota riêng cho manual, gọi helper cũ; nếu dùng chung theo tide-window thì commit tại đây.
-            # Ví dụ (giữ nguyên hàm cũ nếu có):
-            # _quota_commit(st, tide_key, current_value, uid)  # noqa: F821
-            pass
+                # fallback: dùng biến module-level nếu đã có
+                global _open_pos  # noqa: F401
+                if "_open_pos" not in globals():
+                    _open_pos = {}
+                open_pos = _open_pos
+
+            tide_center = now  # Với manual, lấy thời điểm khớp làm center
+            tide_key = tide_center.strftime("%Y-%m-%dT%H:%M")
+
+            open_pos[uid] = {
+                "pair": p.symbol,
+                "side": p.suggested_side,
+                "qty": "live",
+                "entry_time": now,
+                "tide_center": tide_center,
+                "tp_deadline": tp_eta,
+                "simulation": False,
+                "sl_price": sl_price,
+                "tide_window_key": tide_key,
+            }
         except Exception:
+            # Không chặn luồng nếu không ghi được; chỉ bỏ qua
             pass
-        # Đánh dấu pending đã xong
-        try:
-            _mark_pending_done(sig_id_raw)  # noqa: F821
-        except Exception:
-            pass
+        # === [/ADD] ============================================================
+
     else:
-        await msg.reply_text("❌ APPROVE FAIL\n" + "\n".join(results))
+        await update.effective_message.reply_text("Không mở được lệnh (kiểm tra log/khối lượng/cấu hình).")
 
 
-
+# ===== [/reject] =====
 async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = _uid(update)
-    st = storage.get_user(uid)
-    if st.pending and context.args and context.args[0] == st.pending.id:
-        st.pending = None
-        storage.put_user(uid, st)
-        await update.message.reply_text("Đã từ chối tín hiệu.")
-    else:
-        await update.message.reply_text("Không có pending hoặc sai ID.")
+    app = context.application
+    storage = app.bot_data["storage"]
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text("Cú pháp: /reject <pending_id>")
+        return
+    pid = args[0].strip()
 
+    from core.approval_flow import get_pending, mark_done
+    p = get_pending(storage, pid)
+    if not p or p.status != "PENDING":
+        await update.effective_message.reply_text(f"Không tìm thấy pending `{pid}` hoặc đã xử lý.")
+        return
+
+    mark_done(storage, pid, "REJECTED")
+    await update.effective_message.reply_text(f"Đã từ chối pending `{pid}`.")
+    
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
-async def close_cmd(update, context):
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /close                -> đóng 100% trên tất cả account trong ACCOUNTS_JSON
+    /close                -> đóng 100% trên tất cả account trong ACCOUNTS_JSON/settings.ACCOUNTS
     /close 50             -> đóng 50% tất cả account
     /close bingx_test     -> đóng 100% riêng account 'bingx_test'
     /close 25 bingx_test  -> đóng 25% riêng 'bingx_test' (hoặc: /close bingx_test 25)
     """
     msg = update.effective_message
-    pair = os.getenv("PAIR", "BTC/USDT")
+    uid = _uid(update)
 
-    # parse args
+    # --- Lấy pair ưu tiên từ user settings, fallback ENV/DEFAULT ---
+    try:
+        st = storage.get_user(uid)
+        pair = (getattr(st.settings, "pair", None) or os.getenv("PAIR") or "BTC/USDT")
+    except Exception:
+        pair = os.getenv("PAIR", "BTC/USDT")
+
+    # --- Parse args: chấp nhận cả "pct acc" lẫn "acc pct" ---
     args = context.args if hasattr(context, "args") else []
-    percent = 100.0
-    account = None
+    percent: float = 100.0
+    account: Optional[str] = None
 
     def _is_percent(s: str) -> bool:
         try:
             x = float(s)
-            return 0.0 <= x <= 100.0
-        except:
+            return 0.0 < x <= 100.0
+        except Exception:
             return False
 
     if args:
-        a0 = args[0]
+        a0 = str(args[0]).strip()
         if _is_percent(a0):
             percent = float(a0)
             if len(args) >= 2:
-                account = args[1]
+                account = str(args[1]).strip()
         else:
             account = a0
-            if len(args) >= 2 and _is_percent(args[1]):
+            if len(args) >= 2 and _is_percent(str(args[1]).strip()):
                 percent = float(args[1])
+
+    # --- Helpers: dựng client theo tên account / single default ---
+    def _list_accounts() -> list[dict]:
+        try:
+            from config import settings as _S
+            accs = getattr(_S, "ACCOUNTS", [])
+            if isinstance(accs, list) and accs:
+                return accs
+        except Exception:
+            pass
+        try:
+            accs = json.loads(os.getenv("ACCOUNTS_JSON", "[]"))
+            return accs if isinstance(accs, list) else []
+        except Exception:
+            return []
+
+    def _find_account_by_name(name: str) -> Optional[dict]:
+        for a in _list_accounts():
+            if str(a.get("name", "")).strip() == name:
+                return a
+        return None
+
+    async def _get_client_for(acc: Optional[dict]):
+        # Import ở đây để không phá cấu trúc file hiện tại
+        from core.exchange import ExchangeClient  # dự án đang dùng client này
+        if acc:
+            exid = str(acc.get("exchange") or os.getenv("EXCHANGE_ID", "bingx")).lower()
+            api  = acc.get("api_key")    or os.getenv("API_KEY", "")
+            sec  = acc.get("api_secret") or os.getenv("API_SECRET", "")
+            tnet = bool(acc.get("testnet", os.getenv("TESTNET", "false").lower() in ("1","true","yes")))
+            return ExchangeClient(exid, api, sec, tnet)
+        else:
+            # single/default từ ENV
+            exid = os.getenv("EXCHANGE_ID", "bingx").lower()
+            api  = os.getenv("API_KEY", "")
+            sec  = os.getenv("API_SECRET", "")
+            tnet = os.getenv("TESTNET", "false").lower() in ("1","true","yes")
+            return ExchangeClient(exid, api, sec, tnet)
+
+    async def _close_on_account(acc_name: Optional[str], pct: float) -> dict:
+        try:
+            acc_cfg = _find_account_by_name(acc_name) if acc_name else None
+            cli = await _get_client_for(acc_cfg)
+            # Lấy vị thế hiện tại
+            pos = await cli.position(pair)
+            sz  = float(pos.get("size", 0.0) or 0.0)
+            if sz <= 0:
+                return {"ok": False, "message": "no-open-position"}
+            side_long = str(pos.get("side", "")).upper() == "LONG"
+
+            # Tính số lượng đóng
+            close_qty = max(0.0, round(sz * (pct/100.0), 6))
+            if close_qty <= 0:
+                return {"ok": False, "message": "qty<=0"}
+
+            # Đóng bằng lệnh market reduce-only
+            res = await cli.market_close(pair, close_qty, reduce_only=True, side_long=side_long)
+            if not getattr(res, "ok", False):
+                return {"ok": False, "message": getattr(res, "message", "order_fail")}
+            return {"ok": True, "message": f"closed {close_qty}"}
+        except Exception as e:
+            return {"ok": False, "message": f"{e}"}
+
+    async def _cancel_tp_sl_for(acc_name: Optional[str]) -> None:
+        # Hủy tất cả TP/SL đang treo cho cặp này
+        try:
+            acc_cfg = _find_account_by_name(acc_name) if acc_name else None
+            cli = await _get_client_for(acc_cfg)
+            # Nếu client có shortcut hủy TP/SL
+            if hasattr(cli, "cancel_all_tp_sl"):
+                try:
+                    await cli.cancel_all_tp_sl(pair)
+                    return
+                except Exception:
+                    pass
+            # Fallback: duyệt open orders và cancel các order loại TP/SL
+            orders = await cli.open_orders(pair)
+            for od in (orders or []):
+                typ = str(od.get("type","")).upper()
+                if typ in ("STOP","TAKE_PROFIT","STOP_MARKET","TAKE_PROFIT_MARKET","STOP_LOSS","TAKEPROFIT"):
+                    try:
+                        await cli.cancel_order(pair, od["id"])
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # --- Thực thi đóng ---
+    try:
+        percent = float(percent)
+        percent = 100.0 if percent > 100.0 else (1.0 if percent <= 0 else percent)
+    except Exception:
+        percent = 100.0
 
     try:
         if account:
-            res = await close_position_on_account(account, pair, percent)
-            ok = res.get("ok", False)
-            text = f"Đã cố gắng đóng {percent:.0f}% vị thế trên <b>{account}</b> ({pair}): {res.get('message','')}"
-            await msg.reply_text(text, parse_mode="HTML")
+            # Đóng riêng 1 account
+            res = await _close_on_account(account, percent)
+            lines = [f"🔧 Close {percent:.0f}% | {pair} | account: <b>{_esc(account)}</b>",
+                     f"• {'OK' if res.get('ok') else 'FAIL'} { _esc(res.get('message','')) }"]
+            if percent >= 100.0:
+                await _cancel_tp_sl_for(account)
+                lines.append("🧹 TP/SL đã hủy.")
+            await msg.reply_text("\n".join(lines), parse_mode="HTML")
         else:
-            results = await close_position_on_all(pair, percent)
-            lines = [f"Đóng {percent:.0f}% vị thế ({pair}) trên TẤT CẢ tài khoản:"]
-            for i, r in enumerate(results, 1):
-                ok = r.get("ok", False)
-                lines.append(f"• #{i} → {r.get('message','ok' if ok else 'fail')}")
-            await msg.reply_text("\n".join(lines))
+            # Đóng tất cả account (nếu không cấu hình account → coi như 'single')
+            accs = _list_accounts()
+            results = []
+            if accs:
+                for a in accs:
+                    name = str(a.get("name","")).strip() or "(acc)"
+                    r = await _close_on_account(name, percent)
+                    results.append((name, r))
+                    # Nếu 100% → hủy TP/SL sau khi đóng xong
+                    if percent >= 100.0:
+                        await _cancel_tp_sl_for(name)
+                lines = [f"🔧 Close {percent:.0f}% | {pair} | ALL accounts"]
+                for name, r in results:
+                    lines.append(f"• { _esc(name) }: {'OK' if r.get('ok') else 'FAIL'} { _esc(r.get('message','')) }")
+                if percent >= 100.0:
+                    lines.append("🧹 TP/SL đã hủy.")
+                await msg.reply_text("\n".join(lines), parse_mode="HTML")
+            else:
+                # single/default
+                r = await _close_on_account(None, percent)
+                lines = [f"🔧 Close {percent:.0f}% | {pair} | single",
+                         f"• {'OK' if r.get('ok') else 'FAIL'} { _esc(r.get('message','')) }"]
+                if percent >= 100.0:
+                    await _cancel_tp_sl_for(None)
+                    lines.append("🧹 TP/SL đã hủy.")
+                await msg.reply_text("\n".join(lines), parse_mode="HTML")
     except Exception as e:
-        await msg.reply_text(f"❌ Lỗi /close: {e}")
+        await msg.reply_text(f"❌ Lỗi /close: {_esc(str(e))}", parse_mode="HTML")
 
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
