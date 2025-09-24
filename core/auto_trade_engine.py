@@ -32,6 +32,29 @@ try:
     from strategy.m5_strategy import m5_entry_check
 except Exception:
     m5_entry_check = None  # type: ignore
+    
+# [ADD] Hub + formatter thống nhất
+try:
+    from core.trade_executor import execute_order_flow
+except Exception:
+    from trade_executor import execute_order_flow  # type: ignore
+
+try:
+    from tg.formatter import render_executed_boardcard, render_signal_preview
+except Exception:
+    # fallback nếu dự án chưa có đủ 2 hàm (không crash)
+    def render_executed_boardcard(**kw):  # type: ignore
+        ids = kw.get("entry_ids") or []
+        ids_line = " | ".join([str(x) for x in ids]) if ids else "—"
+        return (
+            "🤖 **EXECUTED**\n"
+            f"(Mode: {kw.get('origin','AUTO')}) | {kw.get('symbol','?')} **{kw.get('side','?')}**\n"
+            f"🆔 Entry ID(s): {ids_line}"
+        )
+    def render_signal_preview(*args, **kwargs):  # type: ignore
+        return ""
+   
+    
 
 # Thực thi lệnh (nếu có kết nối sàn)
 ExchangeClient = calc_qty = auto_sl_by_leverage = None
@@ -180,6 +203,17 @@ AUTO_DEBUG_CHAT_ID      = os.getenv("AUTO_DEBUG_CHAT_ID", "").strip()
 
 # Rule: M5 buộc trùng hướng với M30 (anh có thể /setenv ENFORCE_M5_MATCH_M30 false để tắt)
 ENFORCE_M5_MATCH_M30 = _env_bool("ENFORCE_M5_MATCH_M30", "true")
+
+# --- Defaults cho các guard bổ sung (để _apply_runtime_env có giá trị ban đầu) ---
+M30_FLIP_GUARD = False              # yêu cầu M30 không flip hướng quá nhanh
+M30_STABLE_MIN_SEC = 0              # số giây tối thiểu M30 phải ổn định
+M30_NEED_CONSEC_N = 1               # số nến liên tiếp cần thoả điều kiện
+
+M5_MIN_GAP_MIN = 0                  # phút tối thiểu giữa 2 lần vào lệnh (gap guard)
+M5_GAP_SCOPED_TO_WINDOW = True      # gap guard tính trong 1 cửa sổ tide hay toàn cục
+ALLOW_SECOND_ENTRY = False          # cho phép vào lệnh thứ 2 trong cùng cửa sổ
+M5_SECOND_ENTRY_MIN_RETRACE_PCT = 0 # % tối thiểu retrace để cho lệnh thứ 2
+
 
 def _apply_runtime_env(kv: Dict[str, str]) -> None:
     """
@@ -564,187 +598,165 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
             return note
         from time import time as _now_s
         _LAST_EXEC_TS[uid] = _now_s()
+        
+# 10) Khớp lệnh — DÙNG HUB + FORMATTER THỐNG NHẤT (minimal diff)
+opened_real = False
+per_account_logs: List[str] = []
+exec_board_txt = None  # text boardcard EXECUTED
 
-    # 10) Khớp lệnh — sửa TỐI THIỂU: dùng market_with_sl_tp, ĐA SÀN, TP-by-Hours=5.5, chỉ đếm khi khớp thật, broadcast như thủ công
-    opened_real = False
-    per_account_logs = []
-    exec_broadcasts = []  # gom các boardcard đã format để broadcast
+# TP-by-time ETA (mặc định 5.5h nếu không set ENV)
+try:
+    tp_hours = float(os.getenv("TP_TIME_HOURS", "5.5"))
+except Exception:
+    tp_hours = 5.5
+center = center or now
+tp_eta = center + timedelta(hours=tp_hours)
 
-    # TP-by-time ETA (mặc định 5.5h nếu không set ENV)
+# Nhãn tide hh:mm–hh:mm để chèn vào boardcard preview (nếu cần)
+try:
+    tw_hrs = float(os.getenv("TIDE_WINDOW_HOURS", str(tide_window_hours)))
+except Exception:
+    tw_hrs = tide_window_hours
+try:
+    start_hhmm = (center - timedelta(hours=tw_hrs/2)).strftime("%H:%M")
+    end_hhmm   = (center + timedelta(hours=tw_hrs/2)).strftime("%H:%M")
+    tide_label = f"{start_hhmm}–{end_hhmm}"
+except Exception:
+    tide_label = None
+
+# (1) Tính sơ bộ SL/TP để lưu vào pos & cung cấp cho hub (hub vẫn có thể tự tính nếu thiếu)
+try:
+    # dùng close từ khung H4/M30 (đã lấy ở trên)
     try:
-        tp_hours = float(os.getenv("TP_TIME_HOURS", "5.5"))
+        ref_close = float(m30.get("close") or h4.get("close"))
     except Exception:
-        tp_hours = 5.5
-    center = center or now
-    tp_eta = center + timedelta(hours=tp_hours)
+        ref_close = 0.0
+    if (auto_sl_by_leverage is None) or (ref_close <= 0):
+        raise RuntimeError("no auto_sl_by_leverage or bad ref_close")
+    sl_price, tp_price = auto_sl_by_leverage(ref_close, desired_side, leverage)
+except Exception:
+    sl_price, tp_price = (None, None)
 
-    # Lấy danh sách tài khoản: SINGLE_ACCOUNT + ACCOUNTS (giống /order_cmd)
-    try:
-        from config.settings import SINGLE_ACCOUNT, ACCOUNTS
-        accounts = [SINGLE_ACCOUNT] + (ACCOUNTS or [])
-    except Exception:
-        accounts = [{"name": "default"}]
+# (2) Chuẩn bị cấu hình cho hub
+qty_cfg = {
+    # nếu muốn ép số lượng cố định: "qty": <float>
+    "sl": sl_price,
+    "tp": tp_price,
+}
+risk_cfg = {
+    "risk_percent": float(risk_percent),
+    "leverage": int(leverage),
+}
+accounts_cfg = {
+    "enabled": True  # hub sẽ tự đọc danh sách accounts từ settings/ENV (giống shim)
+}
+meta = {
+    "reason": "AUTO_LOOP",
+    "score_meta": {"confidence": confidence, "H4": h4.get("score", 0), "M30": m30.get("score", 0)},
+    "tide_meta": {"center": center.isoformat() if isinstance(center, datetime) else str(center), "tide_label": tide_label},
+    "frames": frames,
+}
 
-    # Nhãn tide hh:mm–hh:mm để chèn vào boardcard
-    try:
-        tw_hrs = float(os.getenv("TIDE_WINDOW_HOURS", str(tide_window_hours)))
-    except Exception:
-        tw_hrs = tide_window_hours
-    try:
-        start_hhmm = (center - timedelta(hours=tw_hrs/2)).strftime("%H:%M")
-        end_hhmm   = (center + timedelta(hours=tw_hrs/2)).strftime("%H:%M")
-        tide_label = f"{start_hhmm}–{end_hhmm}"
-    except Exception:
-        tide_label = None
-
-    # Entry spot (để hiển thị trong boardcard)
-    try:
-        entry_spot_hint = _binance_spot_entry(pair_disp)
-    except Exception:
-        entry_spot_hint = 0.0
-
-    # Vòng từng account
-    for acc in accounts:
-        name = str(acc.get("name") or "default")
-        exid = str(acc.get("exchange") or getattr(st.settings, "exchange", "binanceusdm")).lower()
-        api_key = acc.get("api_key") or None
-        api_secret = acc.get("api_secret") or None
-        testnet = bool(acc.get("testnet")) if "testnet" in acc else None
-        pair_acc = str(acc.get("pair") or pair_disp)
-
-        # Tạo ExchangeClient theo khả năng có sẵn
-        try:
-            try:
-                ex = ExchangeClient(exchange_id=exid, api_key=api_key, api_secret=api_secret, testnet=testnet)  # kiểu mới
-            except Exception:
-                ex = ExchangeClient()  # kiểu cũ không tham số
-        except Exception as e:
-            per_account_logs.append(f"• {name} | {exid} | init_fail: {e}")
-            continue
-
-        # Lấy số dư & giá
-        try:
-            bal = await ex.balance_usdt()
-        except Exception:
-            bal = balance_usdt
-
-        try:
-            # ưu tiên close từ frames nếu có
-            close_price = float(m30.get("close") or h4.get("close"))
-        except Exception:
-            close_price = None
-        if close_price is None:
-            try:
-                ticker = await ex._io(ex.client.fetch_ticker, pair_acc)
-                close_price = float(ticker.get("last") or ticker.get("close") or 0.0)
-            except Exception:
-                close_price = 0.0
-
-        # Sizing
-        qty = calc_qty(bal, risk_percent, leverage, close_price or 0.0)
-        try:
-            qty *= float(os.getenv("SIZE_MULT", "1.0"))
-        except Exception:
-            pass
-
-        # SL/TP auto theo leverage & hướng
-        sl_price, tp_price = auto_sl_by_leverage(close_price or 0.0, desired_side, leverage)
-        side_long = (desired_side == "LONG")
-
-        # set leverage (best-effort)
-        try:
-            await ex.set_leverage(pair_acc, leverage)
-        except Exception:
-            pass
-
-        # === ĐẶT LỆNH: ưu tiên market_with_sl_tp (giống manual) ===
-        ok = False
-        info = ""
-        try:
-            if hasattr(ex, "market_with_sl_tp"):
-                res = await ex.market_with_sl_tp(pair_acc, side_long, qty, sl_price, tp_price)
-            else:
-                # fallback vẫn chấp nhận open_market cũ nhưng đúng tham số
-                res = await ex.open_market(pair_acc, desired_side, qty, sl_price, tp_price)  # type: ignore
-            ok = bool(getattr(res, "ok", False))
-            info = getattr(res, "message", str(res))
-        except Exception as e:
-            ok = False
-            info = f"order_err:{e}"
-
-        if ok:
-            opened_real = True
-            per_account_logs.append(f"• {name} | {exid} | {pair_acc} → {info}")
-            # Chuẩn bị boardcard (format y hệt thủ công)
-            try:
-                btxt = _fmt_exec_broadcast(
-                    pair=pair_acc.replace(":USDT",""),
-                    side=desired_side,
-                    acc_name=name, ex_id=exid,
-                    lev=int(leverage), risk=float(risk_percent), qty=float(qty),
-                    entry_spot=float(entry_spot_hint or close_price or 0.0),
-                    sl=(float(sl_price) if sl_price is not None else None),
-                    tp=(float(tp_price) if tp_price is not None else None),
-                    tide_label=tide_label, mode_label="AUTO",
-                )
-                exec_broadcasts.append(btxt)
-            except Exception:
-                pass
-        else:
-            per_account_logs.append(f"• {name} | {exid} | {pair_acc} → FAILED: {info}")
-
-    # 11) Lưu trạng thái vị thế để TP-by-time (dùng tp_eta ở trên)
-    try:
-        tide_window_key = center.strftime("%Y-%m-%dT%H:%M")
-    except Exception:
-        tide_window_key = str(center)
-
-    _open_pos[uid] = {
-        "pair": pair_disp, "side": desired_side, "qty": None if not opened_real else "live",
-        "entry_time": now, "tide_center": center, "tp_deadline": tp_eta, "simulation": (not opened_real),
-        "sl_price": (sl_price if 'sl_price' in locals() else None),
-        "tide_window_key": tide_window_key,
-    }
-
-    # === [EDIT] Chỉ tăng trade_count khi opened_real ===
-    if opened_real:
-        st_key["trade_count"] = int(st_key.get("trade_count", 0)) + 1
-    order_seq = int(st_key.get("trade_count", 0))
-
-    # 12) Build log /autolog (giữ format cũ, thêm logs per-account)
-    header = (
-        f"🤖 AUTO EXECUTE | {pair_disp} {desired_side}\n"
-        f"Score H4/M30: {h4.get('score',0)} / {m30.get('score',0)} | Total≈{confidence}\n"
-        f"rule M5==M30: {'ON' if ENFORCE_M5_MATCH_M30 else 'OFF'} | m30={side_m30}\n"
-        f"late_window={'YES' if in_late else 'NO'} | "
-        f"TP-by-time: {tp_eta.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"➡️ EXECUTE {'OK' if opened_real else 'FAIL'} | {'counted' if opened_real else 'not-counted'}\n"
-        f"{'\\n'.join(per_account_logs) if per_account_logs else ''}\n"
-        f"{'📣 Opened trade #' + str(order_seq) + '/' + str(MAX_TRADES_PER_WINDOW) if opened_real else ''}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+# (3) GỌI HUB
+try:
+    opened_real, exec_result = await execute_order_flow(
+        app, storage,
+        symbol=pair_disp,
+        side=desired_side,
+        qty_cfg=qty_cfg,
+        risk_cfg=risk_cfg,
+        accounts_cfg=accounts_cfg,
+        meta=meta,
+        origin="AUTO",
     )
-    final_text = header + (text_block or "(no_report_block)")
-    _last_decision_text[uid] = final_text
+except Exception as _e_hub:
+    opened_real = False
+    exec_result = {"error": str(_e_hub), "entry_ids": [], "per_account": {}}
 
-    # 12.1) Broadcast boardcard EXECUTED (Mode: AUTO) — chỉ khi có lệnh mở THẬT
-    if opened_real and exec_broadcasts:
-        for btxt in exec_broadcasts:
-            try:
-                await _broadcast_html(btxt)
-            except Exception:
-                pass
+# (4) Build log per-account (phục vụ /autolog)
+try:
+    pa = exec_result.get("per_account", {}) or {}
+    for name, info in pa.items():
+        if isinstance(info, dict):
+            if info.get("opened"):
+                per_account_logs.append(f"• {name} | opened | id={info.get('entry_id')}")
+            else:
+                per_account_logs.append(f"• {name} | FAILED: {info.get('error','?')}")
+except Exception:
+    pass
 
-    # Gửi log ra kênh debug
+# (5) Boardcard EXECUTED (dùng formatter thống nhất)
+if opened_real:
     try:
-        chat_id = int(AUTO_DEBUG_CHAT_ID) if AUTO_DEBUG_CHAT_ID.isdigit() else uid
+        preview_block = render_signal_preview(
+            {"signal": desired_side}, frames, {"late": in_late, "tide_label": tide_label},
+            {"confidence": confidence},  # score_meta/minimal
+            {"preset": None},            # preset_moon: không bắt buộc
+            {"center": center.isoformat() if isinstance(center, datetime) else str(center)},  # tide_meta
+            "AUTO",
+        )
     except Exception:
-        chat_id = uid
+        preview_block = ""
+
     try:
-        await app.bot.send_message(chat_id=chat_id, text=final_text)
+        exec_board_txt = render_executed_boardcard(
+            origin="AUTO",
+            symbol=pair_disp.replace(":USDT",""),
+            side=desired_side,
+            entry_ids=list(exec_result.get("entry_ids") or []),
+            preview_block=preview_block if os.getenv("AUTO_INCLUDE_PREVIEW_BEFORE_EXEC", "1") == "1" else "",
+        )
+        # Formatter trả Markdown → gửi HTML an toàn (bỏ **, `)
+        await _broadcast_html(exec_board_txt.replace("**","").replace("`",""))
     except Exception:
         pass
 
-    return final_text
+# 11) Lưu trạng thái vị thế để TP-by-time (dùng tp_eta ở trên)
+try:
+    tide_window_key = center.strftime("%Y-%m-%dT%H:%M")
+except Exception:
+    tide_window_key = str(center)
+
+_open_pos[uid] = {
+    "pair": pair_disp, "side": desired_side, "qty": None if not opened_real else "live",
+    "entry_time": now, "tide_center": center, "tp_deadline": tp_eta, "simulation": (not opened_real),
+    "sl_price": (sl_price if 'sl_price' in locals() else None),
+    "tide_window_key": tide_window_key,
+}
+
+# === Chỉ tăng trade_count khi opened_real ===
+if opened_real:
+    st_key["trade_count"] = int(st_key.get("trade_count", 0)) + 1
+order_seq = int(st_key.get("trade_count", 0))
+
+# 12) Build log /autolog (giữ format cũ, thêm logs per-account)
+header = (
+    f"🤖 AUTO EXECUTE | {pair_disp} {desired_side}\n"
+    f"Score H4/M30: {h4.get('score',0)} / {m30.get('score',0)} | Total≈{confidence}\n"
+    f"rule M5==M30: {'ON' if ENFORCE_M5_MATCH_M30 else 'OFF'} | m30={side_m30}\n"
+    f"late_window={'YES' if in_late else 'NO'} | "
+    f"TP-by-time: {tp_eta.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    f"➡️ EXECUTE {'OK' if opened_real else 'FAIL'} | {'counted' if opened_real else 'not-counted'}\n"
+    f"{'\n'.join(per_account_logs) if per_account_logs else ''}\n"
+    f"{'📣 Opened trade #' + str(order_seq) + '/' + str(MAX_TRADES_PER_WINDOW) if opened_real else ''}\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+)
+final_text = header + (text_block or "(no_report_block)")
+_last_decision_text[uid] = final_text
+
+# Gửi log ra kênh debug
+try:
+    chat_id = int(AUTO_DEBUG_CHAT_ID) if AUTO_DEBUG_CHAT_ID.isdigit() else uid
+except Exception:
+    chat_id = uid
+try:
+    await app.bot.send_message(chat_id=chat_id, text=final_text)
+except Exception:
+    pass
+
+return final_text
+
+
 
 
 # ========= TP-by-time theo mốc thủy triều =========
