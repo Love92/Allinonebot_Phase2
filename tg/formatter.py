@@ -477,5 +477,22 @@ def format_daily_moon_tide_report(vn_date: str, tide_window_hours: float = TIDE_
         f"{tw_line}"
     )
     return _safe_html(raw)
+    
+# ========== [ADD] Unified executed boardcard renderer ==========
+def render_executed_boardcard(*, origin: str, symbol: str, side: str,
+                              entry_ids: list[str], preview_block: str = "") -> str:
+    mode_badge = f"(Mode: {origin})"
+    ids_line = " | ".join([str(i) for i in entry_ids]) if entry_ids else "—"
+    lines = [
+        "🤖 **EXECUTED**",
+        f"{mode_badge} | {symbol} **{side}**",
+        f"🆔 Entry ID(s): {ids_line}",
+    ]
+    if preview_block:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(preview_block)
+    return "\n".join(lines)
+# ==================================================================
+
 
 # ----------------------- /tg/formatter.py -----------------------
