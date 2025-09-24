@@ -47,9 +47,19 @@ class UserState:
     history: List[Dict[str, Any]] = field(default_factory=list)
 
 class Storage:
+    """
+    Lưu ý:
+    - self.data là 1 dict "top-level":
+        {
+          "<uid>": { ...UserState... },
+          "<các key tự do>": <giá trị bất kỳ>
+        }
+    - Các hàm get_user/put_user dùng namespace uid.
+    - Các hàm get/set (mới thêm) dùng cho key-value top-level (cờ lock auto, cấu hình tạm, v.v.)
+    """
     def __init__(self, path: str = STATE_FILE):
         self.path = path
-        self.data: Dict[str, dict] = {}
+        self.data: Dict[str, Any] = {}
         self._load()
 
     def _load(self):
@@ -80,6 +90,37 @@ class Storage:
     def _today_str(self):
         return datetime.now(VN_TZ).date().isoformat()
 
+    # ===================== TOP-LEVEL KV API (MỚI) =====================
+    def set(self, key: str, value: Any) -> None:
+        """
+        Đặt giá trị cho một key top-level (ví dụ: "auto_lock_2025-09-24": True).
+        Dùng cho các cờ toàn cục, không gắn với uid cụ thể.
+        """
+        self.data[key] = value
+        self.save()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Lấy giá trị top-level theo key. Nếu không có, trả về default.
+        """
+        return self.data.get(key, default)
+
+    # alias để code cũ/new đều chạy
+    def set_value(self, key: str, value: Any) -> None:
+        self.set(key, value)
+
+    def get_value(self, key: str, default: Any = None) -> Any:
+        return self.get(key, default)
+
+    def delete(self, key: str) -> None:
+        """
+        Xoá một key top-level nếu tồn tại.
+        """
+        if key in self.data:
+            del self.data[key]
+            self.save()
+
+    # ===================== USER NAMESPACE API =====================
     def get_user(self, uid: int) -> UserState:
         key = str(uid)
         if key not in self.data:
@@ -111,7 +152,13 @@ class Storage:
             pending = PendingSignal(**u["pending"])
         history = u.get("history", [])
         tide_window_trades = u.get("tide_window_trades", {})
-        return UserState(settings=settings, today=today, tide_window_trades=tide_window_trades, pending=pending, history=history)
+        return UserState(
+            settings=settings,
+            today=today,
+            tide_window_trades=tide_window_trades,
+            pending=pending,
+            history=history
+        )
 
     def put_user(self, uid: int, state: UserState):
         self.data[str(uid)] = asdict(state)
