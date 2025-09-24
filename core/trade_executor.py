@@ -325,15 +325,41 @@ class ExchangeClient:
             logging.warning("set_leverage failed: %s", e)
 
     async def ticker_price(self, symbol: str) -> float:
+        """
+        Lấy giá gần nhất cho futures/swap:
+        - Ưu tiên fetch_ticker (last/close)
+        - Fallback: close của nến 1m (ổn định hơn trên một số sàn)
+        """
         try:
+            # 1) đảm bảo đã load markets
+            await self._ensure_markets()
             sym = self.normalize_symbol(symbol)
-            t = await self._io(self.client.fetch_ticker, sym)
-            p = float(t.get("last") or t.get("close") or 0.0)
-            if p > 0:
-                return p
+
+            # 2) thử fetch_ticker
+            try:
+                t = await self._io(self.client.fetch_ticker, sym)
+                p = t.get("last") or t.get("close")
+                if p is not None:
+                    p = float(p)
+                    if p > 0:
+                        return p
+            except Exception:
+                pass
+
+            # 3) fallback: lấy close của nến 1m
+            try:
+                ohlcv = await self._io(self.client.fetch_ohlcv, sym, timeframe="1m", limit=1)
+                if ohlcv and len(ohlcv) > 0:
+                    close = float(ohlcv[-1][4])
+                    if close > 0:
+                        return close
+            except Exception:
+                pass
+
         except Exception:
             pass
         return 0.0
+
 
     async def balance_usdt(self) -> float:
         """
