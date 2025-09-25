@@ -157,23 +157,82 @@ def _binance_spot_entry(pair: str) -> float:
         pass
     return 0.0
 
+# ================== Broadcast tín hiệu  ==================
 def _fmt_exec_broadcast(
     *, pair: str, side: str, acc_name: str, ex_id: str,
-    lev: int, risk: float, qty: float, entry_spot: float,
-    sl: float | None, tp: float | None,
+    lev=None, risk=None, qty=None, entry_spot=None,
+    sl: float | None = None, tp: float | None = None,
     tide_label: str | None = None, mode_label: str = "AUTO",
+    entry_ids: list[str] | None = None, tp_time=None,
 ) -> str:
-    lines = [
-        f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(side.upper())}</b>",
-        f"• Mode: {mode_label}",
-        f"• Account: {_esc(acc_name)} ({_esc(ex_id)})",
-        f"• Risk {risk:.1f}% | Lev x{lev}",
-        f"• Entry(SPOT)≈{entry_spot:.2f} | Qty={qty:.6f}",
-        f"• SL={sl:.2f}" if sl else "• SL=—",
-        f"• TP={tp:.2f}" if tp else "• TP=—",
-        f"• Tide: {tide_label}" if tide_label else "",
-    ]
-    return "\n".join([l for l in lines if l])
+    """
+    HTML cho broadcast group — format giống /order_cmd().
+    - Các field risk/lev/qty/entry_spot có thể None -> sẽ tự ẩn.
+    - entry_ids & tp_time là tùy chọn (nếu có sẽ in thêm).
+    """
+    import html as _html
+    def _esc(x):
+        try: return _html.escape("" if x is None else str(x), quote=False)
+        except: return str(x)
+
+    lines: list[str] = []
+    lines.append(f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(str(side).upper())}</b>")
+    lines.append(f"• Mode: {mode_label}")
+    lines.append(f"• Account: {_esc(acc_name)} ({_esc(ex_id)})")
+
+    # Risk | Lev
+    risk_part = f"Risk {float(risk):.1f}%" if isinstance(risk, (int, float)) else ""
+    lev_part  = f"Lev x{int(lev)}"         if isinstance(lev,  (int, float)) else ""
+    if risk_part or lev_part:
+        joiner = " | " if (risk_part and lev_part) else ""
+        lines.append(f"• {risk_part}{joiner}{lev_part}".strip(" |"))
+
+    # Entry(SPOT) | Qty
+    entry_part = f"Entry(SPOT)≈{float(entry_spot):.2f}" if isinstance(entry_spot, (int, float)) else ""
+    qty_part   = f"Qty={float(qty):.6f}"                 if isinstance(qty,        (int, float)) else ""
+    if entry_part or qty_part:
+        joiner2 = " | " if (entry_part and qty_part) else ""
+        lines.append(f"• {entry_part}{joiner2}{qty_part}".strip(" |"))
+    else:
+        lines.append("• Entry: —")
+
+    # SL / TP
+    lines.append(f"• SL={float(sl):.2f}" if isinstance(sl,(int,float)) else "• SL=—")
+    lines.append(f"• TP={float(tp):.2f}" if isinstance(tp,(int,float)) else "• TP=—")
+
+    # TP-by-time (nếu có)
+    try:
+        if tp_time is not None:
+            dt = tp_time
+            try:
+                from utils.time_utils import VN_TZ  # nếu có
+                if getattr(dt, "tzinfo", None) is None:
+                    dt = VN_TZ.localize(dt)
+                else:
+                    dt = dt.astimezone(VN_TZ)
+            except Exception:
+                pass
+            # dt có thể là datetime hoặc string
+            timestr = dt.strftime('%Y-%m-%d %H:%M:%S') if hasattr(dt, "strftime") else str(dt)
+            lines.append(f"• TP-by-time: {timestr}")
+    except Exception:
+        pass
+
+    # Tide
+    if tide_label:
+        lines.append(f"• Tide: {_esc(tide_label)}")
+
+    # Entry IDs (nếu có)
+    if entry_ids:
+        try:
+            ids_str = ", ".join(str(x) for x in entry_ids if x)
+            if ids_str:
+                lines.append(f"• Entry ID(s): {_esc(ids_str)}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
 
 
 def _uid(update: Update) -> int:
@@ -1538,6 +1597,29 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Không tìm thấy pending `{pid}` hoặc đã xử lý.")
         return
 
+    # === QUOTA precheck (giống /order) ===
+    tide_label_pre, tkey, used = None, None, 0
+    try:
+        uid = _uid(update)
+        st = storage_use.get_user(uid)
+        try:
+            # nếu đang ở tg/bot.py: dùng trực tiếp; nếu không, import fallback
+            _quota_precheck_and_label  # type: ignore  # noqa: F401
+            _quota_commit              # type: ignore  # noqa: F401
+            _qp = _quota_precheck_and_label   # type: ignore
+            _qc = _quota_commit               # type: ignore
+        except Exception:
+            from tg.bot import _quota_precheck_and_label as _qp  # type: ignore
+            from tg.bot import _quota_commit as _qc              # type: ignore
+
+        ok_quota, why, tide_label_pre, tkey, used = _qp(st)
+        if not ok_quota:
+            await update.effective_message.reply_text(why)
+            return
+    except Exception:
+        # không chặn nếu thiếu helper quota
+        pass
+
     # Gọi hub thực thi (giữ nguyên)
     from core.trade_executor import execute_order_flow
     opened, exec_result = await execute_order_flow(
@@ -1570,6 +1652,7 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(fallback)
 
         # === [ADD] ĐĂNG KÝ TP-by-time CHO MANUAL (TP_TIME_HOURS, mặc định 5.5h) ===
+        tp_eta = None  # để broadcast dùng phía dưới
         try:
             from utils.time_utils import now_vn
             from datetime import timedelta
@@ -1623,8 +1706,84 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         # === [/ADD] ============================================================
 
+        # === [ADD] BROADCAST lên nhóm tín hiệu (format GIỐNG /order_cmd) + Entry IDs + TP-by-time ===
+        try:
+            # Chuẩn bị dữ liệu giống /order_cmd()
+            side_label = "LONG" if str(p.suggested_side).upper().find("LONG") >= 0 else "SHORT"
+            pair_disp = p.symbol.replace(":USDT","")
+
+            # Lấy thông tin từ exec_result (nếu có)
+            single = (exec_result or {}).get("per_account", {}).get("single", {}) if isinstance(exec_result, dict) else {}
+            name      = single.get("account_name") or single.get("name") or "manual"
+            exid      = single.get("exchange_name") or single.get("exchange") or single.get("exid") or "hub"
+            try:
+                leverage  = int(single.get("leverage") or 0)
+            except Exception:
+                leverage = None
+            try:
+                risk_percent = float(single.get("risk_percent") or 0.0)
+            except Exception:
+                risk_percent = None
+            try:
+                qty = float(single.get("qty") or 0.0)
+            except Exception:
+                qty = None
+
+            # Giá Entry(SPOT) để in đẹp
+            try:
+                entry_spot = _binance_spot_entry(pair_disp)  # nếu helper có sẵn
+            except Exception:
+                try:
+                    entry_spot = float(single.get("entry_spot") or single.get("entry") or 0.0)
+                except Exception:
+                    entry_spot = None
+
+            sl_use = single.get("sl", None)
+            tp_use = single.get("tp", None)
+
+            # Tide label: ưu tiên từ boardcard_ctx hoặc exec_result; fallback precheck
+            tide_label = None
+            try:
+                tide_label = (p.boardcard_ctx or {}).get("tide_label")
+            except Exception:
+                pass
+            if not tide_label:
+                tide_label = (exec_result or {}).get("tide_label")
+            if not tide_label:
+                tide_label = tide_label_pre
+
+            entry_ids = list((exec_result or {}).get("entry_ids") or [])
+
+            btxt = _fmt_exec_broadcast(
+                pair=pair_disp,
+                side=side_label,
+                acc_name=name, ex_id=exid,
+                lev=leverage, risk=risk_percent, qty=qty,
+                entry_spot=entry_spot,
+                sl=sl_use, tp=tp_use,
+                tide_label=tide_label, mode_label="MANUAL",
+                entry_ids=entry_ids,
+                tp_time=tp_eta,
+            )
+            await _broadcast_html(btxt)
+        except Exception as e:
+            # Không chặn luồng nếu broadcast lỗi
+            try:
+                print(f"[MANUAL broadcast warn] {e}")
+            except Exception:
+                pass
+        # === [/ADD] ============================================================
+
+        # === QUOTA commit khi đã mở thành công ===
+        try:
+            if (tkey is not None) and ('st' in locals()):
+                _qc(st, tkey, used, uid)  # type: ignore
+        except Exception:
+            pass
+
     else:
         await update.effective_message.reply_text("Không mở được lệnh (kiểm tra log/khối lượng/cấu hình).")
+
 
 
 # ===== [/reject] =====
