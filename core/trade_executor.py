@@ -852,47 +852,75 @@ except Exception:
 
         return any_ok, results
         
-# ========== [ADD] Unified execute hub (no breaking change) ==========
+# ========== Unified execute hub (MULTI first → fallback SINGLE if needed) ==========
 
 async def execute_order_flow(app, storage, *,
                             symbol: str, side: Literal["LONG","SHORT"],
                             qty_cfg: dict, risk_cfg: dict, accounts_cfg: dict,
                             meta: dict, origin: Literal["AUTO","MANUAL","ORDER"]) -> Tuple[bool, dict]:
     """
+    Trình tự mới (ít đụng chạm, chống double):
+      1) Nếu bật MULTI (có accounts_cfg.enabled): chạy MULTI trước.
+         - Ghi lại entry_id(s) từ từng account opened=True.
+      2) Nếu MULTI không mở được account nào (0 OK) → fallback SINGLE.
+      3) Nếu MULTI tắt (không enabled) → chạy SINGLE như bình thường.
+
     Return:
       - opened_real: bool
       - result: { 'entry_ids': [...], 'per_account': {...}, 'origin': origin, 'side': side, 'symbol': symbol }
-    Ghi chú:
-      - Không tự broadcast ở đây; caller sẽ dùng formatter để gửi boardcard EXECUTED (đồng bộ 1 nguồn).
     """
-    entry_ids = []
-    per_account = {}
+    entry_ids: List[str] = []
+    per_account: Dict[str, Any] = {}
 
-    # --- tài khoản đơn (nếu project của anh không dùng, shim sẽ tự xử lý) ---
-    try:
-        ok, info = await open_single_account_order(
-            app, storage, symbol=symbol, side=side,
-            qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
-        )
-        if ok and isinstance(info, dict) and "entry_id" in info:
-            entry_ids.append(info["entry_id"])
-            per_account["single"] = info
-    except Exception as e:
-        per_account["single_error"] = str(e)
+    multi_enabled = bool(accounts_cfg and accounts_cfg.get("enabled"))
+    multi_opened = 0
 
-    # --- đa tài khoản (nếu bật) ---
-    try:
-        if accounts_cfg and accounts_cfg.get("enabled"):
-            ok2, multi = await open_multi_account_orders(
-                app, storage, symbol=symbol, side=side,
-                accounts_cfg=accounts_cfg, qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
+    # --- (1) MULTI trước, nếu được bật ---
+    if multi_enabled:
+        try:
+            ok_m, multi = await open_multi_account_orders(
+                app, storage,
+                symbol=symbol, side=side,
+                accounts_cfg=accounts_cfg,
+                qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
             )
             per_account["multi"] = multi
-            for acc_name, d in (multi or {}).items():
-                if isinstance(d, dict) and d.get("opened") and "entry_id" in d:
-                    entry_ids.append(d["entry_id"])
-    except Exception as e:
-        per_account["multi_error"] = str(e)
+            if isinstance(multi, dict):
+                for acc_name, d in multi.items():
+                    if isinstance(d, dict) and d.get("opened"):
+                        multi_opened += 1
+                        eid = d.get("entry_id")
+                        if eid:
+                            entry_ids.append(eid)
+        except Exception as e:
+            per_account["multi_error"] = str(e)
+
+    # --- (2) Quyết định fallback SINGLE ---
+    try_single = False
+    if multi_enabled:
+        # MULTI đã chạy; chỉ fallback SINGLE nếu không có account nào mở OK
+        try_single = (multi_opened == 0)
+    else:
+        # MULTI không bật → chạy SINGLE như cũ
+        try_single = True
+
+    if try_single:
+        try:
+            ok_s, info_s = await open_single_account_order(
+                app, storage,
+                symbol=symbol, side=side,
+                qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
+            )
+            if ok_s and isinstance(info_s, dict) and info_s.get("opened"):
+                per_account["single"] = info_s
+                eid = info_s.get("entry_id")
+                if eid:
+                    entry_ids.append(eid)
+            else:
+                # lưu thông tin lỗi để /autolog hiển thị rõ
+                per_account["single_error"] = (info_s if isinstance(info_s, str) else str(info_s))
+        except Exception as e:
+            per_account["single_error"] = str(e)
 
     opened_real = len(entry_ids) > 0
     result = {
