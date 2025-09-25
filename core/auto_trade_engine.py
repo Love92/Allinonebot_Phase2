@@ -152,24 +152,83 @@ async def _broadcast_html(text: str) -> None:
     except Exception:
         pass
 
+# ================== Broadcast tín hiệu  ==================
 def _fmt_exec_broadcast(
     *, pair: str, side: str, acc_name: str, ex_id: str,
-    lev: int, risk: float, qty: float, entry_spot: float,
-    sl: float | None, tp: float | None,
+    lev=None, risk=None, qty=None, entry_spot=None,
+    sl: float | None = None, tp: float | None = None,
     tide_label: str | None = None, mode_label: str = "AUTO",
+    entry_ids: list[str] | None = None, tp_time=None,
 ) -> str:
-    lines = [
-        # [EDIT] an toàn kiểu: str(side).upper()
-        f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(str(side).upper())}</b>",
-        f"• Mode: {mode_label}",
-        f"• Account: {_esc(acc_name)} ({_esc(ex_id)})",
-        f"• Risk {risk:.1f}% | Lev x{lev}",
-        f"• Entry(SPOT)≈{entry_spot:.2f} | Qty={qty:.6f}",
-        f"• SL={sl:.2f}" if sl else "• SL=—",
-        f"• TP={tp:.2f}" if tp else "• TP=—",
-        f"• Tide: {tide_label}" if tide_label else "",
-    ]
-    return "\n".join([l for l in lines if l])
+    """
+    HTML cho broadcast group — format giống /order_cmd().
+    - Các field risk/lev/qty/entry_spot có thể None -> sẽ tự ẩn.
+    - entry_ids & tp_time là tùy chọn (nếu có sẽ in thêm).
+    """
+    import html as _html
+    def _esc(x):
+        try: return _html.escape("" if x is None else str(x), quote=False)
+        except: return str(x)
+
+    lines: list[str] = []
+    lines.append(f"🚀 <b>EXECUTED</b> | <b>{_esc(pair)}</b> <b>{_esc(str(side).upper())}</b>")
+    lines.append(f"• Mode: {mode_label}")
+    lines.append(f"• Account: {_esc(acc_name)} ({_esc(ex_id)})")
+
+    # Risk | Lev
+    risk_part = f"Risk {float(risk):.1f}%" if isinstance(risk, (int, float)) else ""
+    lev_part  = f"Lev x{int(lev)}"         if isinstance(lev,  (int, float)) else ""
+    if risk_part or lev_part:
+        joiner = " | " if (risk_part and lev_part) else ""
+        lines.append(f"• {risk_part}{joiner}{lev_part}".strip(" |"))
+
+    # Entry(SPOT) | Qty
+    entry_part = f"Entry(SPOT)≈{float(entry_spot):.2f}" if isinstance(entry_spot, (int, float)) else ""
+    qty_part   = f"Qty={float(qty):.6f}"                 if isinstance(qty,        (int, float)) else ""
+    if entry_part or qty_part:
+        joiner2 = " | " if (entry_part and qty_part) else ""
+        lines.append(f"• {entry_part}{joiner2}{qty_part}".strip(" |"))
+    else:
+        lines.append("• Entry: —")
+
+    # SL / TP
+    lines.append(f"• SL={float(sl):.2f}" if isinstance(sl,(int,float)) else "• SL=—")
+    lines.append(f"• TP={float(tp):.2f}" if isinstance(tp,(int,float)) else "• TP=—")
+
+    # TP-by-time (nếu có)
+    try:
+        if tp_time is not None:
+            dt = tp_time
+            try:
+                from utils.time_utils import VN_TZ  # nếu có
+                if getattr(dt, "tzinfo", None) is None:
+                    dt = VN_TZ.localize(dt)
+                else:
+                    dt = dt.astimezone(VN_TZ)
+            except Exception:
+                pass
+            # dt có thể là datetime hoặc string
+            timestr = dt.strftime('%Y-%m-%d %H:%M:%S') if hasattr(dt, "strftime") else str(dt)
+            lines.append(f"• TP-by-time: {timestr}")
+    except Exception:
+        pass
+
+    # Tide
+    if tide_label:
+        lines.append(f"• Tide: {_esc(tide_label)}")
+
+    # Entry IDs (nếu có)
+    if entry_ids:
+        try:
+            ids_str = ", ".join(str(x) for x in entry_ids if x)
+            if ids_str:
+                lines.append(f"• Entry ID(s): {_esc(ids_str)}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
+    
 
 def _binance_spot_entry(pair: str) -> float:
     """Lấy giá hiển thị SPOT (Binance) để boardcard. Không dùng cho khớp lệnh."""
@@ -422,6 +481,7 @@ def set_runtime_env(kv: Dict[str, str]) -> None:
 class UserState:
     settings: Any
 
+# ================== AUTO: quyết định & thực thi 1 lần cho uid ==================
 async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     """
     - Tick theo M5 close (chặn trùng slot)
@@ -674,8 +734,9 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     except Exception:
         pass
 
-    # (5) Boardcard EXECUTED (dùng formatter thống nhất)
+    # (5) BROADCAST EXECUTED (format GIỐNG /order_cmd)
     if opened_real:
+        # (giữ nguyên preview cho nội bộ nếu cần)
         try:
             preview_block = render_signal_preview(
                 {"signal": desired_side}, frames, {"late": in_late, "tide_label": tide_label},
@@ -687,15 +748,39 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         except Exception:
             preview_block = ""
 
+        # === Thay broadcast: dùng _fmt_exec_broadcast giống /order_cmd ===
         try:
-            exec_board_txt = render_executed_boardcard(
-                origin="AUTO",
-                symbol=pair_disp.replace(":USDT",""),
-                side=desired_side,
-                entry_ids=list(exec_result.get("entry_ids") or []),
-                preview_block=preview_block if os.getenv("AUTO_INCLUDE_PREVIEW_BEFORE_EXEC", "1") == "1" else "",
+            side_label = "LONG" if desired_side == "LONG" else "SHORT"
+            pair_clean = pair_disp.replace(":USDT","")
+
+            # Lấy thông tin từ exec_result (nếu hub trả về)
+            single = (exec_result or {}).get("per_account", {}).get("single", {}) if isinstance(exec_result, dict) else {}
+            account_name  = single.get("account_name") or single.get("name") or "auto"
+            exchange_name = single.get("exchange_name") or single.get("exchange") or single.get("exid") or "auto"
+            qty_print = single.get("qty")
+            sl_print  = single.get("sl") if single.get("sl") is not None else sl_price
+            tp_print  = single.get("tp") if single.get("tp") is not None else tp_price
+
+            # Entry(SPOT) để hiển thị đẹp
+            try:
+                entry_spot = _binance_spot_entry(pair_clean)  # nếu helper có sẵn
+            except Exception:
+                try:
+                    entry_spot = float(m30.get("close") or h4.get("close") or 0.0)
+                except Exception:
+                    entry_spot = None
+
+            btxt = _fmt_exec_broadcast(
+                pair=pair_clean,
+                side=side_label,
+                acc_name=account_name, ex_id=exchange_name,
+                lev=leverage, risk=risk_percent, qty=qty_print, entry_spot=entry_spot,
+                sl=sl_print, tp=tp_print,
+                tide_label=tide_label, mode_label="AUTO",
+                entry_ids=list((exec_result or {}).get("entry_ids") or []),
+                tp_time=tp_eta,  # in TP-by-time nếu đang áp dụng
             )
-            await _broadcast_html(exec_board_txt.replace("**","").replace("`",""))
+            await _broadcast_html(btxt)
         except Exception:
             pass
 
