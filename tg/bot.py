@@ -22,7 +22,7 @@ from strategy.m5_strategy import m5_snapshot, m5_entry_check
 from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
-from core.approval_flow import create_pending_v2
+
 
 # Vòng nền
 from core.auto_trade_engine import start_auto_loop
@@ -1243,24 +1243,25 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
         f"⏱ Tide window: {tide_label}\n" + "\n".join(results)
     )
-
+# ================== report_cmd chỉ report  ==================
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /report
-    - In báo cáo H4→M30 (và daily Moon/Tide).
-    - Nếu MODE=manual: tạo pending (duyệt /approve).
-    - Nếu MODE=auto và có tín hiệu hợp lệ:
-        + KIỂM TRA QUOTA trước khi vào lệnh (2 lệnh/tide, 8 lệnh/ngày): _quota_precheck_and_label(st)
-        + Vào lệnh (single-account hiện tại). Sau khi THỬ vào lệnh xong → _quota_commit(st, tkey, used, uid) 1 lần.
-        + Broadcast “Mode: AUTO” (entry hiển thị dùng Binance SPOT).
+    - CHỈ in báo cáo: Daily Moon/Tide + H4→M30 (+ M5 filter nếu evaluate_signal đã gộp).
+    - KHÔNG tạo pending, KHÔNG vào lệnh (dù mode auto/manual).
     """
     uid = _uid(update)
     st = storage.get_user(uid)
 
-    # ----------- 1) Báo cáo kỹ thuật + daily ----------
+    # 1) Daily (Moon & Tide)
     d = now_vn().date().isoformat()
-    daily = format_daily_moon_tide_report(d, float(st.settings.tide_window_hours))
+    try:
+        daily = format_daily_moon_tide_report(d, float(st.settings.tide_window_hours))
+    except Exception as e:
+        # nếu lỗi formatter, vẫn cố gắng in phần kỹ thuật bên dưới
+        daily = f"📅 {d}\n⚠️ Lỗi tạo Daily: {html.escape(str(e), quote=False)}"
 
+    # 2) Kỹ thuật H4→M30 (đồng bộ với /status & engine)
     sym = st.settings.pair.replace("/", "")
     loop = asyncio.get_event_loop()
     try:
@@ -1269,193 +1270,37 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None, lambda: evaluate_signal(sym, tide_window_hours=float(st.settings.tide_window_hours))
             )
         except TypeError:
-            # fallback version hàm cũ
+            # fallback phiên bản cũ không có tham số tide_window_hours
             res = await loop.run_in_executor(None, lambda: evaluate_signal(sym))
     except Exception as e:
-        await update.message.reply_text(_esc(daily) + f"\n\n⚠️ Lỗi /report: {_esc(str(e))}")
+        await update.message.reply_text(
+            html.escape(daily, quote=False) + f"\n\n⚠️ Lỗi /report: {html.escape(str(e), quote=False)}",
+            parse_mode="HTML"
+        )
         return
 
+    # 3) Chuẩn hoá kết quả & in
     if not isinstance(res, dict) or not res.get("ok", False):
         reason = (isinstance(res, dict) and (res.get("text") or res.get("reason"))) or "Không tạo được snapshot kỹ thuật."
-        await update.message.reply_text(_esc(daily) + f"\n\n⚠️ {_esc(reason)}")
+        await update.message.reply_text(
+            html.escape(daily, quote=False) + "\n\n" + "⚠️ " + html.escape(str(reason), quote=False),
+            parse_mode="HTML"
+        )
         return
 
+    # text kỹ thuật: ưu tiên res['text']; fallback formatter cũ
     ta_text = res.get("text") or format_signal_report(res)
+    # đồng nhất hiển thị (tránh Telegram HTML hiểu nhầm dấu so sánh)
     ta_text = _beautify_report(ta_text)
-    safe_daily = _esc(daily)
-    safe_ta    = _esc(ta_text)
 
-    # In báo cáo trước
+    safe_daily = html.escape(daily,   quote=False)
+    safe_ta    = html.escape(ta_text, quote=False)
+
     try:
         await update.message.reply_text(safe_daily + "\n\n" + safe_ta, parse_mode="HTML")
     except Exception:
-        await update.message.reply_text(safe_daily + "\n\n" + (res.get("text") or "—"))
-
-    # Không trade nếu bị skip
-    if res.get("skip", True):
-        return
-
-    side = (res.get("signal") or "NONE").upper()
-    if side not in ("LONG", "SHORT"):
-        return
-
-    # ----------- 2) Nhánh MANUAL: tạo pending ----------
-    if (st.settings.mode or "manual").lower() == "manual":
-        # ✅ CHỈ CẬP NHẬT: dùng create_pending_v2 + p.pid (giữ mọi thứ khác)
-        try:
-            from core.approval_flow import create_pending_v2
-        except Exception:
-            # nếu import path khác trong dự án của a, giữ nguyên import hiện có
-            from approval_flow import create_pending_v2  # type: ignore
-
-        # gom thêm context nếu có (tùy res)
-        frames       = res.get("frames", {}) if isinstance(res, dict) else {}
-        qty_cfg      = res.get("qty_cfg", {}) if isinstance(res, dict) else {}
-        risk_cfg     = res.get("risk_cfg", {}) if isinstance(res, dict) else {}
-        accounts_cfg = res.get("accounts_cfg", {}) if isinstance(res, dict) else {}
-        gates        = res.get("gates", {}) if isinstance(res, dict) else {}
-
-        p = create_pending_v2(storage, {
-            "symbol": st.settings.pair,
-            "suggested_side": side,
-            "signal_frames": frames,
-            "boardcard_ctx": {"preview_block": safe_ta},
-            "qty_cfg": qty_cfg,
-            "risk_cfg": risk_cfg,
-            "accounts_cfg": accounts_cfg,
-            "gates": gates,
-        })
-
-        block = (
-            safe_ta
-            + f"\nID: <code>{p.pid}</code>\nDùng /approve {p.pid} hoặc /reject {p.pid}"
-        )
-        await update.message.reply_text(safe_daily + "\n\n" + block, parse_mode="HTML")
-        return
-
-    # ----------- 3) Nhánh AUTO: quota + timing + vào lệnh ----------
-    # 3.1 QUOTA PRECHECK (mục 2.7)
-    ok_quota, why, tide_label, tkey, used = _quota_precheck_and_label(st)
-    if not ok_quota:
-        try:
-            await update.message.reply_text("(AUTO) " + why)
-        except Exception:
-            pass
-        return
-
-    # 3.2 Ràng buộc "late window" (nếu bật)
-    try:
-        late_only = (os.getenv("ENTRY_LATE_ONLY", "false").lower() in ("1","true","yes","on","y"))
-        late_pref = (os.getenv("ENTRY_LATE_PREF", "false").lower() in ("1","true","yes","on","y"))
-        late_from = float(os.getenv("ENTRY_LATE_FROM_HRS", "1.5"))
-        late_to   = float(os.getenv("ENTRY_LATE_TO_HRS", "2.0"))
-
-        now = now_vn()
-        twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
-        if twin:
-            start, end = twin
-            center = start + (end - start) / 2
-            delta_hr = (now - center).total_seconds() / 3600.0
-            in_late = (delta_hr >= late_from and delta_hr <= late_to)
-
-            if late_only and not in_late:
-                await update.message.reply_text(
-                    "(AUTO) "
-                    + _esc(
-                        f"ENTRY_LATE_ONLY=true → chỉ cho phép vào trong late window "
-                        f"[{(center + timedelta(hours=late_from)).strftime('%H:%M')}–{(center + timedelta(hours=late_to)).strftime('%H:%M')}] "
-                        f"(center={center.strftime('%H:%M')}, now={now.strftime('%H:%M')}).\n"
-                        "⏸ Bỏ qua vào lệnh lần này."
-                    )
-                )
-                return
-
-            if (not late_only) and late_pref and (not in_late):
-                conf = int(res.get("confidence", 0))
-                if conf < 6:
-                    await update.message.reply_text(
-                        "(AUTO) " + _esc("ENTRY_LATE_PREF=true và ngoài late window → bỏ qua vì điểm chưa đủ mạnh.")
-                    )
-                    return
-    except Exception as _e_enforce:
-        print(f"[AUTO][WARN] Late-window check error: {_e_enforce}")
-
-    # 3.3 Lấy giá SPOT (để hiển thị broadcast) + giá futures (để khớp lệnh)
-    try:
-        from data.market_data import get_klines
-        dfp = get_klines(symbol=st.settings.pair.replace("/", ""), interval="5m", limit=2)
-        if dfp is None or len(dfp) == 0:
-            await update.message.reply_text("(AUTO) Không lấy được giá hiện tại.")
-            return
-        close = float(dfp.iloc[-1]["close"])
-    except Exception as e:
-        await update.message.reply_text(f"(AUTO) Lỗi lấy giá: {_esc(str(e))}")
-        return
-
-    # 3.4 Tính size + leverage
-    try:
-        bal = await ex.balance_usdt()
-        qty = calc_qty(bal, st.settings.risk_percent, st.settings.leverage, close)
-        await ex.set_leverage(st.settings.pair, st.settings.leverage)
-    except Exception as e:
-        await update.message.reply_text(f"(AUTO) Lỗi khối lượng/leverage: {_esc(str(e))}")
-        return
-
-    side_long = (side == "LONG")
-    try:
-        sl_price, tp_price = auto_sl_by_leverage(close, "LONG" if side_long else "SHORT", st.settings.leverage)
-    except Exception:
-        if side_long:
-            sl_price, tp_price = close * 0.99, close * 1.02
-        else:
-            sl_price, tp_price = close * 1.01, close * 0.98
-
-    # 3.5 Thử khớp lệnh (single-account hiện tại)
-    try:
-        res_exe = await ex.market_with_sl_tp(st.settings.pair, side_long, qty, sl_price, tp_price)
-    except Exception as e:
-        res_exe = OrderResult(False, f"Order failed: {e}")  # fallback để vẫn commit quota
-
-    # 3.6 Lưu lịch sử (không cộng quota ở đây)
-    st.history.append({
-        "id": f"AUTO-{datetime.now().strftime('%H%M%S')}",
-        "side": side, "qty": qty, "entry": close,
-        "sl": sl_price, "tp": tp_price,
-        "ok": getattr(res_exe, "ok", True), "msg": getattr(res_exe, "message", "")
-    })
-    storage.put_user(uid, st)
-
-    # 3.7 Broadcast “Mode: AUTO” (hiển thị entry từ Binance SPOT), nếu lệnh OK
-    try:
-        if getattr(res_exe, "ok", False):
-            entry_spot = _binance_spot_entry(st.settings.pair)
-            btxt = _fmt_exec_broadcast(
-                pair=st.settings.pair.replace(":USDT",""),
-                side=("LONG" if side_long else "SHORT"),
-                acc_name="default",
-                ex_id=getattr(ex, "exchange_id", "binanceusdm"),
-                lev=st.settings.leverage,
-                risk=st.settings.risk_percent,
-                qty=qty,
-                entry_spot=(entry_spot or close),
-                sl=sl_price, tp=tp_price,
-                tide_label=tide_label,  # lấy từ quota-precheck
-                mode_label="AUTO",
-            )
-            await _broadcast_html(btxt)
-    except Exception:
-        pass
-
-    # 3.8 QUOTA COMMIT (mục 2.7) — chỉ +1 lần cho cả phiên AUTO này
-    _quota_commit(st, tkey, used, uid)
-
-    # 3.9 Phản hồi kết quả
-    enter_line = (
-        f"🔧 Executed: {st.settings.pair} {'LONG' if side_long else 'SHORT'} "
-        f"qty={qty:.6f} @~{close:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f}\n"
-        f"↳ {getattr(res_exe, 'message', '')}"
-    )
-    await update.message.reply_text("(AUTO)\n" + enter_line)
+        # nếu HTML bị lỗi ở client, gửi plain
+        await update.message.reply_text((daily or "") + "\n\n" + (ta_text or "—"))
 
 
 # ================== /m5report ==================
@@ -1575,235 +1420,20 @@ async def autolog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📜 Auto log gần nhất:\n{txt}")
 
-# ================== /approve (manual) ==================
-async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    app = context.application
-    # Ưu tiên storage trong bot_data (nếu có), fallback biến global 'storage'
-    try:
-        storage_use = app.bot_data.get("storage") if app and hasattr(app, "bot_data") else None
-    except Exception:
-        storage_use = None
-    storage_use = storage_use or storage
+# ================== Mode Manual: Approve or Reject ==================
+@handler.command("approve")
+async def approve_cmd(update, context):
+    pid = (update.message.text or "").split(maxsplit=1)[1].strip()
+    ok = mark_done(context.application.bot_data["storage"], pid, "APPROVED")
+    await update.message.reply_text("✅ Đã APPROVE." if ok else "⚠️ ID không hợp lệ.")
 
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text("Cú pháp: /approve <pending_id>")
-        return
-    pid = args[0].strip()
-
-    from core.approval_flow import get_pending, mark_done
-    p = get_pending(storage_use, pid)
-    if not p or p.status != "PENDING":
-        await update.effective_message.reply_text(f"Không tìm thấy pending `{pid}` hoặc đã xử lý.")
-        return
-
-    # === QUOTA precheck (giống /order) ===
-    tide_label_pre, tkey, used = None, None, 0
-    try:
-        uid = _uid(update)
-        st = storage_use.get_user(uid)
-        try:
-            # nếu đang ở tg/bot.py: dùng trực tiếp; nếu không, import fallback
-            _quota_precheck_and_label  # type: ignore  # noqa: F401
-            _quota_commit              # type: ignore  # noqa: F401
-            _qp = _quota_precheck_and_label   # type: ignore
-            _qc = _quota_commit               # type: ignore
-        except Exception:
-            from tg.bot import _quota_precheck_and_label as _qp  # type: ignore
-            from tg.bot import _quota_commit as _qc              # type: ignore
-
-        ok_quota, why, tide_label_pre, tkey, used = _qp(st)
-        if not ok_quota:
-            await update.effective_message.reply_text(why)
-            return
-    except Exception:
-        # không chặn nếu thiếu helper quota
-        pass
-
-    # Gọi hub thực thi (giữ nguyên)
-    from core.trade_executor import execute_order_flow
-    opened, exec_result = await execute_order_flow(
-        app, storage_use,
-        symbol=p.symbol,
-        side=p.suggested_side,
-        qty_cfg=p.qty_cfg,
-        risk_cfg=p.risk_cfg,
-        accounts_cfg=p.accounts_cfg,
-        meta={"reason": "MANUAL_APPROVE", "frames": p.signal_frames, "gates": p.gates},
-        origin="MANUAL"
-    )
-
-    if opened:
-        # Mark approved (giữ nguyên)
-        mark_done(storage_use, pid, "APPROVED")
-
-        # Boardcard EXECUTED (giữ nguyên)
-        try:
-            from tg.formatter import render_executed_boardcard
-            preview_block = (p.boardcard_ctx or {}).get("preview_block", "")
-            text_exec = render_executed_boardcard(
-                origin="MANUAL", symbol=p.symbol, side=p.suggested_side,
-                entry_ids=list(exec_result.get("entry_ids") or []), preview_block=preview_block
-            )
-            await update.effective_message.reply_text(text_exec, parse_mode="Markdown")
-        except Exception:
-            ids_line = " | ".join(map(str, (exec_result or {}).get("entry_ids") or [])) or "—"
-            fallback = f"🤖 EXECUTED (Mode: MANUAL) | {p.symbol} {p.suggested_side}\n🆔 {ids_line}"
-            await update.effective_message.reply_text(fallback)
-
-        # === [ADD] ĐĂNG KÝ TP-by-time CHO MANUAL (TP_TIME_HOURS, mặc định 5.5h) ===
-        tp_eta = None  # để broadcast dùng phía dưới
-        try:
-            from utils.time_utils import now_vn
-            from datetime import timedelta
-            import os
-
-            uid = _uid(update)
-            now = now_vn()
-
-            try:
-                tp_hours = float(os.getenv("TP_TIME_HOURS", "5.5"))
-            except Exception:
-                tp_hours = 5.5
-
-            tp_eta = now + timedelta(hours=tp_hours)
-
-            # Lấy SL (nếu hub trả về) để sentinel quản trị rủi ro
-            sl_price = None
-            try:
-                single_info = (exec_result or {}).get("per_account", {}).get("single", {})
-                sl_price = single_info.get("sl")
-            except Exception:
-                pass
-
-            # Lưu vào chỗ theo dõi vị thế đang mở
-            # Ưu tiên dùng app.bot_data để tránh đụng module khác
-            try:
-                open_pos = app.bot_data.setdefault("open_pos", {})
-            except Exception:
-                # fallback: dùng biến module-level nếu đã có
-                global _open_pos  # noqa: F401
-                if "_open_pos" not in globals():
-                    _open_pos = {}
-                open_pos = _open_pos
-
-            tide_center = now  # Với manual, lấy thời điểm khớp làm center
-            tide_key = tide_center.strftime("%Y-%m-%dT%H:%M")
-
-            open_pos[uid] = {
-                "pair": p.symbol,
-                "side": p.suggested_side,
-                "qty": "live",
-                "entry_time": now,
-                "tide_center": tide_center,
-                "tp_deadline": tp_eta,
-                "simulation": False,
-                "sl_price": sl_price,
-                "tide_window_key": tide_key,
-            }
-        except Exception:
-            # Không chặn luồng nếu không ghi được; chỉ bỏ qua
-            pass
-        # === [/ADD] ============================================================
-
-        # === [ADD] BROADCAST lên nhóm tín hiệu (format GIỐNG /order_cmd) + Entry IDs + TP-by-time ===
-        try:
-            # Chuẩn bị dữ liệu giống /order_cmd()
-            side_label = "LONG" if str(p.suggested_side).upper().find("LONG") >= 0 else "SHORT"
-            pair_disp = p.symbol.replace(":USDT","")
-
-            # Lấy thông tin từ exec_result (nếu có)
-            single = (exec_result or {}).get("per_account", {}).get("single", {}) if isinstance(exec_result, dict) else {}
-            name      = single.get("account_name") or single.get("name") or "manual"
-            exid      = single.get("exchange_name") or single.get("exchange") or single.get("exid") or "hub"
-            try:
-                leverage  = int(single.get("leverage") or 0)
-            except Exception:
-                leverage = None
-            try:
-                risk_percent = float(single.get("risk_percent") or 0.0)
-            except Exception:
-                risk_percent = None
-            try:
-                qty = float(single.get("qty") or 0.0)
-            except Exception:
-                qty = None
-
-            # Giá Entry(SPOT) để in đẹp
-            try:
-                entry_spot = _binance_spot_entry(pair_disp)  # nếu helper có sẵn
-            except Exception:
-                try:
-                    entry_spot = float(single.get("entry_spot") or single.get("entry") or 0.0)
-                except Exception:
-                    entry_spot = None
-
-            sl_use = single.get("sl", None)
-            tp_use = single.get("tp", None)
-
-            # Tide label: ưu tiên từ boardcard_ctx hoặc exec_result; fallback precheck
-            tide_label = None
-            try:
-                tide_label = (p.boardcard_ctx or {}).get("tide_label")
-            except Exception:
-                pass
-            if not tide_label:
-                tide_label = (exec_result or {}).get("tide_label")
-            if not tide_label:
-                tide_label = tide_label_pre
-
-            entry_ids = list((exec_result or {}).get("entry_ids") or [])
-
-            btxt = _fmt_exec_broadcast(
-                pair=pair_disp,
-                side=side_label,
-                acc_name=name, ex_id=exid,
-                lev=leverage, risk=risk_percent, qty=qty,
-                entry_spot=entry_spot,
-                sl=sl_use, tp=tp_use,
-                tide_label=tide_label, mode_label="MANUAL",
-                entry_ids=entry_ids,
-                tp_time=tp_eta,
-            )
-            await _broadcast_html(btxt)
-        except Exception as e:
-            # Không chặn luồng nếu broadcast lỗi
-            try:
-                print(f"[MANUAL broadcast warn] {e}")
-            except Exception:
-                pass
-        # === [/ADD] ============================================================
-
-        # === QUOTA commit khi đã mở thành công ===
-        try:
-            if (tkey is not None) and ('st' in locals()):
-                _qc(st, tkey, used, uid)  # type: ignore
-        except Exception:
-            pass
-
-    else:
-        await update.effective_message.reply_text("Không mở được lệnh (kiểm tra log/khối lượng/cấu hình).")
+@handler.command("reject")
+async def reject_cmd(update, context):
+    pid = (update.message.text or "").split(maxsplit=1)[1].strip()
+    ok = mark_done(context.application.bot_data["storage"], pid, "REJECTED")
+    await update.message.reply_text("❌ Đã REJECT." if ok else "⚠️ ID không hợp lệ.")
 
 
-
-# ===== [/reject] =====
-async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    app = context.application
-    storage = app.bot_data["storage"]
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text("Cú pháp: /reject <pending_id>")
-        return
-    pid = args[0].strip()
-
-    from core.approval_flow import get_pending, mark_done
-    p = get_pending(storage, pid)
-    if not p or p.status != "PENDING":
-        await update.effective_message.reply_text(f"Không tìm thấy pending `{pid}` hoặc đã xử lý.")
-        return
-
-    mark_done(storage, pid, "REJECTED")
-    await update.effective_message.reply_text(f"Đã từ chối pending `{pid}`.")
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
