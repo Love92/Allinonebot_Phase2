@@ -40,7 +40,7 @@ except Exception:
     from trade_executor import execute_order_flow  # type: ignore
 
 try:
-    from tg.formatter import render_executed_boardcard, render_signal_preview
+    from tg.formatter import render_executed_boardcard, render_signal_preview   # Cần theo dõi để cải thiện
 except Exception:
     # fallback nếu dự án chưa có đủ 2 hàm (không crash)
     def render_executed_boardcard(**kw):  # type: ignore
@@ -113,7 +113,6 @@ def _norm_side_txt(side_long_or_str) -> str:
 def _side_txt_from_bool(side_long: bool) -> str:
     # True = LONG, False = SHORT
     return "LONG" if bool(side_long) else "SHORT"
-# ========= [/ADD] ====================================
 
 # ========= [ADD] Broadcast helpers (đồng bộ format với /order) =========
 import html as _html
@@ -241,7 +240,6 @@ def _binance_spot_entry(pair: str) -> float:
     except Exception:
         pass
     return 0.0
-# ========= [/ADD] ========================================================
 
 # ========= ENV & runtime knobs (có thể đổi bằng /setenv hoặc preset) =========
 def _env_bool(key: str, default: str = "false") -> bool:
@@ -466,8 +464,12 @@ _last_m5_slot_sent: Dict[int, int] = {}
 _user_tide_state: Dict[int, Dict[str, Any]] = {}
 # Vị thế đang mở (theo UID) để xử lý TP-by-time
 _open_pos: Dict[int, Dict[str, Any]] = {}
-# [ADD] Mốc thời gian vào lệnh gần nhất (gap guard)
+# [OLD] Mốc thời gian vào lệnh gần nhất (global gap guard)
 _LAST_EXEC_TS: Dict[int, float] = {}  # key=uid, val=epoch seconds
+# [NEW] States cho patch A & B
+_m30_guard_state: Dict[int, Dict[str, Dict[str, Any]]] = {}
+_m30_consec_state: Dict[int, Dict[str, Any]] = {}
+_last_entry_meta: Dict[int, Dict[str, Any]] = {}
 
 def get_last_decision_text(uid: int) -> Optional[str]:
     return _last_decision_text.get(uid)
@@ -583,6 +585,56 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
             await _debug_send(app, uid, msg)
         return msg
 
+    # === [PATCH A] M30 flip-guard & ổn định + consecutive-N ===
+    side_m30 = str(m30.get("side", "NONE")).upper()
+    if M30_FLIP_GUARD and side_m30 in ("LONG", "SHORT") and isinstance(center, datetime) and (tau is not None):
+        stable_sec = int(float(os.getenv("M30_STABLE_MIN_SEC", str(M30_STABLE_MIN_SEC))))
+        need_n = max(1, int(float(os.getenv("M30_NEED_CONSEC_N", str(M30_NEED_CONSEC_N)))))
+        g_user = _m30_guard_state.setdefault(uid, {})
+        g_day  = g_user.setdefault(now.strftime("%Y-%m-%d"), {})
+        g      = g_day.setdefault(center.strftime("%H:%M"), {})
+        # Trước tâm: ghi nhận và yêu cầu đợi qua tâm
+        if tau < 0:
+            if "pre_side" not in g:
+                g["pre_side"] = side_m30
+            msg = _one_line("SKIP", "m30_wait_post_center", now, f"tau={tau:.2f}h pre_side={g['pre_side']}")
+            _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+            if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                await _debug_send(app, uid, msg)
+            return msg
+        # Sau tâm: yêu cầu ổn định đủ giây
+        if "pre_side" not in g:
+            g["pre_side"] = side_m30
+        if side_m30 != g.get("pre_side"):
+            g["flipped"] = True
+        if g.get("post_stable_since") is None:
+            g["post_stable_since"] = now
+        waited = (now - g["post_stable_since"]).total_seconds()
+        if waited < max(0, stable_sec):
+            msg = _one_line("SKIP", "m30_need_stable_sec", now, f"{waited:.0f}/{stable_sec}s side={side_m30}")
+            _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+            if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                await _debug_send(app, uid, msg)
+            return msg
+        # Cần N nến M30 liên tiếp
+        if need_n > 1:
+            stc = _m30_consec_state.setdefault(uid, {"side": None, "count": 0, "last_bar_key": None})
+            bar_key = now.strftime("%Y-%m-%d %H") + f":{(now.minute // 30) * 30:02d}"
+            if stc["side"] != side_m30:
+                stc["side"] = side_m30
+                stc["count"] = 1
+                stc["last_bar_key"] = bar_key
+            else:
+                if stc["last_bar_key"] != bar_key:
+                    stc["count"] += 1
+                    stc["last_bar_key"] = bar_key
+            if stc["count"] < need_n:
+                msg = _one_line("SKIP", "m30_need_consec_n", now, f"side={side_m30} {stc['count']}/{need_n}")
+                _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
+                if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                    await _debug_send(app, uid, msg)
+                return msg
+
     # Quota mỗi cửa sổ thủy triều
     key_day = now.strftime("%Y-%m-%d")
     key_win = f"{center.strftime('%H:%M') if center else 'NA'}"
@@ -613,7 +665,6 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         return msg
 
     # 8) Bắt buộc M5 cùng hướng với M30 (nếu bật)
-    side_m30 = str(m30.get("side", "NONE")).upper()
     if ENFORCE_M5_MATCH_M30:
         if side_m30 not in ("LONG", "SHORT"):
             msg = _one_line("SKIP", "m30_side_none", now, "M30 không có hướng rõ ràng")
@@ -639,24 +690,61 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
                 await _debug_send(app, uid, msg)
             return msg
 
-    # M5 gap guard (nếu cấu hình)
+    # === [PATCH B] M5 cooldown theo window + optional second-entry ===
     try:
         gap_min = int(float(os.getenv("M5_MIN_GAP_MIN", os.getenv("ENTRY_SEQ_WINDOW_MIN", "0"))))
     except Exception:
         gap_min = 0
-    if gap_min > 0:
-        import time
-        now_sec = time.time()
-        last = _LAST_EXEC_TS.get(uid)
-        if last and (now_sec - last) < gap_min * 60:
-            need_m = int(gap_min - (now_sec - last) / 60.0 + 0.999)
+    scoped_to_window = (os.getenv("M5_GAP_SCOPED_TO_WINDOW", "true").strip().lower() in ("1","true","yes","on","y"))
+    allow_second = (os.getenv("ALLOW_SECOND_ENTRY", "true").strip().lower() in ("1","true","yes","on","y"))
+    try:
+        second_retrace_pct = float(os.getenv("M5_SECOND_ENTRY_MIN_RETRACE_PCT", "0.3"))
+    except Exception:
+        second_retrace_pct = 0.3
+
+    last = _last_entry_meta.get(uid, {})
+    last_at = last.get("at")
+    last_win = last.get("window")
+    same_win = (last_win == key_win)
+    under_scope = (same_win if scoped_to_window else True)
+
+    # Cooldown gap
+    if gap_min > 0 and last_at is not None and under_scope:
+        gap_now = (now - last_at).total_seconds() / 60.0
+        if gap_now < gap_min:
+            need_m = int(gap_min - gap_now + 0.999)
             note = _one_line("SKIP", "m5_gap_guard", now, f"need≥{gap_min}m, còn≈{need_m}m")
             _last_decision_text[uid] = note + ("\n\n" + text_block if text_block else "")
             if AUTO_DEBUG and not AUTO_DEBUG_ONLY_WHEN_SKIP:
                 await _debug_send(app, uid, note)
             return note
-        from time import time as _now_s
-        _LAST_EXEC_TS[uid] = _now_s()
+
+    # Second-entry trong cùng window (nếu đã có >=1 lệnh)
+    if under_scope and same_win and int(st_key.get("trade_count", 0)) >= 1:
+        if not allow_second:
+            msg = _one_line("SKIP", "second_entry_disabled", now, f"win={key_win}")
+            _last_decision_text[uid] = msg + "\n\n" + text_block
+            if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                await _debug_send(app, uid, msg)
+            return msg
+        try:
+            px_now = float(m5f.get("close") or 0.0) if isinstance(m5f, dict) else 0.0
+            last_px = float(last.get("price") or 0.0)
+            last_side = str(last.get("side") or desired_side).upper()
+            retrace_ok = False
+            if last_px > 0 and px_now > 0:
+                if last_side == "LONG":
+                    retrace_ok = ((last_px - px_now) / last_px * 100.0) >= second_retrace_pct
+                else:
+                    retrace_ok = ((px_now - last_px) / last_px * 100.0) >= second_retrace_pct
+            if not retrace_ok:
+                msg = _one_line("SKIP", "second_entry_need_retrace", now, f"need≥{second_retrace_pct}%, last={last_px}, now={px_now}")
+                _last_decision_text[uid] = msg + "\n\n" + text_block
+                if not AUTO_DEBUG_ONLY_WHEN_SKIP:
+                    await _debug_send(app, uid, msg)
+                return msg
+        except Exception:
+            pass
 
     # 10) Khớp lệnh — DÙNG HUB + FORMATTER THỐNG NHẤT (minimal diff)
     opened_real = False
@@ -802,6 +890,40 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         st_key["trade_count"] = int(st_key.get("trade_count", 0)) + 1
     order_seq = int(st_key.get("trade_count", 0))
 
+    # === [PATCH C] Đồng bộ storage để /status (today.count, tide_window_trades) ===
+    if opened_real:
+        try:
+            st_persist = storage.get_user(uid)
+            # today.count
+            try:
+                cur = int(getattr(st_persist.today, "count", 0))
+                setattr(st_persist.today, "count", cur + 1)
+            except Exception:
+                pass
+            # per-window map
+            try:
+                twk = tide_window_key
+                if not hasattr(st_persist, "tide_window_trades") or not isinstance(st_persist.tide_window_trades, dict):
+                    st_persist.tide_window_trades = {}
+                st_persist.tide_window_trades[twk] = int(st_persist.tide_window_trades.get(twk, 0)) + 1
+            except Exception:
+                pass
+            storage.put_user(uid, st_persist)
+        except Exception:
+            pass
+
+    # Lưu meta lần vào để phục vụ cooldown/second-entry
+    try:
+        px_close = float(m5f.get("close") or 0.0) if isinstance(m5f, dict) else 0.0
+        _last_entry_meta[uid] = {
+            "at": now if opened_real else _last_entry_meta.get(uid, {}).get("at", None),
+            "window": key_win if opened_real else _last_entry_meta.get(uid, {}).get("window", None),
+            "price": px_close if opened_real else _last_entry_meta.get(uid, {}).get("price", 0.0),
+            "side": desired_side if opened_real else _last_entry_meta.get(uid, {}).get("side", desired_side),
+        }
+    except Exception:
+        pass
+
     # 12) Build log /autolog
     header = (
         f"🤖 AUTO EXECUTE | {pair_disp} {desired_side}\n"
@@ -810,7 +932,7 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         f"late_window={'YES' if in_late else 'NO'} | "
         f"TP-by-time: {tp_eta.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"➡️ EXECUTE {'OK' if opened_real else 'FAIL'} | {'counted' if opened_real else 'not-counted'}\n"
-        f"{'\n'.join(per_account_logs) if per_account_logs else ''}\n"
+        f"{chr(10).join(per_account_logs) if per_account_logs else ''}\n"
         f"{'📣 Opened trade #' + str(order_seq) + '/' + str(MAX_TRADES_PER_WINDOW) if opened_real else ''}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
