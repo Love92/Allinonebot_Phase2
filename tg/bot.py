@@ -22,6 +22,7 @@ from strategy.m5_strategy import m5_snapshot, m5_entry_check
 from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
+from core.approval_flow import mark_done
 
 
 # Vòng nền
@@ -1421,18 +1422,26 @@ async def autolog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📜 Auto log gần nhất:\n{txt}")
 
 # ================== Mode Manual: Approve or Reject ==================
-@handler.command("approve")
-async def approve_cmd(update, context):
-    pid = (update.message.text or "").split(maxsplit=1)[1].strip()
-    ok = mark_done(context.application.bot_data["storage"], pid, "APPROVED")
-    await update.message.reply_text("✅ Đã APPROVE." if ok else "⚠️ ID không hợp lệ.")
 
-@handler.command("reject")
-async def reject_cmd(update, context):
-    pid = (update.message.text or "").split(maxsplit=1)[1].strip()
-    ok = mark_done(context.application.bot_data["storage"], pid, "REJECTED")
-    await update.message.reply_text("❌ Đã REJECT." if ok else "⚠️ ID không hợp lệ.")
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    storage = context.application.bot_data["storage"]
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await update.message.reply_text("Cách dùng: /approve <PENDING_ID>")
+        return
+    pid = args[1].strip()
+    ok = mark_done(storage, pid, "APPROVED")
+    await update.message.reply_text("✅ Đã APPROVE." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
 
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    storage = context.application.bot_data["storage"]
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await update.message.reply_text("Cách dùng: /reject <PENDING_ID>")
+        return
+    pid = args[1].strip()
+    ok = mark_done(storage, pid, "REJECTED")
+    await update.message.reply_text("❌ Đã REJECT." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
 
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
