@@ -22,7 +22,7 @@ from strategy.m5_strategy import m5_snapshot, m5_entry_check
 from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
-from core.approval_flow import mark_done
+from core.approval_flow import mark_done, get_pending
 from core.trade_executor import retime_tp_by_time_for_open_positions
 
 
@@ -783,6 +783,7 @@ async def setenv_cmd(update, context):
         "ENTRY_SEQ_WINDOW_MIN","M30_TAKEOVER_MIN","CROSS_RECENT_N",
         "RSI_OB","RSI_OS",
         "STCH_RECENT_N",
+        "MAX_PENDING_MINUTES",
     }
     float_keys = {
         "ENTRY_LATE_FROM_HRS","ENTRY_LATE_TO_HRS","TP_TIME_HOURS",
@@ -1609,7 +1610,6 @@ async def autolog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📜 Auto log gần nhất:\n{txt}")
 
 # ================== Mode Manual: Approve or Reject ==================
-
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage = context.application.bot_data["storage"]
     args = (update.message.text or "").split(maxsplit=1)
@@ -1617,18 +1617,45 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Cách dùng: /approve <PENDING_ID>")
         return
     pid = args[1].strip()
+
+    # Lấy pending record
+    p = get_pending(storage, pid)
+    if not p:
+        await update.message.reply_text("⚠️ ID không hợp lệ hoặc đã xử lý.")
+        return
+
+    # Đọc ngưỡng phút chờ duyệt (ENV → default 10)
+    try:
+        max_min = int(float(os.getenv("MAX_PENDING_MINUTES", "10")))
+    except Exception:
+        max_min = 10
+    max_min = max(1, max_min)  # an toàn
+
+    # Tính tuổi pending (phút) từ created_at (UTC ISO) → so với now UTC
+    from datetime import datetime, timezone
+    try:
+        # created_at lưu bằng datetime.utcnow().isoformat()
+        # thường là 'YYYY-MM-DDTHH:MM:SS.ssssss' (naive) → coi như UTC
+        created_utc = datetime.fromisoformat(p.created_at)
+        if created_utc.tzinfo is None:
+            created_utc = created_utc.replace(tzinfo=timezone.utc)
+    except Exception:
+        created_utc = datetime.now(timezone.utc)  # fallback: xem như vừa tạo
+
+    now_utc = datetime.now(timezone.utc)
+    age_min = (now_utc - created_utc).total_seconds() / 60.0
+
+    # Nếu quá hạn → tự REJECT
+    if age_min > max_min:
+        mark_done(storage, pid, "REJECTED")
+        await update.message.reply_text(
+            f"⏱ Pending {pid} đã quá hạn (> {max_min} phút). Đã tự động từ chối."
+        )
+        return
+
+    # Còn hạn → APPROVE như cũ
     ok = mark_done(storage, pid, "APPROVED")
     await update.message.reply_text("✅ Đã APPROVE." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
-
-async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage = context.application.bot_data["storage"]
-    args = (update.message.text or "").split(maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text("Cách dùng: /reject <PENDING_ID>")
-        return
-    pid = args[1].strip()
-    ok = mark_done(storage, pid, "REJECTED")
-    await update.message.reply_text("❌ Đã REJECT." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
 
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
