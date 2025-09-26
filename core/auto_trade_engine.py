@@ -263,14 +263,14 @@ AUTO_DEBUG_CHAT_ID      = os.getenv("AUTO_DEBUG_CHAT_ID", "").strip()
 ENFORCE_M5_MATCH_M30 = _env_bool("ENFORCE_M5_MATCH_M30", "true")
 
 # --- Defaults cho các guard bổ sung (để _apply_runtime_env có giá trị ban đầu) ---
-M30_FLIP_GUARD = False              # yêu cầu M30 không flip hướng quá nhanh
-M30_STABLE_MIN_SEC = 0              # số giây tối thiểu M30 phải ổn định
+M30_FLIP_GUARD = True              # yêu cầu M30 không flip hướng quá nhanh
+M30_STABLE_MIN_SEC = 1800              # số giây tối thiểu M30 phải ổn định
 M30_NEED_CONSEC_N = 1               # số nến liên tiếp cần thoả điều kiện
 
-M5_MIN_GAP_MIN = 0                  # phút tối thiểu giữa 2 lần vào lệnh (gap guard)
+M5_MIN_GAP_MIN = 15                  # phút tối thiểu giữa 2 lần vào lệnh (gap guard)
 M5_GAP_SCOPED_TO_WINDOW = True      # gap guard tính trong 1 cửa sổ tide hay toàn cục
-ALLOW_SECOND_ENTRY = False          # cho phép vào lệnh thứ 2 trong cùng cửa sổ
-M5_SECOND_ENTRY_MIN_RETRACE_PCT = 0 # % tối thiểu retrace để cho lệnh thứ 2
+ALLOW_SECOND_ENTRY = True          # cho phép vào lệnh thứ 2 trong cùng cửa sổ
+M5_SECOND_ENTRY_MIN_RETRACE_PCT = 0.1 # % tối thiểu retrace để cho lệnh thứ 2
 
 
 def _apply_runtime_env(kv: Dict[str, str]) -> None:
@@ -1423,4 +1423,5 @@ async def start_auto_loop(app, storage):
 
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 # ----------------------- /core/auto_trade_engine.py -----------------------
+
 
