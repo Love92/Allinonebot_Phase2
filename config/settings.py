@@ -60,6 +60,8 @@ SCHEDULER_TICK_SEC    = _as_int("SCHEDULER_TICK_SEC", "2")
 MAX_ORDERS_PER_DAY    = _as_int("MAX_ORDERS_PER_DAY", "8")
 MAX_ORDERS_PER_TIDE_WINDOW = _as_int("MAX_ORDERS_PER_TIDE_WINDOW", "2")
 M5_MAX_DELAY_SEC      = _as_int("M5_MAX_DELAY_SEC", "60")
+# NEW: thời gian tối đa chờ duyệt pending (phút)
+MAX_PENDING_MINUTES   = _as_int("MAX_PENDING_MINUTES", "10")
 
 # ===== Debug flags =====
 AUTO_DEBUG                = _env_bool("AUTO_DEBUG", "true")
@@ -98,3 +100,4 @@ EXCHANGE = EXCHANGE_ID
 DEFAULT_PAIR = PAIR
 DEFAULT_PRESET_MODE = PRESET_MODE
 # ----------------------- /config/settings.py -----------------------
+
