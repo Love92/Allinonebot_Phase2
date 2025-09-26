@@ -1772,7 +1772,7 @@ def build_app():
     app.add_handler(CommandHandler("tidewindow", tidewindow_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("order", order_cmd))
-    app.add_handler(CommandHandler("order", order_new_cmd))
+    app.add_handler(CommandHandler("ordernew", order_new_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("m5report", m5report_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
@@ -1865,6 +1865,7 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
+
 
 
 
