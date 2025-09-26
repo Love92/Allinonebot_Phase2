@@ -784,9 +784,8 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
     - Thực hiện khớp lệnh qua execute_order_flow.
     - Trả về tất cả dữ liệu cần cho bước (C).
     """
-    import os, json  # [ADD] dùng để đọc ACCOUNTS_JSON
-    from datetime import datetime, timedelta  # [KEEP]
-    # [KEEP] các import/const khác (auto_sl_by_leverage, TIDE_WINDOW_HOURS, execute_order_flow) đã có ở file
+    import os, json
+    from datetime import datetime, timedelta
 
     now          = gate["now"]
     pair_disp    = gate["pair_disp"]
@@ -824,13 +823,12 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
     except Exception:
         tide_label = None
 
-    # SL/TP sơ bộ
+    # SL/TP sơ bộ (không nhét 0.0 vào qty_cfg để executor tự tính theo giá live khi cần)
     try:
-        ref_close = float(m30.get("close") or h4.get("close"))  # [KEEP]
+        ref_close = float(m30.get("close") or h4.get("close"))
     except Exception:
         ref_close = 0.0
 
-    # [MOD] Nếu ref_close <= 0 (case /ordernew tối thiểu), KHÔNG nhét 0.0 vào qty_cfg => để executor tự tính từ giá live
     sl_price = None
     tp_price = None
     try:
@@ -839,7 +837,6 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
     except Exception:
         sl_price, tp_price = (None, None)
 
-    # [MOD] Chỉ thêm SL/TP vào qty_cfg khi có giá trị thực (>0); tránh 0.0
     qty_cfg = {}
     if sl_price and sl_price > 0:
         qty_cfg["sl"] = sl_price
@@ -848,52 +845,46 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
 
     risk_cfg = {"risk_percent": float(risk_percent), "leverage": int(leverage)}
 
-    # [MOD] Ưu tiên MULTI trước, fallback SINGLE (DEFAULT_ACCOUNT) sau
-    # - Đọc MULTI từ settings + ACCOUNTS_JSON
-    # - Loại trùng DEFAULT_ACCOUNT khỏi MULTI để tránh “vào 2 lần” cùng account khi fallback
+    # === ACCOUNTS: bám sát trade_executor (MULTI trước → fallback SINGLE env) ===
+    # - MULTI lấy từ settings.ACCOUNTS hoặc ENV ACCOUNTS_JSON (đúng schema: name/exchange/api_key/api_secret/testnet/pair)
+    # - KHÔNG lọc theo "default" nữa; execute_order_flow đã đảm bảo chỉ fallback SINGLE khi MULTI = 0 opened.
     accounts_cfg = {"enabled": True, "prefer": "multi", "fallback_single": True}
+    accounts_list = []
     try:
-        from config.settings import ACCOUNTS, DEFAULT_ACCOUNT  # [ADD] lấy danh sách & mặc định
-        accounts_list = list(ACCOUNTS or [])
-        default_single = str(DEFAULT_ACCOUNT or "").strip()
+        from config import settings as _S
+        if isinstance(getattr(_S, "ACCOUNTS", None), list):
+            accounts_list = list(_S.ACCOUNTS or [])
     except Exception:
         accounts_list = []
-        default_single = ""
 
+    # merge thêm từ ENV ACCOUNTS_JSON (nếu có)
     j = os.getenv("ACCOUNTS_JSON")
     if j:
         try:
             arr = json.loads(j)
             if isinstance(arr, list):
-                known = {a.get("name") for a in accounts_list if isinstance(a, dict)}
-                for a in arr:
-                    if isinstance(a, dict) and a.get("name") not in known:
-                        accounts_list.append(a)
+                accounts_list.extend([a for a in arr if isinstance(a, dict)])
         except Exception:
             pass
 
-    # [MOD] MULTI = ALL - {DEFAULT_ACCOUNT}  (tránh trùng khi fallback single)
-    multi_accounts = []
-    for a in accounts_list:
-        if not isinstance(a, dict):
-            continue
-        name = (a.get("name") or "").strip()
-        if name and name != default_single:
-            multi_accounts.append(a)
-    if multi_accounts:
-        accounts_cfg["accounts"] = multi_accounts
+    # nếu có danh sách thì truyền thẳng (trade_executor.open_multi_account_orders sẽ dùng trường 'exchange', 'api_key', 'api_secret', ...)
+    if accounts_list:
+        accounts_cfg["accounts"] = accounts_list
 
-    # [MOD] Origin lấy đúng từ gate (ORDER/MANUAL/AUTO). Nếu rỗng -> AUTO
+    # Origin (ORDER/MANUAL/AUTO) lấy từ gate để hiển thị/broadcast đúng
     origin = str(gate.get("mode", "AUTO")).strip().upper() or "AUTO"
 
     meta = {
-        "reason": origin,  # [MOD] thay vì hằng "AUTO_LOOP"
+        "reason": origin,  # thay vì "AUTO_LOOP"
         "score_meta": {"confidence": confidence, "H4": h4.get("score", 0), "M30": m30.get("score", 0)},
-        "tide_meta": {"center": center.isoformat() if isinstance(center, datetime) else str(center),
-                      "tide_label": tide_label},
+        "tide_meta": {
+            "center": center.isoformat() if isinstance(center, datetime) else str(center),
+            "tide_label": tide_label
+        },
         "frames": gate["frames"],
     }
 
+    # === Gọi hub thực thi (MULTI trước → nếu 0 opened mới fallback SINGLE theo ENV) ===
     try:
         opened_real, exec_result = await execute_order_flow(
             app, storage,
@@ -901,18 +892,17 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
             side=desired_side,
             qty_cfg=qty_cfg,
             risk_cfg=risk_cfg,
-            accounts_cfg=accounts_cfg,  # [MOD] đã ưu tiên MULTI trước
+            accounts_cfg=accounts_cfg,
             meta=meta,
-            origin=origin,              # [MOD] truyền đúng mode
+            origin=origin,
         )
     except Exception as e:
         opened_real = False
         exec_result = {"error": str(e), "entry_ids": [], "per_account": {}}
 
-    # Build per-account logs (diễn giải rõ MULTI/SINGLE)
+    # Log chi tiết per-account (ưu tiên multi, rồi single)
     try:
         pa = (exec_result.get("per_account") or {})
-        # [ADD] Ưu tiên log chi tiết MULTI (lặn vào từng account con)
         mm = pa.get("multi")
         if isinstance(mm, dict):
             multi_opened_any = False
@@ -927,7 +917,6 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
             if multi_opened_any:
                 pa["single_ignored_because_multi_opened"] = True
 
-        # [KEEP/ADD] SINGLE (chỉ log nếu MULTI không mở được)
         sg = pa.get("single")
         if isinstance(sg, dict) and not pa.get("single_ignored_because_multi_opened"):
             if sg.get("opened"):
@@ -935,13 +924,11 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
             else:
                 per_account_logs.append(f"• single | FAILED: {sg.get('error','?')}")
 
-        # [ADD] Lỗi tổng hợp nếu có
         if pa.get("multi_error"):
             per_account_logs.append(f"• multi_error: {pa['multi_error']}")
         if pa.get("single_error"):
             per_account_logs.append(f"• single_error: {pa['single_error']}")
     except Exception:
-        # [KEEP] giữ nguyên tính chịu lỗi
         pass
 
     return {
@@ -962,10 +949,11 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
         "now": now,
         "risk_percent": risk_percent,
         "leverage": leverage,
-        "center": center,           # từ gate/hoặc fallback ở trên
-        "frames": gate["frames"],   # nguyên frames để preview
-        "key_win": gate["key_win"], # chuỗi HH:MM của cửa sổ thủy triều
+        "center": center,
+        "frames": gate["frames"],
+        "key_win": gate["key_win"],
     }
+
 
 #=================(C) Broadcast & Autolog===========================
 async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
