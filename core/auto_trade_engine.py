@@ -811,15 +811,18 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
     center = center or now
     tp_eta = center + timedelta(hours=tp_hours)
 
-    # Nhãn tide
+    # Nhãn tide (khớp /report: ±TIDE_WINDOW_HOURS quanh anchor/center)
     try:
         tw_hrs = float(os.getenv("TIDE_WINDOW_HOURS", str(TIDE_WINDOW_HOURS)))
     except Exception:
         tw_hrs = TIDE_WINDOW_HOURS
     try:
-        start_hhmm = (center - timedelta(hours=tw_hrs/2)).strftime("%H:%M")
-        end_hhmm   = (center + timedelta(hours=tw_hrs/2)).strftime("%H:%M")
-        tide_label = f"{start_hhmm}–{end_hhmm}"
+        if center:
+            start_hhmm = (center - timedelta(hours=tw_hrs)).strftime("%H:%M")
+            end_hhmm   = (center + timedelta(hours=tw_hrs)).strftime("%H:%M")
+            tide_label = f"{start_hhmm}–{end_hhmm}"
+        else:
+            tide_label = None
     except Exception:
         tide_label = None
 
@@ -1423,5 +1426,4 @@ async def start_auto_loop(app, storage):
 
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 # ----------------------- /core/auto_trade_engine.py -----------------------
-
 
