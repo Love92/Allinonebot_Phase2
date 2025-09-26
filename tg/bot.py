@@ -55,7 +55,7 @@ def _quota_precheck_and_label(st):
         return False, f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day}).", tide_label, tkey, used
     if used >= st.settings.max_orders_per_tide_window:
         return False, f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh.", tide_label, tkey, used
-    return True, "", tide_label, tkey, used
+    return True, "", tide_label, tkey, used, center
 
 def _quota_commit(st, tkey, used, uid):
     st.today.count += 1
@@ -1133,7 +1133,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         head += tp_line + "\n"
     pos = await _format_position_status(st.settings.pair, fallback_lev=st.settings.leverage)
     await update.message.reply_text(head + "\n" + pos)
-
 # ================== /order (manual) ==================
 async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1143,7 +1142,9 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - Mode label: "Thủ công ORDER".
     """
     import os, json
+    from datetime import timedelta
     from config import settings as _S
+    from utils.time_utils import now_vn
     from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 
     msg = update.effective_message
@@ -1182,7 +1183,26 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logic_pair   = DEFAULT_PAIR
 
     # QUOTA precheck (tide + daily)
-    ok_quota, why, tide_label, tkey, used = _quota_precheck_and_label(st)
+    # Kỳ vọng bản mới của _quota_precheck_and_label trả thêm center (anchor) ở cuối.
+    # Nếu repo của anh chưa cập nhật, em có fallback tự suy ra center từ tide_label.
+    res = _quota_precheck_and_label(st)
+    center = None
+    try:
+        ok_quota, why, tide_label, tkey, used, center = res
+    except Exception:
+        ok_quota, why, tide_label, tkey, used = res  # kiểu cũ chưa có center
+        # Fallback: đoán center từ tide_label "HH:MM–HH:MM"
+        try:
+            if tide_label and "–" in tide_label:
+                hh1, hh2 = tide_label.split("–", 1)
+                today = now_vn().date()
+                from datetime import datetime
+                start = datetime.strptime(hh1.strip(), "%H:%M").replace(year=today.year, month=today.month, day=today.day, tzinfo=now_vn().tzinfo)
+                end   = datetime.strptime(hh2.strip(), "%H:%M").replace(year=today.year, month=today.month, day=today.day, tzinfo=now_vn().tzinfo)
+                center = start + (end - start)/2
+        except Exception:
+            center = None
+
     if not ok_quota:
         await msg.reply_text(why); return
 
@@ -1192,7 +1212,11 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not isinstance(ACCOUNTS, list): ACCOUNTS = []
     except Exception:
         try:
-            ACCOUNTS = json.loads(os.getenv("ACCOUNTS_JSON","[]"))
+            # cho phép ENV chứa mảng hoặc object {"accounts":[...]}
+            raw = os.getenv("ACCOUNTS_JSON","")
+            ACCOUNTS = json.loads(raw) if raw else []
+            if isinstance(ACCOUNTS, dict) and "accounts" in ACCOUNTS:
+                ACCOUNTS = ACCOUNTS["accounts"]
             if not isinstance(ACCOUNTS, list): ACCOUNTS = []
         except Exception:
             ACCOUNTS = []
@@ -1203,8 +1227,9 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uniq, seen = [], set()
     for acc in base:
         try:
+            if not isinstance(acc, dict): continue
             exid = str(acc.get("exchange","")).lower()
-            key  = (exid, acc.get("api_key",""))
+            key  = (exid, acc.get("api_key","") or acc.get("apiKey",""))
             if key in seen: continue
             seen.add(key)
             if not acc.get("pair"):
@@ -1219,21 +1244,31 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Entry hiển thị từ BINANCE SPOT
     entry_spot = _binance_spot_entry(logic_pair)
 
+    # === TÍNH TP-BY-TIME = anchor + TP_TIME_HOURS (đơn giản, hiệu quả) ===
+    try:
+        tp_hours = float(os.getenv("TP_TIME_HOURS", "5.5"))
+    except Exception:
+        tp_hours = 5.5
+    # nếu chưa có center (anchor) thì fallback giờ hiện tại (hiếm khi xảy ra)
+    base_dt = center or now_vn()
+    tp_time = base_dt + timedelta(hours=tp_hours)
+    # =====================================================================
+
     # chạy từng sàn
     results = []
     for acc in uniq:
         try:
             exid   = str(acc.get("exchange") or "").lower()
             name   = acc.get("name","default")
-            api    = acc.get("api_key") or ""
-            secret = acc.get("api_secret") or ""
+            api    = acc.get("api_key")  or acc.get("apiKey")  or ""
+            secret = acc.get("api_secret") or acc.get("secret") or ""
             testnet= bool(acc.get("testnet", False))
             pair   = acc.get("pair") or logic_pair
 
             cli = ExchangeClient(exid, api, secret, testnet)
             px  = await cli.ticker_price(pair)
             if not px or px <= 0:
-                results.append(f"• {name} | {exid} | {pair} → ERR: Không lấy được giá futures."); 
+                results.append(f"• {name} | {exid} | {pair} → ERR: Không lấy được giá futures.")
                 continue
 
             bal = await cli.balance_usdt()
@@ -1254,7 +1289,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
             r = await cli.market_with_sl_tp(pair, side_long, qty, sl_use, tp_use)
-            results.append(f"• {name} | {exid} | {pair} → {r.message}")
+            results.append(f"• {name} | {exid} | {pair} → {getattr(r, 'message', 'OK')}")
 
             # broadcast khi OK
             if getattr(r, "ok", False):
@@ -1267,6 +1302,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     entry_spot=(entry_spot or px),
                     sl=sl_use, tp=tp_use,
                     tide_label=tide_label, mode_label="Thủ công ORDER",
+                    tp_time=tp_time,                       # << thêm TP-by-time(anchor + H) vào broadcast
                 )
                 await _broadcast_html(btxt)
 
@@ -1280,6 +1316,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
         f"⏱ Tide window: {tide_label}\n" + "\n".join(results)
     )
+
 # ================== /order_new_cmd áp dụng logic gọi (B)+ (C)  ==================    
 async def order_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
