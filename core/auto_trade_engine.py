@@ -777,13 +777,17 @@ async def _auto_gate_decision(uid: int, app, storage) -> Optional[dict]:
         "st_key": st_key,
     }
 
-#================= (B) Execute Hub ===========================
+# ================= (B) Execute Hub ===========================
 async def _auto_execute_hub(uid: int, app, storage, gate: dict):
     """
     (B) Execute Hub:
     - Thực hiện khớp lệnh qua execute_order_flow.
     - Trả về tất cả dữ liệu cần cho bước (C).
     """
+    import os, json  # [ADD] dùng để đọc ACCOUNTS_JSON
+    from datetime import datetime, timedelta  # [KEEP]
+    # [KEEP] các import/const khác (auto_sl_by_leverage, TIDE_WINDOW_HOURS, execute_order_flow) đã có ở file
+
     now          = gate["now"]
     pair_disp    = gate["pair_disp"]
     desired_side = gate["desired_side"]
@@ -822,19 +826,68 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
 
     # SL/TP sơ bộ
     try:
-        ref_close = float(m30.get("close") or h4.get("close"))
+        ref_close = float(m30.get("close") or h4.get("close"))  # [KEEP]
     except Exception:
         ref_close = 0.0
+
+    # [MOD] Nếu ref_close <= 0 (case /ordernew tối thiểu), KHÔNG nhét 0.0 vào qty_cfg => để executor tự tính từ giá live
+    sl_price = None
+    tp_price = None
     try:
-        sl_price, tp_price = auto_sl_by_leverage(ref_close, desired_side, leverage)
+        if ref_close and ref_close > 0.0:
+            sl_price, tp_price = auto_sl_by_leverage(ref_close, desired_side, leverage)
     except Exception:
         sl_price, tp_price = (None, None)
 
-    qty_cfg = {"sl": sl_price, "tp": tp_price}
+    # [MOD] Chỉ thêm SL/TP vào qty_cfg khi có giá trị thực (>0); tránh 0.0
+    qty_cfg = {}
+    if sl_price and sl_price > 0:
+        qty_cfg["sl"] = sl_price
+    if tp_price and tp_price > 0:
+        qty_cfg["tp"] = tp_price
+
     risk_cfg = {"risk_percent": float(risk_percent), "leverage": int(leverage)}
-    accounts_cfg = {"enabled": True}
+
+    # [MOD] Ưu tiên MULTI trước, fallback SINGLE (DEFAULT_ACCOUNT) sau
+    # - Đọc MULTI từ settings + ACCOUNTS_JSON
+    # - Loại trùng DEFAULT_ACCOUNT khỏi MULTI để tránh “vào 2 lần” cùng account khi fallback
+    accounts_cfg = {"enabled": True, "prefer": "multi", "fallback_single": True}
+    try:
+        from config.settings import ACCOUNTS, DEFAULT_ACCOUNT  # [ADD] lấy danh sách & mặc định
+        accounts_list = list(ACCOUNTS or [])
+        default_single = str(DEFAULT_ACCOUNT or "").strip()
+    except Exception:
+        accounts_list = []
+        default_single = ""
+
+    j = os.getenv("ACCOUNTS_JSON")
+    if j:
+        try:
+            arr = json.loads(j)
+            if isinstance(arr, list):
+                known = {a.get("name") for a in accounts_list if isinstance(a, dict)}
+                for a in arr:
+                    if isinstance(a, dict) and a.get("name") not in known:
+                        accounts_list.append(a)
+        except Exception:
+            pass
+
+    # [MOD] MULTI = ALL - {DEFAULT_ACCOUNT}  (tránh trùng khi fallback single)
+    multi_accounts = []
+    for a in accounts_list:
+        if not isinstance(a, dict):
+            continue
+        name = (a.get("name") or "").strip()
+        if name and name != default_single:
+            multi_accounts.append(a)
+    if multi_accounts:
+        accounts_cfg["accounts"] = multi_accounts
+
+    # [MOD] Origin lấy đúng từ gate (ORDER/MANUAL/AUTO). Nếu rỗng -> AUTO
+    origin = str(gate.get("mode", "AUTO")).strip().upper() or "AUTO"
+
     meta = {
-        "reason": "AUTO_LOOP",
+        "reason": origin,  # [MOD] thay vì hằng "AUTO_LOOP"
         "score_meta": {"confidence": confidence, "H4": h4.get("score", 0), "M30": m30.get("score", 0)},
         "tide_meta": {"center": center.isoformat() if isinstance(center, datetime) else str(center),
                       "tide_label": tide_label},
@@ -848,23 +901,47 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
             side=desired_side,
             qty_cfg=qty_cfg,
             risk_cfg=risk_cfg,
-            accounts_cfg=accounts_cfg,
+            accounts_cfg=accounts_cfg,  # [MOD] đã ưu tiên MULTI trước
             meta=meta,
-            origin="AUTO",
+            origin=origin,              # [MOD] truyền đúng mode
         )
     except Exception as e:
         opened_real = False
         exec_result = {"error": str(e), "entry_ids": [], "per_account": {}}
 
-    # Build per-account logs
+    # Build per-account logs (diễn giải rõ MULTI/SINGLE)
     try:
-        for name, info in (exec_result.get("per_account") or {}).items():
-            if isinstance(info, dict):
+        pa = (exec_result.get("per_account") or {})
+        # [ADD] Ưu tiên log chi tiết MULTI (lặn vào từng account con)
+        mm = pa.get("multi")
+        if isinstance(mm, dict):
+            multi_opened_any = False
+            for acc_name, info in mm.items():
+                if not isinstance(info, dict):
+                    continue
                 if info.get("opened"):
-                    per_account_logs.append(f"• {name} | opened | id={info.get('entry_id')}")
+                    multi_opened_any = True
+                    per_account_logs.append(f"• {acc_name} | opened | id={info.get('entry_id')}")
                 else:
-                    per_account_logs.append(f"• {name} | FAILED: {info.get('error','?')}")
+                    per_account_logs.append(f"• {acc_name} | FAILED: {info.get('error','?')}")
+            if multi_opened_any:
+                pa["single_ignored_because_multi_opened"] = True
+
+        # [KEEP/ADD] SINGLE (chỉ log nếu MULTI không mở được)
+        sg = pa.get("single")
+        if isinstance(sg, dict) and not pa.get("single_ignored_because_multi_opened"):
+            if sg.get("opened"):
+                per_account_logs.append(f"• single | opened | id={sg.get('entry_id')}")
+            else:
+                per_account_logs.append(f"• single | FAILED: {sg.get('error','?')}")
+
+        # [ADD] Lỗi tổng hợp nếu có
+        if pa.get("multi_error"):
+            per_account_logs.append(f"• multi_error: {pa['multi_error']}")
+        if pa.get("single_error"):
+            per_account_logs.append(f"• single_error: {pa['single_error']}")
     except Exception:
+        # [KEEP] giữ nguyên tính chịu lỗi
         pass
 
     return {
@@ -889,6 +966,7 @@ async def _auto_execute_hub(uid: int, app, storage, gate: dict):
         "frames": gate["frames"],   # nguyên frames để preview
         "key_win": gate["key_win"], # chuỗi HH:MM của cửa sổ thủy triều
     }
+
 #=================(C) Broadcast & Autolog===========================
 async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
     """
@@ -919,6 +997,40 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
     frames  = result.get("frames", {})
     key_win = result.get("key_win")
 
+    # [ADD] lấy mode_label từ exec_result.origin (ORDER/MANUAL/AUTO)
+    try:
+        mode_label = str((exec_result or {}).get("origin", "AUTO")).upper()
+        if not mode_label:
+            mode_label = "AUTO"
+    except Exception:
+        mode_label = "AUTO"
+
+    # [ADD] chọn "picked account" để hiển thị (ưu tiên MULTI opened trước, rồi mới đến SINGLE)
+    picked = None
+    try:
+        pa = (exec_result or {}).get("per_account") or {}
+        mm = pa.get("multi")
+        if isinstance(mm, dict):
+            for acc_name, d in mm.items():
+                if isinstance(d, dict) and d.get("opened"):
+                    tmp = dict(d)
+                    tmp["name"] = acc_name if not tmp.get("name") else tmp["name"]
+                    if not tmp.get("exchange"):
+                        tmp["exchange"] = tmp.get("exid") or "multi"
+                    picked = tmp
+                    break
+        if not picked:
+            sg = pa.get("single")
+            if isinstance(sg, dict) and (sg.get("opened") or True):  # giữ nguyên hành vi hiển thị single nếu có
+                tmp = dict(sg)
+                if not tmp.get("name"):
+                    tmp["name"] = "single"
+                if not tmp.get("exchange"):
+                    tmp["exchange"] = tmp.get("exid") or "single"
+                picked = tmp
+    except Exception:
+        picked = None
+
     # Broadcast executed
     if opened_real:
         # (giữ nguyên preview cho nội bộ nếu cần) + phòng thủ chữ ký
@@ -934,7 +1046,7 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
                 {"confidence": confidence},
                 {"preset": None},
                 {"center": center_str},
-                "AUTO",
+                mode_label,  # [MOD] thay "AUTO" bằng mode_label
             )
         except Exception:
             preview_block = ""
@@ -952,6 +1064,17 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
             sl_print      = single.get("sl") if (single.get("sl") is not None) else sl_price
             tp_print      = single.get("tp") if (single.get("tp") is not None) else tp_price
 
+            # [ADD] nếu đã chọn picked (MULTI/SINGLE ưu tiên), dùng picked để override hiển thị
+            if isinstance(picked, dict):
+                account_name  = picked.get("account_name") or picked.get("name") or account_name
+                exchange_name = picked.get("exchange_name") or picked.get("exchange") or picked.get("exid") or exchange_name
+                if picked.get("qty") is not None:
+                    qty_print = picked.get("qty")
+                if picked.get("sl") is not None:
+                    sl_print = picked.get("sl")
+                if picked.get("tp") is not None:
+                    tp_print = picked.get("tp")
+
             # Entry(SPOT) để hiển thị đẹp
             try:
                 entry_spot = _binance_spot_entry(pair_clean)  # nếu helper có sẵn
@@ -967,7 +1090,7 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
                 acc_name=account_name, ex_id=exchange_name,
                 lev=leverage, risk=risk_percent, qty=qty_print, entry_spot=entry_spot,
                 sl=sl_print, tp=tp_print,
-                tide_label=tide_label, mode_label="AUTO",
+                tide_label=tide_label, mode_label=mode_label,  # [MOD] thay "AUTO" bằng mode_label
                 entry_ids=list((exec_result or {}).get("entry_ids") or []),
                 tp_time=tp_eta,  # in TP-by-time nếu đang áp dụng
             )
@@ -1038,8 +1161,9 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
     except Exception:
         side_m30 = "NONE"
 
+    # [MOD] header dùng mode_label thay vì cố định AUTO
     header = (
-        f"🤖 AUTO EXECUTE | {pair_disp} {desired_side}\n"
+        f"🤖 {mode_label} EXECUTE | {pair_disp} {desired_side}\n"
         f"Score H4/M30: {h4.get('score',0)} / {m30.get('score',0)} | Total≈{confidence}\n"
         f"rule M5==M30: {'ON' if ENFORCE_M5_MATCH_M30 else 'OFF'} | m30={side_m30}\n"
         f"late_window={'YES' if in_late else 'NO'} | "
@@ -1063,7 +1187,6 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
         pass
 
     return final_text
-
 
 #================= Mode Auto or Manual trong bot.mode_cmd ===========================
 async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
