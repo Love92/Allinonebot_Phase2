@@ -840,7 +840,7 @@ async def setenv_cmd(update, context):
                 except TypeError:
                     # fallback nếu helper được định nghĩa sync
                     updated = _retime_tp(context.application, storage, new_hours)  # type: ignore
-                retime_msg = f"\n🕒 Đã dời TP-by-time cho {updated} vị thế đang mở (deadline = entry + {new_hours:.2f}h)."
+                retime_msg = f"\n🕒 Đã dời TP-by-time cho {updated} vị thế đang mở (deadline = tide_center + {new_hours:.2f}h)."
             else:
                 retime_msg = "\n⚠️ Không tìm thấy storage hoặc giá trị TP_TIME_HOURS không hợp lệ (>0)."
     except Exception as e:
@@ -1338,9 +1338,7 @@ async def order_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     center = now  # với lệnh thủ công, lấy 'tâm' = now để build tide_label/TP-by-time
     # tính nhãn cửa sổ thủy triều HH:MM (để cooldown/second-entry dùng đúng format)
     try:
-        start_hhmm = (center - timedelta(hours=tide_window_hours/2)).strftime("%H:%M")
-        end_hhmm   = (center + timedelta(hours=tide_window_hours/2)).strftime("%H:%M")
-        key_win = start_hhmm  # meta 'window' dùng HH:MM (giống engine)
+        key_win = center.strftime("%H:%M")  # dùng trực tiếp mốc anchor/center làm khóa cửa sổ
     except Exception:
         key_win = "NA"
 
