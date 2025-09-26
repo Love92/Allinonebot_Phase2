@@ -4,7 +4,7 @@ import asyncio, logging, math, os, json
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 from typing import Literal
-
+from datetime import timedelta, datetime
 
 from dotenv import load_dotenv
 import ccxt  # type: ignore
@@ -1018,4 +1018,50 @@ async def execute_order_flow(app, storage, *,
     }
     return opened_real, result
 
-# =====================================================================
+# ========= Helper dời TP-by-time cho toàn bộ lệnh đang mở =============
+async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -> int:
+    """
+    Đặt lại deadline TP-by-time cho toàn bộ vị thế đang mở:
+        new_deadline = entry_time + timedelta(hours=new_hours)
+    Trả về: số vị thế đã cập nhật.
+    """
+    if new_hours is None:
+        return 0
+    try:
+        new_hours = float(new_hours)
+    except Exception:
+        return 0
+    if new_hours <= 0:
+        return 0
+
+    # Lấy danh sách position mở
+    try:
+        open_positions = await storage.list_open_positions()
+    except TypeError:
+        open_positions = storage.list_open_positions()
+
+    updated = 0
+    for p in open_positions or []:
+        if getattr(p, "is_closed", False):
+            continue
+        entry_time = getattr(p, "entry_time", None)
+        if not entry_time:
+            continue
+
+        new_deadline = entry_time + timedelta(hours=new_hours)
+        if getattr(p, "tp_time_deadline", None) != new_deadline:
+            p.tp_time_deadline = new_deadline
+            try:
+                await storage.update_position(p)
+            except TypeError:
+                storage.update_position(p)
+            updated += 1
+
+    app.bot_data.setdefault("tp_time_change_log", []).append(
+        {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "new_hours": new_hours,
+            "updated": updated,
+        }
+    )
+    return updated
