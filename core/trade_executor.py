@@ -1018,15 +1018,18 @@ async def execute_order_flow(app, storage, *,
     }
     return opened_real, result
 
-# ========= Helper dời TP-by-time cho toàn bộ lệnh đang mở =============
+# ========= Helper dời TP-by-time cho toàn bộ lệnh đang mở (anchor-based, robust storage) =============
 async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -> int:
     """
-    Đặt lại deadline TP-by-time cho toàn bộ vị thế đang mở:
-        new_deadline = entry_time + timedelta(hours=new_hours)
+    Đặt lại deadline TP-by-time cho toàn bộ vị thế đang mở theo chuẩn:
+        new_deadline = tide_anchor(entry_time) + timedelta(hours=new_hours)
+    Nếu không lấy được anchor → fallback entry_time + hours.
     Trả về: số vị thế đã cập nhật.
     """
-    if new_hours is None:
-        return 0
+    from strategy.signal_generator import tide_window_now  # dùng chung tính center (anchor)
+    from utils.time_utils import now_vn
+
+    # --- cast giờ ---
     try:
         new_hours = float(new_hours)
     except Exception:
@@ -1034,11 +1037,37 @@ async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -
     if new_hours <= 0:
         return 0
 
-    # Lấy danh sách position mở
-    try:
-        open_positions = await storage.list_open_positions()
-    except TypeError:
-        open_positions = storage.list_open_positions()
+    # --- lấy danh sách vị thế mở từ nhiều API thường gặp ---
+    def _iter_open(storage_obj):
+        # 1) API “mở” thường gặp
+        for name in ("list_open_positions", "get_open_positions", "list_positions_open", "get_positions_open"):
+            if hasattr(storage_obj, name):
+                fn = getattr(storage_obj, name)
+                try:
+                    return fn()                # sync
+                except TypeError:
+                    async def _aw(): return await fn()  # async
+                    return _aw()
+        # 2) API tổng rồi lọc
+        for name in ("list_positions", "get_positions", "get_all_positions", "positions"):
+            if hasattr(storage_obj, name):
+                obj = getattr(storage_obj, name)
+                items = obj() if callable(obj) else obj
+                return [p for p in (items or []) if not getattr(p, "is_closed", False)]
+        # 3) Fallback đọc dict
+        for attr in ("state", "__dict__"):
+            d = getattr(storage_obj, attr, None)
+            if isinstance(d, dict):
+                for k in ("positions", "open_positions", "trades", "orders"):
+                    if isinstance(d.get(k), (list, tuple)):
+                        return [p for p in d[k] if not getattr(p, "is_closed", False)]
+        return []
+
+    pos_iter = _iter_open(storage)
+    if callable(getattr(pos_iter, "__await__", None)):
+        open_positions = await pos_iter  # nếu là coroutine
+    else:
+        open_positions = pos_iter
 
     updated = 0
     for p in open_positions or []:
@@ -1048,20 +1077,37 @@ async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -
         if not entry_time:
             continue
 
-        new_deadline = entry_time + timedelta(hours=new_hours)
+        # Ưu tiên anchor có sẵn lưu trong position
+        anchor = getattr(p, "tide_center", None) or getattr(p, "tide_anchor", None)
+
+        # Nếu chưa có, tính anchor từ entry_time bằng tide_window_now()
+        if anchor is None:
+            try:
+                tw = tide_window_now(entry_time, hours=float(os.getenv("TIDE_WINDOW_HOURS", "2.5")))
+                if tw:
+                    start, end = tw
+                    anchor = start + (end - start) / 2
+            except Exception:
+                anchor = None
+
+        base = anchor or entry_time
+        new_deadline = base + timedelta(hours=new_hours)
+
         if getattr(p, "tp_time_deadline", None) != new_deadline:
             p.tp_time_deadline = new_deadline
-            try:
-                await storage.update_position(p)
-            except TypeError:
-                storage.update_position(p)
+            if hasattr(storage, "update_position"):
+                try:
+                    await storage.update_position(p)
+                except TypeError:
+                    storage.update_position(p)
+            elif hasattr(storage, "save_position"):
+                try:
+                    await storage.save_position(p)
+                except TypeError:
+                    storage.save_position(p)
             updated += 1
 
     app.bot_data.setdefault("tp_time_change_log", []).append(
-        {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "new_hours": new_hours,
-            "updated": updated,
-        }
+        {"ts": datetime.now().isoformat(timespec="seconds"), "new_hours": new_hours, "updated": updated}
     )
     return updated
