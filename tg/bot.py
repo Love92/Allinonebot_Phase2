@@ -23,6 +23,8 @@ from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
 from tg.formatter import format_signal_report, format_daily_moon_tide_report
 from core.approval_flow import mark_done
+from core.trade_executor import retime_tp_by_time_for_open_positions
+
 
 
 # Vòng nền
@@ -721,7 +723,9 @@ async def setenv_cmd(update, context):
     /setenv KEY VALUE
     /setenv_status
     """
+    import os
     from core import auto_trade_engine as ae
+    from core.trade_executor import retime_tp_by_time_for_open_positions as _retime_tp
 
     msg = update.effective_message
     if not context.args or len(context.args) < 2:
@@ -740,12 +744,18 @@ async def setenv_cmd(update, context):
         return str(s or "").strip().lower() in ("1","true","on","yes","y")
 
     def _is_floatlike(s: str) -> bool:
-        try: float(s); return True
-        except: return False
+        try:
+            float(s)
+            return True
+        except Exception:
+            return False
 
     def _is_intlike(s: str) -> bool:
-        try: int(float(s)); return True
-        except: return False
+        try:
+            int(float(s))
+            return True
+        except Exception:
+            return False
 
     # alias tương thích cũ:
     aliases = {
@@ -781,7 +791,7 @@ async def setenv_cmd(update, context):
         "EXTREME_RSI_OB","EXTREME_RSI_OS","EXTREME_STOCH_OB","EXTREME_STOCH_OS",
         "SIZE_MULT_STRONG","SIZE_MULT_MID","SIZE_MULT_CT",
         "SONIC_WEIGHT","HTF_MIN_ALIGN_SCORE","HTF_NEAR_ALIGN_GAP",
-        "STCH_GAP_MIN","STCH_SLOPE_MIN", "RSI_GAP_MIN",
+        "STCH_GAP_MIN","STCH_SLOPE_MIN","RSI_GAP_MIN",
     }
     passthrough_str = {"SONIC_MODE","M5_RELAX_KIND","AUTO_DEBUG_CHAT_ID","EXTREME_KIND"}
 
@@ -791,18 +801,22 @@ async def setenv_cmd(update, context):
             kv_to_apply[key_norm] = "true" if _as_bool(val_raw) else "false"
         elif key_norm in int_keys:
             if not _is_intlike(val_raw):
-                await msg.reply_text(f"Giá trị cho {key_norm} phải là số nguyên."); return
+                await msg.reply_text(f"Giá trị cho {key_norm} phải là số nguyên.")
+                return
             kv_to_apply[key_norm] = str(int(float(val_raw)))
         elif key_norm in float_keys:
             if not _is_floatlike(val_raw):
-                await msg.reply_text(f"Giá trị cho {key_norm} phải là số (float)."); return
+                await msg.reply_text(f"Giá trị cho {key_norm} phải là số (float).")
+                return
             kv_to_apply[key_norm] = str(float(val_raw))
         elif key_norm in passthrough_str:
             kv_to_apply[key_norm] = val_raw
         else:
-            await msg.reply_text(f"KEY không được phép: {key}\nGõ /help để xem KEY hỗ trợ."); return
+            await msg.reply_text(f"KEY không được phép: {key}\nGõ /help để xem KEY hỗ trợ.")
+            return
     except Exception as e:
-        await msg.reply_text(f"Lỗi ép kiểu: {e}"); return
+        await msg.reply_text(f"Lỗi ép kiểu: {e}")
+        return
 
     # ghi ENV
     for k, v in kv_to_apply.items():
@@ -814,8 +828,27 @@ async def setenv_cmd(update, context):
     except Exception as e:
         print(f"[WARN] _apply_runtime_env failed: {e}")
 
+    # Nếu có đổi TP_TIME_HOURS -> dời deadline TP-by-time cho mọi vị thế đang mở
+    retime_msg = ""
+    try:
+        if "TP_TIME_HOURS" in kv_to_apply:
+            new_hours = float(kv_to_apply["TP_TIME_HOURS"])
+            storage = context.application.bot_data.get("storage")
+            if storage is not None and new_hours > 0:
+                try:
+                    updated = await _retime_tp(context.application, storage, new_hours)
+                except TypeError:
+                    # fallback nếu helper được định nghĩa sync
+                    updated = _retime_tp(context.application, storage, new_hours)  # type: ignore
+                retime_msg = f"\n🕒 Đã dời TP-by-time cho {updated} vị thế đang mở (deadline = entry + {new_hours:.2f}h)."
+            else:
+                retime_msg = "\n⚠️ Không tìm thấy storage hoặc giá trị TP_TIME_HOURS không hợp lệ (>0)."
+    except Exception as e:
+        retime_msg = f"\n⚠️ Dời TP-by-time lỗi: {e}"
+
     pretty = "\n".join([f"• {k} = {v}" for k, v in kv_to_apply.items()])
-    await msg.reply_html(f"✅ Đã cập nhật ENV (runtime):\n{pretty}")
+    await msg.reply_html(f"✅ Đã cập nhật ENV (runtime):\n{pretty}{retime_msg}")
+
 
 # ========== /setenv_status ==========
 async def setenv_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
