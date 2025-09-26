@@ -1656,6 +1656,17 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Còn hạn → APPROVE như cũ
     ok = mark_done(storage, pid, "APPROVED")
     await update.message.reply_text("✅ Đã APPROVE." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
+	
+	
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    storage = context.application.bot_data["storage"]
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await update.message.reply_text("Cách dùng: /reject <PENDING_ID>")
+        return
+    pid = args[1].strip()
+    ok = mark_done(storage, pid, "REJECTED")
+    await update.message.reply_text("❌ Đã REJECT." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
 
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1962,7 +1973,6 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-
 
 
 
