@@ -320,7 +320,7 @@ PRESETS = {
         "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
         "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
         "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
-        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
 
         # Các ngưỡng HTF mặc định (giữ nguyên như cũ)
         "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
@@ -359,7 +359,7 @@ PRESETS = {
         "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
         "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
         "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
-        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
         
         
         "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
@@ -398,7 +398,7 @@ PRESETS = {
         "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
         "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
         "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
-        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
         
         "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
         "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
@@ -436,7 +436,7 @@ PRESETS = {
         "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
         "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
         "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
-        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.3, # retrace % tối thiểu để entry lần 2
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
         
         "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
         "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
@@ -1900,6 +1900,7 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
+
 
 
 
