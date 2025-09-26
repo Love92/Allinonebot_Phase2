@@ -1565,10 +1565,13 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /close                -> đóng 100% trên tất cả account trong ACCOUNTS_JSON/settings.ACCOUNTS
+    /close                -> đóng 100% trên tất cả account (SINGLE_ACCOUNT + ACCOUNTS/ACCOUNTS_JSON)
     /close 50             -> đóng 50% tất cả account
     /close bingx_test     -> đóng 100% riêng account 'bingx_test'
     /close 25 bingx_test  -> đóng 25% riêng 'bingx_test' (hoặc: /close bingx_test 25)
+
+    Ghi chú:
+    - Khi percent>=100, backend sẽ tự hủy TP/SL và toàn bộ open orders của symbol trước/sau khi close (có thể cấu hình qua ENV).
     """
     from core.trade_executor import close_position_on_account, close_position_on_all
 
@@ -1613,28 +1616,27 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if account:
-            # Đóng riêng 1 account
+            # Đóng riêng 1 account (backend sẽ tìm đúng account theo name/exchange)
             res = await close_position_on_account(account, pair, percent)
             lines = [
                 f"🔧 Close {percent:.0f}% | {pair} | account: <b>{_esc(account)}</b>",
                 f"• {'OK' if res.get('ok') else 'FAIL'} {_esc(res.get('message',''))}"
             ]
             if percent >= 100.0:
-                lines.append("🧹 TP/SL đã hủy.")
+                lines.append("🧹 TP/SL & lệnh chờ đã được xử lý.")
             await msg.reply_text("\n".join(lines), parse_mode="HTML")
         else:
             # Đóng tất cả account
             results = await close_position_on_all(pair, percent)  # list[dict]
             lines = [f"🔧 Close {percent:.0f}% | {pair} | ALL accounts"]
             for r in results or []:
-                # mỗi r thường có 'message' đã bao gồm tên account/chi tiết sàn
                 lines.append(f"• { _esc(r.get('message','')) }")
             if percent >= 100.0:
-                lines.append("🧹 TP/SL đã hủy.")
+                lines.append("🧹 TP/SL & lệnh chờ đã được xử lý.")
             await msg.reply_text("\n".join(lines), parse_mode="HTML")
     except Exception as e:
         await msg.reply_text(f"❌ Lỗi /close: {_esc(str(e))}", parse_mode="HTML")
-    
+   
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
