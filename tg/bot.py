@@ -32,6 +32,9 @@ from core.m5_reporter import m5_report_loop
 # NEW: dùng resolver P1–P4 theo %illum + hướng
 from data.moon_tide import resolve_preset_code
 
+# Áp dụng cho order_new_cmd() gọi (B)+ (C) để kiểm tra hiệu quả
+from core.auto_trade_engine import _auto_execute_hub, _auto_broadcast_and_log, now_vn, TIDE_WINDOW_HOURS
+
 # ================== Global state ==================
 storage = Storage()
 ex = ExchangeClient()
@@ -1244,6 +1247,122 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ /order {side_raw.upper()} | risk={risk_percent:.1f}%, lev=x{leverage}\n"
         f"⏱ Tide window: {tide_label}\n" + "\n".join(results)
     )
+# ================== /order_new_cmd áp dụng logic gọi (B)+ (C)  ==================    
+async def order_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /order <pair> <side> [risk_percent] [leverage]
+    Ví dụ: /order BTC/USDT long 5 20
+    - Mục đích: kiểm chứng (B) _auto_execute_hub và (C) _auto_broadcast_and_log
+    - Không chạy Gate (A). Tạo 'gate bundle' tối thiểu rồi B->C.
+    """
+    storage = context.application.bot_data["storage"]
+    uid = _uid(update)
+
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Cách dùng:\n/order <pair> <side> [risk_percent] [leverage]\nVD: /order BTC/USDT long 5 20"
+        )
+        return
+
+    # ---- Parse args
+    pair_in = parts[1].upper()
+    side_in = parts[2].upper()
+    if side_in not in ("LONG", "SHORT"):
+        await update.message.reply_text("side phải là LONG hoặc SHORT.")
+        return
+
+    try:
+        st = storage.get_user(uid)
+        default_risk = float(getattr(st.settings, "risk_percent", 10.0))
+        default_lev  = int(float(getattr(st.settings, "leverage", 10)))
+        tide_window_hours = float(getattr(st.settings, "tide_window_hours", TIDE_WINDOW_HOURS))
+    except Exception:
+        default_risk = 10.0
+        default_lev  = 10
+        tide_window_hours = TIDE_WINDOW_HOURS
+
+    risk_percent = default_risk
+    leverage = default_lev
+    if len(parts) >= 4:
+        try:
+            risk_percent = float(parts[3])
+        except Exception:
+            pass
+    if len(parts) >= 5:
+        try:
+            leverage = int(float(parts[4]))
+        except Exception:
+            pass
+
+    # ---- Chuẩn hoá pair
+    pair_disp = pair_in if "/" in pair_in else (pair_in[:-4] + "/USDT" if pair_in.endswith("USDT") else f"{pair_in}/USDT")
+    symbol = pair_disp.replace("/", "")
+
+    # ---- Lắp 'gate bundle' tối thiểu cho (B) và (C)
+    now = now_vn()
+    center = now  # với lệnh thủ công, lấy 'tâm' = now để build tide_label/TP-by-time
+    # tính nhãn cửa sổ thủy triều HH:MM (để cooldown/second-entry dùng đúng format)
+    try:
+        start_hhmm = (center - timedelta(hours=tide_window_hours/2)).strftime("%H:%M")
+        end_hhmm   = (center + timedelta(hours=tide_window_hours/2)).strftime("%H:%M")
+        key_win = start_hhmm  # meta 'window' dùng HH:MM (giống engine)
+    except Exception:
+        key_win = "NA"
+
+    # frames/h4/m30/m5f để (C) render preview & entry_spot fallback
+    frames = {"H4": {}, "M30": {}, "M5": {}}
+    h4, m30, m5f = frames["H4"], frames["M30"], frames["M5"]
+
+    # Bundle cần các khóa giống output của (A)
+    gate = {
+        "ok": True,
+        "now": now,
+        "pair_disp": pair_disp,
+        "symbol": symbol,
+        "risk_percent": risk_percent,
+        "leverage": leverage,
+        "mode": "manual",
+        "auto_on": False,
+        "balance_usdt": float(getattr(st.settings, "balance_usdt", 100.0)) if 'st' in locals() else 100.0,
+        "tide_window_hours": tide_window_hours,
+
+        "res": {},
+        "skip_report": False,
+        "desired_side": side_in,
+        "confidence": 0,
+        "text_block": "(manual order)",
+        "frames": frames,
+        "h4": h4, "m30": m30, "m5f": m5f,
+
+        "center": center,
+        "tau": 0.0,
+        "in_late": False,
+        "side_m30": side_in,
+
+        # quota state giả để không đụng guard khác
+        "key_day": now.strftime("%Y-%m-%d"),
+        "key_win": key_win,
+        "st_key": {"trade_count": 0},
+    }
+
+    # ---- Gọi (B) rồi (C)
+    try:
+        result = await _auto_execute_hub(uid, context.application, storage, gate)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi execute hub: {e}")
+        return
+
+    try:
+        final_text = await _auto_broadcast_and_log(uid, context.application, storage, result)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi broadcast/log: {e}")
+        return
+
+    # Phản hồi ngắn cho user (nội dung chi tiết đã broadcast)
+    await update.message.reply_text("✅ Đã thực thi /order (manual) — xem broadcast để biết chi tiết.")
+
 # ================== report_cmd chỉ report  ==================
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1653,6 +1772,7 @@ def build_app():
     app.add_handler(CommandHandler("tidewindow", tidewindow_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("order", order_cmd))
+    app.add_handler(CommandHandler("order", order_new_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("m5report", m5report_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
