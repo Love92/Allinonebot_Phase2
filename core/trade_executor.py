@@ -636,82 +636,168 @@ class ExchangeClient:
 
 
 # ===================== Multi-account /close helpers =====================
+# ==== Helpers: load & match accounts ====
+def _load_all_accounts() -> List[dict]:
+    from config import settings as _S
+    lst: List[dict] = []
+
+    # SINGLE_ACCOUNT (nếu có) + ACCOUNTS (list)
+    try:
+        single = getattr(_S, "SINGLE_ACCOUNT", None)
+        if isinstance(single, dict):
+            lst.append(single)
+    except Exception:
+        pass
+    try:
+        accs = getattr(_S, "ACCOUNTS", [])
+        if isinstance(accs, list):
+            lst.extend([a for a in accs if isinstance(a, dict)])
+    except Exception:
+        pass
+
+    # ENV ACCOUNTS_JSON (nếu có)
+    try:
+        j = os.getenv("ACCOUNTS_JSON", "")
+        if j:
+            arr = json.loads(j)
+            if isinstance(arr, list):
+                lst.extend([a for a in arr if isinstance(a, dict)])
+    except Exception:
+        pass
+
+    # Dedup theo (exchange, api_key)
+    uniq: List[dict] = []
+    seen = set()
+    for a in lst:
+        exid = str(a.get("exchange") or EXCHANGE_ID).lower()
+        key  = a.get("api_key") or API_KEY
+        k = (exid, key)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(a)
+    return uniq
+
+
+def _find_account_by_name_or_exchange(name: str) -> Optional[dict]:
+    if not name:
+        return None
+    name_l = str(name).strip().lower()
+    all_accs = _load_all_accounts()
+
+    # Ưu tiên match theo 'name'
+    for a in all_accs:
+        nm = str(a.get("name", "")).strip().lower()
+        if nm and nm == name_l:
+            return a
+
+    # Fallback: match theo exchange id (e.g. "binance", "bingx")
+    for a in all_accs:
+        ex = str(a.get("exchange") or EXCHANGE_ID).strip().lower()
+        if ex == name_l:
+            return a
+
+    return None
+
 async def close_position_on_account(account_name: str, pair: str, percent: float) -> Dict[str, Any]:
     """
-    Đóng vị thế trên 1 account (map từ ENV/config hiện tại).
-    Return: {"ok": bool, "message": str}
+    Đóng vị thế trên 1 account (theo tên/hoặc exchange).
+    - Tìm account trong SINGLE_ACCOUNT/ACCOUNTS/ACCOUNTS_JSON theo 'name' (ưu tiên) hoặc 'exchange'.
+    - Nếu không thấy -> fallback về ENV default như cũ.
+    - Khi percent >= 100: hủy TP/SL và toàn bộ lệnh chờ của symbol trước/sau khi close để đảm bảo sạch.
+    ENV:
+      - CLOSE_CANCEL_ALL_ON_100=true/false (default: true)
+      - CLOSE_CANCEL_TP_SL_ON_PARTIAL=true/false (default: false)
     """
     try:
-        exid = os.getenv("EXCHANGE_ID", EXCHANGE_ID)
-        api = os.getenv("API_KEY", API_KEY)
-        sec = os.getenv("API_SECRET", API_SECRET)
-        testnet = (os.getenv("TESTNET", "false").strip().lower() in ("1", "true", "yes", "on"))
+        # Chuẩn hoá % và pair
+        pct = max(0.0, min(100.0, float(percent)))
+        sym_pair = pair or "BTC/USDT"
 
-        cli = ExchangeClient(exid, api, sec, testnet)
-        res = await cli.close_percent(pair, percent)
-        return {"ok": bool(res.ok), "message": res.message}
+        # Load config mặc định
+        exid_d = os.getenv("EXCHANGE_ID", EXCHANGE_ID)
+        api_d  = os.getenv("API_KEY", API_KEY)
+        sec_d  = os.getenv("API_SECRET", API_SECRET)
+        tnet_d = (os.getenv("TESTNET", str(TESTNET)).strip().lower() in ("1","true","yes","on"))
+
+        # Tìm account theo tên
+        acc = _find_account_by_name_or_exchange(account_name)
+
+        # Lấy thông tin dùng để tạo client
+        exid = str((acc or {}).get("exchange") or exid_d).lower()
+        api  = (acc or {}).get("api_key")    or api_d
+        sec  = (acc or {}).get("api_secret") or sec_d
+        tnet = bool((acc or {}).get("testnet", tnet_d))
+        disp_name = (acc or {}).get("name", account_name or "default")
+
+        cli = ExchangeClient(exid, api, sec, tnet)
+
+        # Chính sách huỷ lệnh
+        cancel_on_100 = (os.getenv("CLOSE_CANCEL_ALL_ON_100", "true").strip().lower() in ("1","true","yes","on"))
+        cancel_partial_tp_sl = (os.getenv("CLOSE_CANCEL_TP_SL_ON_PARTIAL", "false").strip().lower() in ("1","true","yes","on"))
+
+        cancelled_msgs: List[str] = []
+
+        # Nếu đóng toàn bộ → hủy hết TP/SL + open orders trước
+        if pct >= 99.9 and cancel_on_100:
+            r1 = await cli.cancel_tp_sl_orders(sym_pair)
+            cancelled_msgs.append(r1.message)
+            r2 = await cli.cancel_all_orders_symbol(sym_pair)
+            cancelled_msgs.append(r2.message)
+
+        # Nếu đóng một phần nhưng muốn dọn TP/SL (tuỳ ENV)
+        if 0.0 < pct < 99.9 and cancel_partial_tp_sl:
+            r0 = await cli.cancel_tp_sl_orders(sym_pair)
+            cancelled_msgs.append(r0.message)
+
+        # Thực hiện đóng
+        res = await cli.close_percent(sym_pair, pct)
+
+        # Sau khi đóng toàn bộ, dọn TP/SL lần nữa để chắc chắn
+        if pct >= 99.9 and cancel_on_100:
+            r3 = await cli.cancel_tp_sl_orders(sym_pair)
+            cancelled_msgs.append(r3.message)
+
+        # Tổng hợp thông điệp
+        msg = f"{disp_name} | {exid} → {res.message}"
+        if cancelled_msgs:
+            msg += " | " + " / ".join([m for m in cancelled_msgs if m])
+
+        return {"ok": bool(res.ok), "message": msg}
     except Exception as e:
-        return {"ok": False, "message": f"{e}"}
+        return {"ok": False, "message": f"{account_name or 'default'} | {e}"}
 
 
 async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any]]:
     """
-    Đóng vị thế trên tất cả account (SINGLE_ACCOUNT + ACCOUNTS_JSON).
-    Return: list[{"ok": bool, "message": str}]
+    Đóng vị thế trên tất cả account biết tới (SINGLE_ACCOUNT + ACCOUNTS + ACCOUNTS_JSON).
+    - Tái sử dụng close_position_on_account để đảm bảo cùng chính sách cancel orders.
     """
-    from config import settings as _S
-
     results: List[Dict[str, Any]] = []
+    accs = _load_all_accounts()
 
-    # Lấy danh sách account
-    try:
-        ACCOUNTS = getattr(_S, "ACCOUNTS", [])
-        if not isinstance(ACCOUNTS, list):
-            ACCOUNTS = []
-    except Exception:
-        try:
-            ACCOUNTS = json.loads(os.getenv("ACCOUNTS_JSON", "[]"))
-            if not isinstance(ACCOUNTS, list):
-                ACCOUNTS = []
-        except Exception:
-            ACCOUNTS = []
-
-    SINGLE_ACCOUNT = getattr(_S, "SINGLE_ACCOUNT", None)
-    base = ([SINGLE_ACCOUNT] if SINGLE_ACCOUNT else []) + ACCOUNTS
-
-    uniq: List[dict] = []
-    seen = set()
-    for acc in base:
-        if not isinstance(acc, dict):
-            continue
-        exid = str(acc.get("exchange") or EXCHANGE_ID).lower()
-        key = (exid, acc.get("api_key") or API_KEY)
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(acc)
-
-    # Nếu không có account cấu hình → dùng ENV mặc định
-    if not uniq:
+    # Nếu không có bất kỳ account cấu hình → fallback ENV default (giữ hành vi cũ)
+    if not accs:
         r = await close_position_on_account("default", pair, percent)
         results.append(r)
         return results
 
-    # Đóng trên từng account
-    for acc in uniq:
-        try:
-            exid = str(acc.get("exchange") or EXCHANGE_ID).lower()
-            api = acc.get("api_key") or API_KEY
-            sec = acc.get("api_secret") or API_SECRET
-            testnet = bool(acc.get("testnet", TESTNET))
-            name = acc.get("name", "default")
-            sym = acc.get("pair", pair)
+    # Dedup theo (exchange, api_key)
+    uniq: List[dict] = []
+    seen = set()
+    for a in accs:
+        exid = str(a.get("exchange") or EXCHANGE_ID).lower()
+        key  = a.get("api_key") or API_KEY
+        k = (exid, key)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(a)
 
-            cli = ExchangeClient(exid, api, sec, testnet)
-            res = await cli.close_percent(sym, percent)
-            results.append({"ok": bool(res.ok), "message": f"{name} | {exid} → {res.message}"})
-        except Exception as e:
-            results.append({"ok": False, "message": f"{acc.get('name','?')} | {e}"})
+    for acc in uniq:
+        name = acc.get("name") or acc.get("exchange") or "default"
+        r = await close_position_on_account(name, acc.get("pair", pair or "BTC/USDT"), percent)
+        results.append(r)
 
     return results
 
