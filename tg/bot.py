@@ -284,12 +284,168 @@ def _env_or_runtime(k: str, default: str = "—") -> str:
     return default
 
 # ================== PRESETS (P1–P4 theo Moon — % độ rọi + hướng) ==================
-# (Giữ nguyên nội dung PRESETS của anh)
-# ... [KHÔNG THAY ĐỔI KHỐI PRESETS, giữ nguyên như file anh gửi] ...
+# ================== PRESETS (P1–P4 theo Moon — % độ rọi + hướng) ==================
+# P1: 0–25% (quanh New) | P2: 25–75% & waxing | P3: 75–100% (quanh Full) | P4: 25–75% & waning
+# Theo yêu cầu: P1=P3 (trend + Sonic on + late-only 0.5~2.5h, tide 2.5h, TP 5.5h)
+#               P2=P4 (Sonic off; các tham số còn lại giống nhau trong cặp)
+PRESETS = {
+    # P1 — 0–25%: quanh New — Waning Crescent ↔ New ↔ Waxing Crescent
+    # Trend/tiếp diễn + vào muộn để an toàn
+    "P1": {
+        "SONIC_MODE": "weight", "SONIC_WEIGHT": 1.0,
+
+        # Entry timing (thủy triều)
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,
+        # TP theo thời gian (rút ngắn)
+        "TP_TIME_HOURS": 5.5,
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+		# Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
 
 
-# (Nguyên khối PRESETS của anh giữ nguyên – em không lặp lại để tránh rối.)
+        # M5 gate (giữ logic mặc định, có thể vặn thêm bằng /setenv khi cần)
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
 
+        # Các ngưỡng HTF mặc định (giữ nguyên như cũ)
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+
+    # P2 — 25–75% & waxing: Waxing Crescent ↔ First Quarter ↔ Waxing Gibbous
+    # Momentum/breakout — không ép late-only, Sonic OFF theo yêu cầu
+    "P2": {
+        "SONIC_MODE": "off",
+
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,     # để đồng bộ định dạng; không dùng nếu ONLY=false
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,       # cho thống nhất cặp P2=P4
+        "TP_TIME_HOURS": 5.5,           # cho thống nhất cặp P2=P4
+        
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center    
+	    # Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
+
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
+        
+        
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+
+    # P3 — 75–100%: Waxing Gibbous ↔ Full ↔ Waning Gibbous
+    # Theo yêu cầu: giống P1 (trend + Sonic on + late-only 0.5~2.5h)
+    "P3": {
+        "SONIC_MODE": "weight", "SONIC_WEIGHT": 1.0,
+
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,
+        "TP_TIME_HOURS": 5.5,
+        
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+		# Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
+
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
+        
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+
+    # P4 — 25–75% & waning: Waning Gibbous ↔ Last Quarter ↔ Waning Crescent
+    # Theo yêu cầu: giống P2 (Sonic OFF; không ép late-only)
+    "P4": {
+        "SONIC_MODE": "off",
+
+        "ENTRY_LATE_PREF": False,
+        "ENTRY_LATE_ONLY": True,
+        "ENTRY_LATE_FROM_HRS": 0.5,
+        "ENTRY_LATE_TO_HRS": 2.5,
+        "TIDE_WINDOW_HOURS": 2.5,
+        "TP_TIME_HOURS": 5.5,
+        
+        # NEW — guard lật hướng M30 quanh mốc thủy triều
+        "M30_FLIP_GUARD": True,
+        "M30_STABLE_MIN_SEC": 1800, # after 30min tide center
+		# Extreme guard defaults
+        "EXTREME_BLOCK_ON": True,
+        "EXTREME_RSI_OB": 70.0,
+        "EXTREME_RSI_OS": 30.0,
+        "EXTREME_STOCH_OB": 90.0,
+        "EXTREME_STOCH_OS": 10.0,
+
+        "M5_STRICT": False, "M5_RELAX_KIND": "either",
+        "M5_WICK_PCT": 0.50,
+        "M5_VOL_MULT_RELAX": 1.00, "M5_VOL_MULT_STRICT": 1.10,
+        "M5_REQUIRE_ZONE_STRICT": True,
+        "M5_LOOKBACK_RELAX": 3, "M5_RELAX_NEED_CURRENT": False,
+        "M5_LOOKBACK_STRICT": 6, "ENTRY_SEQ_WINDOW_MIN": 30,
+        # M5 entry spacing / second entry
+        "M5_MIN_GAP_MIN": 15, # khoảng cách tối thiểu giữa 2 entry M5 (phút)
+        "M5_GAP_SCOPED_TO_WINDOW": True, # true → reset gap theo từng tide window
+        "ALLOW_SECOND_ENTRY": True,      # cho phép vào entry thứ 2 nếu đủ điều kiện
+        "M5_SECOND_ENTRY_MIN_RETRACE_PCT": 0.1, # retrace % tối thiểu để entry lần 2
+        
+        "RSI_OB": 65, "RSI_OS": 35, "DELTA_RSI30_MIN": 10,
+        "SIZE_MULT_STRONG": 1.0, "SIZE_MULT_MID": 0.7, "SIZE_MULT_CT": 0.4,
+    },
+}
 
 async def _apply_preset_and_reply(update: Update, preset_name: str, header: str = ""):
     preset = PRESETS[preset_name]
@@ -1427,8 +1583,7 @@ def build_app():
 
     return app
 
-
-# ===== Auto preset helpers ==========================
+# ===== Auto preset helpers (map P1..P4 theo Moon API) ==========================
 def _preset_mode() -> str:
     return (os.getenv("PRESET_MODE", "auto") or "auto").upper()
 
@@ -1436,8 +1591,10 @@ def _apply_preset_code_runtime(pcode: str) -> bool:
     preset = PRESETS.get(pcode)
     if not preset:
         return False
+    # 1) Ghi ENV
     for k, v in preset.items():
         os.environ[k] = _bool_str(v) if isinstance(v, bool) else str(v)
+    # 2) Bơm runtime sang auto_trade_engine nếu có
     applied = False
     try:
         from core import auto_trade_engine as ae
@@ -1467,6 +1624,7 @@ async def _apply_auto_preset_now(app=None, silent: bool = True):
     ok = _apply_preset_code_runtime(pcode)
     if (not silent) and app:
         try:
+            # Ưu tiên AUTO_DEBUG_CHAT_ID nếu là số; fallback dùng TELEGRAM_BROADCAST_CHAT_ID
             raw = os.getenv("AUTO_DEBUG_CHAT_ID", "")
             if raw.isdigit():
                 chat_id = int(raw)
@@ -1485,6 +1643,7 @@ async def _apply_auto_preset_now(app=None, silent: bool = True):
             except Exception:
                 pass
 
+
 async def _auto_preset_daemon(app: Application):
     """Mỗi ngày 00:05 JST: nếu PRESET_MODE=AUTO thì tự đổi preset theo Moon mới."""
     await asyncio.sleep(1)
@@ -1497,4 +1656,3 @@ async def _auto_preset_daemon(app: Application):
         await asyncio.sleep(sleep_s)
         if _preset_mode() == "AUTO":
             await _apply_auto_preset_now(app, silent=True)
-# ----------------------- /tg/bot.py -----------------------
