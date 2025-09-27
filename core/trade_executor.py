@@ -165,6 +165,9 @@ class ExchangeClient:
         self.client = ex_class(params)
         self._markets_loaded = False
 
+        # [ADD] trạng thái Position Mode cho Binance (hedge|oneway|None)
+        self._binance_position_mode: Optional[str] = None
+
     # ---------- markets/symbol ----------
     async def _ensure_markets(self):
         if not self._markets_loaded:
@@ -189,6 +192,35 @@ class ExchangeClient:
     # ---------- async I/O helper ----------
     async def _io(self, func, *args, **kwargs):
         return await _to_thread(func, *args, **kwargs)
+
+    # ---------- [ADD] Detect Binance position mode ----------
+    async def _detect_binance_position_mode(self) -> str:
+        """
+        Trả về 'hedge' hoặc 'oneway' cho Binance USDⓈ-M.
+        Có thể override bằng ENV POSITION_MODE_OVERRIDE=hedge|oneway.
+        Nếu không phải binanceusdm → mặc định 'oneway'.
+        """
+        override = (os.getenv("POSITION_MODE_OVERRIDE") or "").strip().lower()
+        if override in ("hedge", "oneway"):
+            self._binance_position_mode = override
+            return override
+
+        if self.exchange_id != "binanceusdm":
+            self._binance_position_mode = "oneway"
+            return "oneway"
+
+        try:
+            # ccxt raw endpoint: GET /fapi/v1/positionSide/dual
+            # nhiều phiên bản ccxt dùng tên: fapiPrivate_get_positionside_dual
+            resp = await self._io(self.client.fapiPrivate_get_positionside_dual)
+            dual = (resp or {}).get("dualSidePosition")
+            mode = "hedge" if str(dual).lower() in ("true", "1") else "oneway"
+            self._binance_position_mode = mode
+            return mode
+        except Exception:
+            # nếu lỗi API, an toàn coi là oneway
+            self._binance_position_mode = "oneway"
+            return "oneway"
 
     # ---------- common helpers ----------
     @staticmethod
@@ -295,9 +327,10 @@ class ExchangeClient:
         meta = {"min_qty": min_qty, "max_qty": max_qty, "step": step, "min_cost": min_cost, "max_cost": max_cost}
         return (float(q), meta)
 
-    async def _place_market_with_retries(self, sym: str, side: str, qty: float, *, max_retries: int = 3):
+    async def _place_market_with_retries(self, sym: str, side: str, qty: float, *, params: Optional[dict] = None, max_retries: int = 3):
         """
         Tạo lệnh market; nếu lỗi do limit → giảm size (0.7×) và thử lại.
+        [MODIFIED] Bổ sung truyền params (vd: positionSide cho Binance hedge).
         """
         attempt = 0
         last_err: Optional[Exception] = None
@@ -306,7 +339,7 @@ class ExchangeClient:
 
         while attempt <= max_retries:
             try:
-                return await self._io(self.client.create_order, sym, "market", side, q)
+                return await self._io(self.client.create_order, sym, "market", side, q, None, params or {})
             except Exception as e:
                 last_err = e
                 if not self._should_shrink_on_error(e):
@@ -503,6 +536,7 @@ class ExchangeClient:
     ) -> OrderResult:
         """
         Vào lệnh thị trường (side = LONG/SHORT). Tự fit qty + đặt SL reduceOnly nếu truyền.
+        [MODIFIED] Tự phát hiện Hedge Mode của Binance & gắn positionSide phù hợp.
         """
         try:
             sym = self.normalize_symbol(symbol)
@@ -523,7 +557,13 @@ class ExchangeClient:
             if q_fit <= 0:
                 return OrderResult(False, f"Order failed: qty_fit=0 (limits={meta})")
 
-            entry = await self._place_market_with_retries(sym, order_side, q_fit)
+            # [ADD] Detect Binance mode & build params for entry
+            params_entry: Dict[str, Any] = {}
+            mode = self._binance_position_mode or await self._detect_binance_position_mode()
+            if mode == "hedge" and self.exchange_id == "binanceusdm":
+                params_entry["positionSide"] = "LONG" if s == "LONG" else "SHORT"
+
+            entry = await self._place_market_with_retries(sym, order_side, q_fit, params=params_entry)
 
             # SL (reduceOnly)
             if stop_loss is not None:
@@ -531,6 +571,9 @@ class ExchangeClient:
                 params = {"reduceOnly": True, "stopPrice": float(stop_loss)}
                 if self.exchange_id == "okx":
                     params["slTriggerPx"] = float(stop_loss)
+                # [ADD] giữ đúng side khi hedge
+                if mode == "hedge" and self.exchange_id == "binanceusdm":
+                    params["positionSide"] = "LONG" if s == "LONG" else "SHORT"
                 try:
                     await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
                 except Exception as e:
@@ -551,6 +594,7 @@ class ExchangeClient:
         """
         Lệnh market + gắn SL/TP reduceOnly (nếu sàn hỗ trợ).
         'side_long' được chuẩn hoá: bool/str/int/float đều OK.
+        [MODIFIED] Hỗ trợ Binance Hedge Mode với positionSide cho entry & SL/TP.
         """
         try:
             sym = self.normalize_symbol(symbol)
@@ -567,8 +611,14 @@ class ExchangeClient:
             if q_fit <= 0:
                 return OrderResult(False, f"entry_error: qty_fit=0 (limits={meta})")
 
+            # [ADD] Detect Binance mode & build entry params
+            params_entry: Dict[str, Any] = {}
+            mode = self._binance_position_mode or await self._detect_binance_position_mode()
+            if mode == "hedge" and self.exchange_id == "binanceusdm":
+                params_entry["positionSide"] = "LONG" if is_long else "SHORT"
+
             # Vào lệnh
-            entry = await self._place_market_with_retries(sym, side, q_fit)
+            entry = await self._place_market_with_retries(sym, side, q_fit, params=params_entry)
 
             # Đặt SL/TP reduceOnly
             opp = "sell" if side == "buy" else "buy"
@@ -579,6 +629,8 @@ class ExchangeClient:
                     params = {"reduceOnly": True, "stopPrice": sp}
                     if self.exchange_id == "okx":
                         params["slTriggerPx"] = sp
+                    if mode == "hedge" and self.exchange_id == "binanceusdm":
+                        params["positionSide"] = "LONG" if is_long else "SHORT"
                     await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
                 except Exception as e:
                     logging.warning("Create SL order failed: %s", e)
@@ -587,6 +639,8 @@ class ExchangeClient:
                 try:
                     tp = float(tp_price)
                     params = {"reduceOnly": True, "stopPrice": tp}
+                    if mode == "hedge" and self.exchange_id == "binanceusdm":
+                        params["positionSide"] = "LONG" if is_long else "SHORT"
                     tptype = "take_profit_market"  # vài sàn map nội bộ sang stop_market
                     await self._io(self.client.create_order, sym, tptype, opp, q_fit, None, params)
                 except Exception as e:
@@ -605,6 +659,7 @@ class ExchangeClient:
         """
         Đóng percent% vị thế hiện có (reduceOnly).
         100% → close toàn bộ. Tự co size nếu vướng hạn mức.
+        GHI CHÚ: Ở Hedge Mode, hàm này đóng theo vị thế “net/được ccxt trả về”.
         """
         try:
             pct = max(0.0, min(100.0, float(percent)))
