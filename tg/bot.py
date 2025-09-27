@@ -17,7 +17,7 @@ from config.settings import (
 from tg.admin_bot import enforce_admin_for_all_commands # quản lý quyền botallinone
 from utils.storage import Storage
 from utils.time_utils import now_vn, TOKYO_TZ
-from strategy.signal_generator import evaluate_signal, tide_window_now
+from strategy.signal_generator import evaluate_signal
 from strategy.m5_strategy import m5_snapshot, m5_entry_check
 from core.trade_executor import ExchangeClient, calc_qty, auto_sl_by_leverage
 from core.trade_executor import close_position_on_all, close_position_on_account # ==== /close (đa tài khoản: Binance/BingX/...) ====
@@ -42,29 +42,6 @@ from core.tide_gate import TideGateConfig, tide_gate_check, bump_counters_after_
 # ================== Global state ==================
 storage = Storage()
 ex = ExchangeClient()
-
-# ==== QUOTA helpers: 2 lệnh / cửa sổ thủy triều, 8 lệnh / ngày (gộp mọi mode) ====
-# (Giữ cho /order legacy; /ordernew đã dùng TideGate.)
-def _quota_precheck_and_label(st):
-    now = now_vn()
-    twin = tide_window_now(now, hours=float(st.settings.tide_window_hours))
-    if not twin:
-        return False, "⏳ Ngoài khung thủy triều.", None, None, 0
-    start, end = twin
-    tide_label = f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
-    tkey = (start + (end - start) / 2).strftime("%Y-%m-%d %H:%M")
-    used = int(st.tide_window_trades.get(tkey, 0))
-    if st.today.count >= st.settings.max_orders_per_day:
-        return False, f"🚫 Vượt giới hạn ngày ({st.settings.max_orders_per_day}).", tide_label, tkey, used
-    if used >= st.settings.max_orders_per_tide_window:
-        return False, f"🚫 Cửa sổ thủy triều hiện tại đã đủ {used}/{st.settings.max_orders_per_tide_window} lệnh.", tide_label, tkey, used
-    return True, "", tide_label, tkey, used
-
-def _quota_commit(st, tkey, used, uid):
-    st.today.count += 1
-    st.tide_window_trades[tkey] = used + 1
-    storage.put_user(uid, st)
-
 
 # ================== Helpers ==================
 def _beautify_report(s: str) -> str:
@@ -502,7 +479,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 <b>Mode giao dịch:</b>\n"
         "• <code>/mode auto</code> — Bot tự động vào lệnh khi đủ điều kiện.\n"
         "• <code>/mode manual</code> — Bot chỉ báo tín hiệu, cần /approve hoặc /reject mới vào lệnh.\n"
-        "• <code>/order</code> — Vào lệnh thủ công ngay (theo %risk/leverage).\n\n"
+        "• <code>/ordernew</code> — Vào lệnh thủ công theo %risk/leverage (qua TideGate).\n\n"
         "📌 <b>Đóng lệnh (/close):</b>\n"
         "• <code>/close</code> hoặc <code>/close 100</code> — Đóng toàn bộ & hủy TP/SL.\n"
         "• <code>/close 50</code> — Đóng 50% tất cả account.\n"
@@ -875,7 +852,7 @@ async def setenv_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"MODE = {st.settings.mode}",
         f"RISK_PERCENT = {st.settings.risk_percent}",
         f"LEVERAGE = x{st.settings.leverage}",
-        f"TIDE_WINDOW_HOURS = {st.settings.tide_window_hourse if hasattr(st.settings,'tide_window_hourse') else st.settings.tide_window_hours}",
+        f"TIDE_WINDOW_HOURS = {getattr(st.settings, 'tide_window_hours', '—')}",
         f"MAX_ORDERS_PER_DAY = {os.getenv('MAX_ORDERS_PER_DAY','8')}",
         f"MAX_ORDERS_PER_TIDE_WINDOW = {os.getenv('MAX_ORDERS_PER_TIDE_WINDOW','2')}",
         f"M5_REPORT_ENABLED = {st.settings.m5_report_enabled}",
