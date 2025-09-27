@@ -1,9 +1,12 @@
 # ----------------------- core/trade_executor.py -----------------------
 from __future__ import annotations
-import asyncio, logging, math, os, json
+import asyncio
+import logging
+import math
+import os
+import json
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict, Any
-from typing import Literal
+from typing import Optional, Tuple, List, Dict, Any, Literal
 from datetime import timedelta, datetime
 
 from dotenv import load_dotenv
@@ -77,7 +80,7 @@ def auto_sl_by_leverage(entry: float, side: str, lev: int, rr_mult: float | None
         tp = entry - rr_mult * dist
     return sl, tp
 
-# ===== Strict casting helpers (avoid side/float glitches) =====
+
 def _force_is_long(side) -> bool:
     """
     Chuẩn hoá hướng vào lệnh thành bool:
@@ -117,14 +120,13 @@ class ExchangeClient:
     - Tự co size & retry khi vướng hạn mức
     """
 
-    # ---------- init ----------
     def __init__(
         self,
         exchange_id: Optional[str] = None,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         testnet: Optional[bool] = None,
-        **kwargs: Any,  # giữ tương thích nơi khác có thể truyền account_name=...
+        **kwargs: Any,
     ):
         self.exchange_id = (exchange_id or EXCHANGE_ID).lower()
         self.api_key = api_key or API_KEY
@@ -165,7 +167,7 @@ class ExchangeClient:
         self.client = ex_class(params)
         self._markets_loaded = False
 
-        # [ADD] trạng thái Position Mode cho Binance (hedge|oneway|None)
+        # trạng thái Position Mode cho Binance (hedge|oneway|None)
         self._binance_position_mode: Optional[str] = None
 
     # ---------- markets/symbol ----------
@@ -193,7 +195,7 @@ class ExchangeClient:
     async def _io(self, func, *args, **kwargs):
         return await _to_thread(func, *args, **kwargs)
 
-    # ---------- [ADD] Detect Binance position mode ----------
+    # ---------- Detect Binance position mode ----------
     async def _detect_binance_position_mode(self) -> str:
         """
         Trả về 'hedge' hoặc 'oneway' cho Binance USDⓈ-M.
@@ -209,7 +211,6 @@ class ExchangeClient:
             self._binance_position_mode = "oneway"
             return "oneway"
 
-        # thử nhiều tên raw method để tránh khác biệt phiên bản ccxt
         try_methods = [
             "fapiPrivate_get_positionside_dual",
             "fapiPrivateGetPositionSideDual",
@@ -225,7 +226,6 @@ class ExchangeClient:
             except Exception:
                 continue
 
-        # nếu lỗi API, an toàn coi là oneway
         self._binance_position_mode = "oneway"
         return "oneway"
 
@@ -251,13 +251,6 @@ class ExchangeClient:
 
     @staticmethod
     def _as_side_long(v) -> bool:
-        """
-        Chuẩn hoá hướng:
-        - bool: giữ nguyên
-        - int/float: >0 → LONG, <=0 → SHORT
-        - str: long/buy/true/1/+1/y → LONG; short/sell/false/0/-1/n → SHORT
-        - mặc định False (SHORT) nếu không nhận diện được
-        """
         try:
             if isinstance(v, bool):
                 return v
@@ -272,7 +265,6 @@ class ExchangeClient:
             pass
         return False
 
-    # Helper: nhận diện -4061
     @staticmethod
     def _is_pos_side_mismatch(err: Exception) -> bool:
         s = str(err).lower()
@@ -302,7 +294,6 @@ class ExchangeClient:
         min_cost = cost.get("min", min_cost)
         max_cost = cost.get("max", max_cost)
 
-        # raw filters (Binance…)
         try:
             for f in info.get("filters", []):
                 t = f.get("filterType")
@@ -338,8 +329,51 @@ class ExchangeClient:
             q = float(min_qty or lot_step)
 
         meta = {"min_qty": min_qty, "max_qty": max_qty, "step": step, "min_cost": min_cost, "max_cost": max_cost}
-        return (float(q), meta)
+        return float(q), meta
 
+    # ---------- fit stopPrice theo tickSize ----------
+    def _fit_stop_price(self, symbol: str, price: float, *, favor: str | None = None) -> float:
+        """
+        Chuẩn hoá stopPrice theo tickSize của market (Binance rất nghiêm).
+        favor: "down" (floor), "up" (ceil), None (round).
+        """
+        try:
+            mkt = self.client.market(self.normalize_symbol(symbol))
+            info = mkt.get("info", {}) if isinstance(mkt, dict) else {}
+            precision = mkt.get("precision", {}) if isinstance(mkt, dict) else {}
+            tick = None
+
+            for f in (info.get("filters") or []):
+                if f.get("filterType") == "PRICE_FILTER":
+                    ts = f.get("tickSize")
+                    if ts:
+                        try:
+                            tick = float(ts)
+                        except Exception:
+                            pass
+                    break
+
+            if not tick:
+                p = precision.get("price")
+                if isinstance(p, int) and p >= 0:
+                    tick = 10 ** (-p)
+
+            px = float(price)
+            if not tick or tick <= 0:
+                return px
+
+            q = px / tick
+            if favor == "down":
+                q = math.floor(q)
+            elif favor == "up":
+                q = math.ceil(q)
+            else:
+                q = round(q)
+            return float(q * tick)
+        except Exception:
+            return float(price)
+
+    # ---------- place market with retries ----------
     async def _place_market_with_retries(self, sym: str, side: str, qty: float, *, params: Optional[dict] = None, max_retries: int = 3):
         """
         Tạo lệnh market; nếu lỗi do limit → giảm size (0.7×) và thử lại.
@@ -369,6 +403,7 @@ class ExchangeClient:
                 await self._io(self.client.set_leverage, int(lev), sym)
         except Exception as e:
             logging.warning("set_leverage failed: %s", e)
+
     async def ticker_price(self, symbol: str) -> float:
         """
         Lấy giá gần nhất cho futures/swap (đã robust cho Binance USDM):
@@ -382,7 +417,6 @@ class ExchangeClient:
             await self._ensure_markets()
             sym = self.normalize_symbol(symbol)
 
-            # 1) fetch_ticker
             try:
                 t = await self._io(self.client.fetch_ticker, sym)
                 p = t.get("last") or t.get("close")
@@ -393,7 +427,6 @@ class ExchangeClient:
             except Exception:
                 pass
 
-            # 2) fetch_ohlcv 1m
             try:
                 ohlcv = await self._io(self.client.fetch_ohlcv, sym, timeframe="1m", limit=1)
                 if ohlcv and len(ohlcv) > 0:
@@ -403,22 +436,17 @@ class ExchangeClient:
             except Exception:
                 pass
 
-            # 3) Binance USDM: lấy markPrice (premium index)
             if self.exchange_id == "binanceusdm":
                 try:
-                    # Lấy market id (BTC/USDT -> BTCUSDT) nếu có
                     mkt = self.client.market(sym)
                     sym_id = (mkt.get("id") or "").upper() if isinstance(mkt, dict) else ""
                     if not sym_id:
-                        # rơi vào trường hợp map lỗi, cố đoán nhanh
                         sym_id = symbol.upper().replace("/", "")
                         if sym_id.endswith(":USDT"):
                             sym_id = sym_id.replace(":USDT", "")
-                    # raw API ccxt (tuỳ phiên bản hàm có thể là camelCase)
                     fn = getattr(self.client, "fapiPublic_get_premiumindex", None) or getattr(self.client, "fapiPublicGetPremiumIndex", None)
                     if callable(fn):
                         data = await self._io(fn, {"symbol": sym_id})
-                        # API trả list hoặc object tuỳ query; xử lý cả hai
                         obj = data[0] if isinstance(data, list) and data else data
                         mp = float((obj or {}).get("markPrice") or 0.0)
                         if mp > 0:
@@ -426,7 +454,6 @@ class ExchangeClient:
                 except Exception:
                     pass
 
-            # 4) fetch_order_book: lấy mid price
             try:
                 ob = await self._io(self.client.fetch_order_book, sym, limit=5)
                 bid = float(ob["bids"][0][0]) if ob.get("bids") else 0.0
@@ -440,9 +467,6 @@ class ExchangeClient:
         except Exception:
             pass
         return 0.0
-
-
-
 
     async def balance_usdt(self) -> float:
         """
@@ -554,7 +578,6 @@ class ExchangeClient:
         try:
             sym = self.normalize_symbol(symbol)
             fn = getattr(self.client, "cancel_all_orders", None) or getattr(self.client, "cancelAllOrders", None)
-        # noqa: E722
             if callable(fn):
                 try:
                     await self._io(fn, sym)
@@ -589,6 +612,8 @@ class ExchangeClient:
         Vào lệnh thị trường (side = LONG/SHORT). Tự fit qty + đặt SL reduceOnly nếu truyền.
         [MODIFIED] Tự phát hiện Hedge Mode của Binance & gắn positionSide phù hợp.
         [NEW]     Nếu gặp -4061 → tự động chuyển chế độ cache (hedge↔oneway) và retry.
+        [NEW]     Fit stopPrice theo tickSize + set workingType (MARK_PRICE/CONTRACT_PRICE) cho Binance,
+                  và retry 1 lần với workingType còn lại nếu bị từ chối.
         """
         try:
             sym = self.normalize_symbol(symbol)
@@ -609,22 +634,21 @@ class ExchangeClient:
             if q_fit <= 0:
                 return OrderResult(False, f"Order failed: qty_fit=0 (limits={meta})")
 
-            # [ADD] Detect Binance mode & build params for entry
+            # Detect mode & build params for entry
             params_entry: Dict[str, Any] = {}
             mode = self._binance_position_mode or await self._detect_binance_position_mode()
             if mode == "hedge" and self.exchange_id == "binanceusdm":
                 params_entry["positionSide"] = "LONG" if s == "LONG" else "SHORT"
 
-            # ENTRY (with adaptive retry on -4061)
+            # ENTRY (adaptive retry -4061)
             try:
                 entry = await self._place_market_with_retries(sym, order_side, q_fit, params=params_entry)
             except Exception as e:
                 if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
-                    # Flip mode & retry
-                    if "positionSide" in params_entry:  # đang nghĩ là hedge nhưng thực tế one-way
+                    if "positionSide" in params_entry:
                         self._binance_position_mode = "oneway"
                         entry = await self._place_market_with_retries(sym, order_side, q_fit, params={})
-                    else:  # đang nghĩ là oneway nhưng thực tế hedge
+                    else:
                         self._binance_position_mode = "hedge"
                         params_retry = {"positionSide": "LONG" if s == "LONG" else "SHORT"}
                         entry = await self._place_market_with_retries(sym, order_side, q_fit, params=params_retry)
@@ -634,11 +658,23 @@ class ExchangeClient:
             # SL (reduceOnly)
             if stop_loss is not None:
                 opp = "sell" if order_side == "buy" else "buy"
-                params = {"reduceOnly": True, "stopPrice": float(stop_loss)}
-                if self.exchange_id == "okx":
-                    params["slTriggerPx"] = float(stop_loss)
 
-                # gắn positionSide nếu cache hiện tại là hedge
+                # LONG → SL < entry ⇒ floor; SHORT → SL > entry ⇒ ceil
+                raw_sp = float(stop_loss)
+                favor = "down" if s == "LONG" else "up"
+                sp = self._fit_stop_price(sym, raw_sp, favor=favor)
+
+                params = {"reduceOnly": True, "stopPrice": sp}
+
+                if self.exchange_id == "okx":
+                    params["slTriggerPx"] = sp
+
+                if self.exchange_id == "binanceusdm":
+                    wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
+                    if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
+                        wt = "MARK_PRICE"
+                    params["workingType"] = wt
+
                 mode_now = self._binance_position_mode or mode
                 if mode_now == "hedge" and self.exchange_id == "binanceusdm":
                     params["positionSide"] = "LONG" if s == "LONG" else "SHORT"
@@ -646,20 +682,35 @@ class ExchangeClient:
                 try:
                     await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
                 except Exception as e:
-                    # nếu mismatch, thử bỏ/hoặc thêm positionSide theo chiều ngược lại của cache
                     if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
                         try:
                             if "positionSide" in params:
-                                params2 = {"reduceOnly": True, "stopPrice": float(stop_loss)}
+                                params2 = {"reduceOnly": True, "stopPrice": sp}
                                 if self.exchange_id == "okx":
-                                    params2["slTriggerPx"] = float(stop_loss)
+                                    params2["slTriggerPx"] = sp
+                                if "workingType" in params:
+                                    params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                             else:
-                                params2 = {"reduceOnly": True, "stopPrice": float(stop_loss),
-                                           "positionSide": "LONG" if s == "LONG" else "SHORT"}
+                                params2 = {
+                                    "reduceOnly": True,
+                                    "stopPrice": sp,
+                                    "positionSide": "LONG" if s == "LONG" else "SHORT",
+                                }
+                                if self.exchange_id == "okx":
+                                    params2["slTriggerPx"] = sp
+                                if "workingType" in params:
+                                    params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                         except Exception as _:
                             logging.warning("Create SL order failed after retry: %s", e)
+                    elif self.exchange_id == "binanceusdm" and "workingType" in params:
+                        try:
+                            params_alt = dict(params)
+                            params_alt["workingType"] = "CONTRACT_PRICE" if params["workingType"] == "MARK_PRICE" else "MARK_PRICE"
+                            await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params_alt)
+                        except Exception:
+                            logging.warning("Create SL order failed: %s", e)
                     else:
                         logging.warning("Create SL order failed: %s", e)
 
@@ -680,29 +731,26 @@ class ExchangeClient:
         'side_long' được chuẩn hoá: bool/str/int/float đều OK.
         [MODIFIED] Hỗ trợ Binance Hedge Mode với positionSide cho entry & SL/TP.
         [NEW]     Nếu gặp -4061 → tự động chuyển chế độ cache (hedge↔oneway) và retry.
+        [NEW]     Fit stopPrice theo tickSize + set workingType (MARK_PRICE/CONTRACT_PRICE) cho Binance,
+                  và retry 1 lần với kiểu còn lại nếu sàn từ chối.
         """
         try:
             sym = self.normalize_symbol(symbol)
 
-            # Chuẩn hoá hướng
             is_long = self._as_side_long(side_long)
             side = "buy" if is_long else "sell"
 
-            # Giá hiện tại để fit notional/limits
             px = await self.ticker_price(sym)
 
-            # Fit qty theo limits
             q_fit, meta = await self._fit_qty(sym, float(qty), float(px or 0))
             if q_fit <= 0:
                 return OrderResult(False, f"entry_error: qty_fit=0 (limits={meta})")
 
-            # [ADD] Detect Binance mode & build entry params
             params_entry: Dict[str, Any] = {}
             mode = self._binance_position_mode or await self._detect_binance_position_mode()
             if mode == "hedge" and self.exchange_id == "binanceusdm":
                 params_entry["positionSide"] = "LONG" if is_long else "SHORT"
 
-            # ENTRY (adaptive retry)
             try:
                 entry = await self._place_market_with_retries(sym, side, q_fit, params=params_entry)
             except Exception as e:
@@ -717,57 +765,113 @@ class ExchangeClient:
                 else:
                     raise
 
-            # Đặt SL/TP reduceOnly
             opp = "sell" if side == "buy" else "buy"
 
+            # ----- Stop Loss -----
             if sl_price is not None:
                 try:
-                    sp = float(sl_price)
+                    raw_sp = float(sl_price)
+                    favor_sl = "down" if is_long else "up"
+                    sp = self._fit_stop_price(sym, raw_sp, favor=favor_sl)
+
                     params = {"reduceOnly": True, "stopPrice": sp}
+
                     if self.exchange_id == "okx":
                         params["slTriggerPx"] = sp
+
+                    if self.exchange_id == "binanceusdm":
+                        wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
+                        if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
+                            wt = "MARK_PRICE"
+                        params["workingType"] = wt
+
                     mode_now = self._binance_position_mode or mode
                     if mode_now == "hedge" and self.exchange_id == "binanceusdm":
                         params["positionSide"] = "LONG" if is_long else "SHORT"
+
                     await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
+
                 except Exception as e:
                     if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
                         try:
                             if "positionSide" in params:
-                                params2 = {"reduceOnly": True, "stopPrice": float(sp)}
+                                params2 = {"reduceOnly": True, "stopPrice": sp}
                                 if self.exchange_id == "okx":
-                                    params2["slTriggerPx"] = float(sp)
+                                    params2["slTriggerPx"] = sp
+                                if "workingType" in params:
+                                    params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                             else:
-                                params2 = {"reduceOnly": True, "stopPrice": float(sp),
-                                           "positionSide": "LONG" if is_long else "SHORT"}
+                                params2 = {
+                                    "reduceOnly": True,
+                                    "stopPrice": sp,
+                                    "positionSide": "LONG" if is_long else "SHORT",
+                                }
+                                if self.exchange_id == "okx":
+                                    params2["slTriggerPx"] = sp
+                                if "workingType" in params:
+                                    params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                         except Exception as _:
                             logging.warning("Create SL order failed after retry: %s", e)
+                    elif self.exchange_id == "binanceusdm" and "workingType" in params:
+                        try:
+                            params_alt = dict(params)
+                            params_alt["workingType"] = "CONTRACT_PRICE" if params["workingType"] == "MARK_PRICE" else "MARK_PRICE"
+                            await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params_alt)
+                        except Exception:
+                            logging.warning("Create SL order failed: %s", e)
                     else:
                         logging.warning("Create SL order failed: %s", e)
 
+            # ----- Take Profit -----
             if tp_price is not None:
                 try:
-                    tp = float(tp_price)
+                    raw_tp = float(tp_price)
+                    favor_tp = "up" if is_long else "down"
+                    tp = self._fit_stop_price(sym, raw_tp, favor=favor_tp)
+
                     params = {"reduceOnly": True, "stopPrice": tp}
+
+                    if self.exchange_id == "binanceusdm":
+                        wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
+                        if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
+                            wt = "MARK_PRICE"
+                        params["workingType"] = wt
+
                     mode_now = self._binance_position_mode or mode
                     if mode_now == "hedge" and self.exchange_id == "binanceusdm":
                         params["positionSide"] = "LONG" if is_long else "SHORT"
+
                     tptype = "take_profit_market"
                     await self._io(self.client.create_order, sym, tptype, opp, q_fit, None, params)
+
                 except Exception as e:
                     if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
                         try:
                             if "positionSide" in params:
-                                params2 = {"reduceOnly": True, "stopPrice": float(tp)}
+                                params2 = {"reduceOnly": True, "stopPrice": tp}
+                                if "workingType" in params:
+                                    params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params2)
                             else:
-                                params2 = {"reduceOnly": True, "stopPrice": float(tp),
-                                           "positionSide": "LONG" if is_long else "SHORT"}
+                                params2 = {
+                                    "reduceOnly": True,
+                                    "stopPrice": tp,
+                                    "positionSide": "LONG" if is_long else "SHORT",
+                                }
+                                if "workingType" in params:
+                                    params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params2)
                         except Exception as _:
                             logging.warning("Create TP order failed after retry: %s", e)
+                    elif self.exchange_id == "binanceusdm" and "workingType" in params:
+                        try:
+                            params_alt = dict(params)
+                            params_alt["workingType"] = "CONTRACT_PRICE" if params["workingType"] == "MARK_PRICE" else "MARK_PRICE"
+                            await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params_alt)
+                        except Exception:
+                            logging.warning("Create TP order failed: %s", e)
                     else:
                         logging.warning("Create TP order failed: %s", e)
 
@@ -815,13 +919,11 @@ class ExchangeClient:
             return OrderResult(False, f"close_percent failed: {e}")
 
 
-# ===================== Multi-account /close helpers =====================
-# ==== Helpers: load & match accounts ====
+# ===================== Multi-account / close helpers =====================
 def _load_all_accounts() -> List[dict]:
     from config import settings as _S
     lst: List[dict] = []
 
-    # SINGLE_ACCOUNT (nếu có) + ACCOUNTS (list)
     try:
         single = getattr(_S, "SINGLE_ACCOUNT", None)
         if isinstance(single, dict):
@@ -835,7 +937,6 @@ def _load_all_accounts() -> List[dict]:
     except Exception:
         pass
 
-    # ENV ACCOUNTS_JSON (nếu có)
     try:
         j = os.getenv("ACCOUNTS_JSON", "")
         if j:
@@ -845,12 +946,11 @@ def _load_all_accounts() -> List[dict]:
     except Exception:
         pass
 
-    # Dedup theo (exchange, api_key)
     uniq: List[dict] = []
     seen = set()
     for a in lst:
         exid = str(a.get("exchange") or EXCHANGE_ID).lower()
-        key  = a.get("api_key") or API_KEY
+        key = a.get("api_key") or API_KEY
         k = (exid, key)
         if k in seen:
             continue
@@ -865,19 +965,18 @@ def _find_account_by_name_or_exchange(name: str) -> Optional[dict]:
     name_l = str(name).strip().lower()
     all_accs = _load_all_accounts()
 
-    # Ưu tiên match theo 'name'
     for a in all_accs:
         nm = str(a.get("name", "")).strip().lower()
         if nm and nm == name_l:
             return a
 
-    # Fallback: match theo exchange id (e.g. "binance", "bingx")
     for a in all_accs:
         ex = str(a.get("exchange") or EXCHANGE_ID).strip().lower()
         if ex == name_l:
             return a
 
     return None
+
 
 async def close_position_on_account(account_name: str, pair: str, percent: float) -> Dict[str, Any]:
     """
@@ -890,55 +989,45 @@ async def close_position_on_account(account_name: str, pair: str, percent: float
       - CLOSE_CANCEL_TP_SL_ON_PARTIAL=true/false (default: false)
     """
     try:
-        # Chuẩn hoá % và pair
         pct = max(0.0, min(100.0, float(percent)))
         sym_pair = pair or "BTC/USDT"
 
-        # Load config mặc định
         exid_d = os.getenv("EXCHANGE_ID", EXCHANGE_ID)
-        api_d  = os.getenv("API_KEY", API_KEY)
-        sec_d  = os.getenv("API_SECRET", API_SECRET)
-        tnet_d = (os.getenv("TESTNET", str(TESTNET)).strip().lower() in ("1","true","yes","on"))
+        api_d = os.getenv("API_KEY", API_KEY)
+        sec_d = os.getenv("API_SECRET", API_SECRET)
+        tnet_d = (os.getenv("TESTNET", str(TESTNET)).strip().lower() in ("1", "true", "yes", "on"))
 
-        # Tìm account theo tên
         acc = _find_account_by_name_or_exchange(account_name)
 
-        # Lấy thông tin dùng để tạo client
         exid = str((acc or {}).get("exchange") or exid_d).lower()
-        api  = (acc or {}).get("api_key")    or api_d
-        sec  = (acc or {}).get("api_secret") or sec_d
+        api = (acc or {}).get("api_key") or api_d
+        sec = (acc or {}).get("api_secret") or sec_d
         tnet = bool((acc or {}).get("testnet", tnet_d))
         disp_name = (acc or {}).get("name", account_name or "default")
 
         cli = ExchangeClient(exid, api, sec, tnet)
 
-        # Chính sách huỷ lệnh
-        cancel_on_100 = (os.getenv("CLOSE_CANCEL_ALL_ON_100", "true").strip().lower() in ("1","true","yes","on"))
-        cancel_partial_tp_sl = (os.getenv("CLOSE_CANCEL_TP_SL_ON_PARTIAL", "false").strip().lower() in ("1","true","yes","on"))
+        cancel_on_100 = (os.getenv("CLOSE_CANCEL_ALL_ON_100", "true").strip().lower() in ("1", "true", "yes", "on"))
+        cancel_partial_tp_sl = (os.getenv("CLOSE_CANCEL_TP_SL_ON_PARTIAL", "false").strip().lower() in ("1", "true", "yes", "on"))
 
         cancelled_msgs: List[str] = []
 
-        # Nếu đóng toàn bộ → hủy hết TP/SL + open orders trước
         if pct >= 99.9 and cancel_on_100:
             r1 = await cli.cancel_tp_sl_orders(sym_pair)
             cancelled_msgs.append(r1.message)
             r2 = await cli.cancel_all_orders_symbol(sym_pair)
             cancelled_msgs.append(r2.message)
 
-        # Nếu đóng một phần nhưng muốn dọn TP/SL (tuỳ ENV)
         if 0.0 < pct < 99.9 and cancel_partial_tp_sl:
             r0 = await cli.cancel_tp_sl_orders(sym_pair)
             cancelled_msgs.append(r0.message)
 
-        # Thực hiện đóng
         res = await cli.close_percent(sym_pair, pct)
 
-        # Sau khi đóng toàn bộ, dọn TP/SL lần nữa để chắc chắn
         if pct >= 99.9 and cancel_on_100:
             r3 = await cli.cancel_tp_sl_orders(sym_pair)
             cancelled_msgs.append(r3.message)
 
-        # Tổng hợp thông điệp
         msg = f"{disp_name} | {exid} → {res.message}"
         if cancelled_msgs:
             msg += " | " + " / ".join([m for m in cancelled_msgs if m])
@@ -956,18 +1045,16 @@ async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any
     results: List[Dict[str, Any]] = []
     accs = _load_all_accounts()
 
-    # Nếu không có bất kỳ account cấu hình → fallback ENV default (giữ hành vi cũ)
     if not accs:
         r = await close_position_on_account("default", pair, percent)
         results.append(r)
         return results
 
-    # Dedup theo (exchange, api_key)
     uniq: List[dict] = []
     seen = set()
     for a in accs:
         exid = str(a.get("exchange") or EXCHANGE_ID).lower()
-        key  = a.get("api_key") or API_KEY
+        key = a.get("api_key") or API_KEY
         k = (exid, key)
         if k in seen:
             continue
@@ -981,34 +1068,27 @@ async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any
 
     return results
 
-# ========== [ADD] Shim adapters if not provided elsewhere ==========
+
+# ========== Shim adapters if not provided elsewhere ==========
 try:
-    # Nếu a đã có 2 hàm này ở module khác, import ở đây và BỎ các shim bên dưới.
     from core.order_ops import open_single_account_order, open_multi_account_orders  # type: ignore
 except Exception:
     async def open_single_account_order(app, storage, *, symbol: str, side: str,
                                        qty_cfg: dict, risk_cfg: dict, meta: dict):
-        """
-        Adapter tối thiểu cho SINGLE ACCOUNT.
-        Trả về: (ok: bool, info: dict với 'entry_id' nếu mở thành công)
-        """
         from config import settings as _S
         exid = getattr(_S, "EXCHANGE_ID", EXCHANGE_ID)
-        api  = getattr(_S, "API_KEY", API_KEY)
-        sec  = getattr(_S, "API_SECRET", API_SECRET)
+        api = getattr(_S, "API_KEY", API_KEY)
+        sec = getattr(_S, "API_SECRET", API_SECRET)
         tnet = getattr(_S, "TESTNET", TESTNET)
 
         cli = ExchangeClient(exid, api, sec, tnet)
 
-        # Lấy giá hiện tại
         px = await cli.ticker_price(symbol)
         if px <= 0:
             return False, {"error": "ticker_price<=0"}
 
-        # Tính qty:
         qty = float(qty_cfg.get("qty") or 0)
         if qty <= 0:
-            # fallback theo balance, risk%, lev
             bal = await cli.balance_usdt()
             risk_percent = float(risk_cfg.get("risk_percent", getattr(_S, "RISK_PERCENT", 1.0)))
             lev = int(risk_cfg.get("leverage", getattr(_S, "LEVERAGE", 10)))
@@ -1017,18 +1097,16 @@ except Exception:
         if qty <= 0:
             return False, {"error": "qty<=0"}
 
-        # SL/TP (nếu chưa có thì auto theo leverage)
         lev = int(risk_cfg.get("leverage", getattr(_S, "LEVERAGE", 10)))
         sl = qty_cfg.get("sl")
         tp = qty_cfg.get("tp")
         if sl is None or tp is None:
             sl, tp = auto_sl_by_leverage(px, side, lev)
 
-        # --- EP KIỂU RÕ RÀNG (trước khi gọi client) ---
         is_long = _force_is_long(side)
         qty = _force_float(qty, 0.0)
-        sl  = _force_float(sl,  None)
-        tp  = _force_float(tp,  None)
+        sl = _force_float(sl, None)
+        tp = _force_float(tp, None)
 
         res = await cli.market_with_sl_tp(symbol, is_long, qty, sl, tp)
 
@@ -1041,13 +1119,8 @@ except Exception:
 
     async def open_multi_account_orders(app, storage, *, symbol: str, side: str,
                                        accounts_cfg: dict, qty_cfg: dict, risk_cfg: dict, meta: dict):
-        """
-        Adapter tối thiểu cho MULTI ACCOUNT.
-        Trả về: (ok: bool, mapping account_name -> info dict)
-        """
         from config import settings as _S
 
-        # Lấy danh sách account từ settings.ACCOUNTS hoặc ENV ACCOUNTS_JSON
         try:
             ACCOUNTS = getattr(_S, "ACCOUNTS", [])
             if not isinstance(ACCOUNTS, list):
@@ -1067,20 +1140,18 @@ except Exception:
             try:
                 name = acc.get("name", "acc")
                 exid = str(acc.get("exchange") or EXCHANGE_ID).lower()
-                api  = acc.get("api_key") or API_KEY
-                sec  = acc.get("api_secret") or API_SECRET
+                api = acc.get("api_key") or API_KEY
+                sec = acc.get("api_secret") or API_SECRET
                 tnet = bool(acc.get("testnet", TESTNET))
                 pair = acc.get("pair", symbol)
 
                 cli = ExchangeClient(exid, api, sec, tnet)
 
-                # giá hiện tại
                 px = await cli.ticker_price(pair)
                 if px <= 0:
                     results[name] = {"opened": False, "error": "ticker_price<=0"}
                     continue
 
-                # qty theo acc (ưu tiên qty_cfg['qty_per_account'] nếu có)
                 qty = float(qty_cfg.get("qty_per_account") or qty_cfg.get("qty") or 0)
                 if qty <= 0:
                     bal = await cli.balance_usdt()
@@ -1092,18 +1163,16 @@ except Exception:
                     results[name] = {"opened": False, "error": "qty<=0"}
                     continue
 
-                # SL/TP
                 lev = int(risk_cfg.get("leverage", acc.get("leverage", getattr(_S, "LEVERAGE", 10))))
                 sl = qty_cfg.get("sl")
                 tp = qty_cfg.get("tp")
                 if sl is None or tp is None:
                     sl, tp = auto_sl_by_leverage(px, side, lev)
 
-                # --- EP KIỂU RÕ RÀNG (trước khi gọi client) ---
                 is_long = _force_is_long(side)
                 qty = _force_float(qty, 0.0)
-                sl  = _force_float(sl,  None)
-                tp  = _force_float(tp,  None)
+                sl = _force_float(sl, None)
+                tp = _force_float(tp, None)
 
                 res = await cli.market_with_sl_tp(pair, is_long, qty, sl, tp)
 
@@ -1117,23 +1186,26 @@ except Exception:
                 results[name] = {"opened": False, "error": f"{e}"}
 
         return any_ok, results
-        
+
+
 # ========== Unified execute hub (MULTI first → fallback SINGLE if needed) ==========
-
-async def execute_order_flow(app, storage, *,
-                            symbol: str, side: Literal["LONG","SHORT"],
-                            qty_cfg: dict, risk_cfg: dict, accounts_cfg: dict,
-                            meta: dict, origin: Literal["AUTO","MANUAL","ORDER"]) -> Tuple[bool, dict]:
+async def execute_order_flow(
+    app,
+    storage,
+    *,
+    symbol: str,
+    side: Literal["LONG", "SHORT"],
+    qty_cfg: dict,
+    risk_cfg: dict,
+    accounts_cfg: dict,
+    meta: dict,
+    origin: Literal["AUTO", "MANUAL", "ORDER"],
+) -> Tuple[bool, dict]:
     """
-    Trình tự mới (ít đụng chạm, chống double):
-      1) Nếu bật MULTI (có accounts_cfg.enabled): chạy MULTI trước.
-         - Ghi lại entry_id(s) từ từng account opened=True.
-      2) Nếu MULTI không mở được account nào (0 OK) → fallback SINGLE.
-      3) Nếu MULTI tắt (không enabled) → chạy SINGLE như bình thường.
-
-    Return:
-      - opened_real: bool
-      - result: { 'entry_ids': [...], 'per_account': {...}, 'origin': origin, 'side': side, 'symbol': symbol }
+    Trình tự:
+      1) Nếu bật MULTI (accounts_cfg.enabled): chạy MULTI trước.
+      2) Nếu MULTI không mở được account nào → fallback SINGLE.
+      3) Nếu MULTI tắt → chạy SINGLE.
     """
     entry_ids: List[str] = []
     per_account: Dict[str, Any] = {}
@@ -1141,18 +1213,21 @@ async def execute_order_flow(app, storage, *,
     multi_enabled = bool(accounts_cfg and accounts_cfg.get("enabled"))
     multi_opened = 0
 
-    # --- (1) MULTI trước, nếu được bật ---
     if multi_enabled:
         try:
             ok_m, multi = await open_multi_account_orders(
-                app, storage,
-                symbol=symbol, side=side,
+                app,
+                storage,
+                symbol=symbol,
+                side=side,
                 accounts_cfg=accounts_cfg,
-                qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
+                qty_cfg=qty_cfg,
+                risk_cfg=risk_cfg,
+                meta=meta,
             )
             per_account["multi"] = multi
             if isinstance(multi, dict):
-                for acc_name, d in multi.items():
+                for _, d in multi.items():
                     if isinstance(d, dict) and d.get("opened"):
                         multi_opened += 1
                         eid = d.get("entry_id")
@@ -1161,21 +1236,22 @@ async def execute_order_flow(app, storage, *,
         except Exception as e:
             per_account["multi_error"] = str(e)
 
-    # --- (2) Quyết định fallback SINGLE ---
     try_single = False
     if multi_enabled:
-        # MULTI đã chạy; chỉ fallback SINGLE nếu không có account nào mở OK
         try_single = (multi_opened == 0)
     else:
-        # MULTI không bật → chạy SINGLE như cũ
         try_single = True
 
     if try_single:
         try:
             ok_s, info_s = await open_single_account_order(
-                app, storage,
-                symbol=symbol, side=side,
-                qty_cfg=qty_cfg, risk_cfg=risk_cfg, meta=meta
+                app,
+                storage,
+                symbol=symbol,
+                side=side,
+                qty_cfg=qty_cfg,
+                risk_cfg=risk_cfg,
+                meta=meta,
             )
             if ok_s and isinstance(info_s, dict) and info_s.get("opened"):
                 per_account["single"] = info_s
@@ -1183,7 +1259,6 @@ async def execute_order_flow(app, storage, *,
                 if eid:
                     entry_ids.append(eid)
             else:
-                # lưu thông tin lỗi để /autolog hiển thị rõ
                 per_account["single_error"] = (info_s if isinstance(info_s, str) else str(info_s))
         except Exception as e:
             per_account["single_error"] = str(e)
@@ -1198,7 +1273,8 @@ async def execute_order_flow(app, storage, *,
     }
     return opened_real, result
 
-# ========= Helper dời TP-by-time cho toàn bộ lệnh đang mở (anchor-based, robust storage) =============
+
+# ========= Helper dời TP-by-time cho toàn bộ lệnh đang mở =========
 async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -> int:
     """
     Đặt lại deadline TP-by-time cho toàn bộ vị thế đang mở theo chuẩn:
@@ -1207,9 +1283,7 @@ async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -
     Trả về: số vị thế đã cập nhật.
     """
     from strategy.signal_generator import tide_window_now  # dùng chung tính center (anchor)
-    from utils.time_utils import now_vn
 
-    # --- cast giờ ---
     try:
         new_hours = float(new_hours)
     except Exception:
@@ -1217,24 +1291,20 @@ async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -
     if new_hours <= 0:
         return 0
 
-    # --- lấy danh sách vị thế mở từ nhiều API thường gặp ---
     def _iter_open(storage_obj):
-        # 1) API “mở” thường gặp
         for name in ("list_open_positions", "get_open_positions", "list_positions_open", "get_positions_open"):
             if hasattr(storage_obj, name):
                 fn = getattr(storage_obj, name)
                 try:
-                    return fn()                # sync
+                    return fn()
                 except TypeError:
-                    async def _aw(): return await fn()  # async
+                    async def _aw(): return await fn()
                     return _aw()
-        # 2) API tổng rồi lọc
         for name in ("list_positions", "get_positions", "get_all_positions", "positions"):
             if hasattr(storage_obj, name):
                 obj = getattr(storage_obj, name)
                 items = obj() if callable(obj) else obj
                 return [p for p in (items or []) if not getattr(p, "is_closed", False)]
-        # 3) Fallback đọc dict
         for attr in ("state", "__dict__"):
             d = getattr(storage_obj, attr, None)
             if isinstance(d, dict):
@@ -1245,7 +1315,7 @@ async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -
 
     pos_iter = _iter_open(storage)
     if callable(getattr(pos_iter, "__await__", None)):
-        open_positions = await pos_iter  # nếu là coroutine
+        open_positions = await pos_iter
     else:
         open_positions = pos_iter
 
@@ -1257,10 +1327,8 @@ async def retime_tp_by_time_for_open_positions(app, storage, new_hours: float) -
         if not entry_time:
             continue
 
-        # Ưu tiên anchor có sẵn lưu trong position
         anchor = getattr(p, "tide_center", None) or getattr(p, "tide_anchor", None)
 
-        # Nếu chưa có, tính anchor từ entry_time bằng tide_window_now()
         if anchor is None:
             try:
                 tw = tide_window_now(entry_time, hours=float(os.getenv("TIDE_WINDOW_HOURS", "2.5")))
