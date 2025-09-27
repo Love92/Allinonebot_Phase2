@@ -588,6 +588,53 @@ class ExchangeClient:
         except Exception:
             return None, 0.0
 
+    async def _position_qty_by_side(self, symbol: str, side_filter: Literal["LONG", "SHORT"]) -> float:
+        """
+        Lấy riêng khối lượng vị thế theo side (nếu có). Dùng cho Binance Hedge.
+        Trả 0 nếu không có hoặc sàn không tách side.
+        """
+        try:
+            sym = self.normalize_symbol(symbol)
+            try:
+                positions = await self._io(self.client.fetch_positions, [sym])
+            except Exception:
+                positions = []
+            sf = (side_filter or "").upper()
+            qty = 0.0
+
+            for p in positions or []:
+                if not isinstance(p, dict):
+                    continue
+                info = p.get("info") or {}
+                # Binance Hedge có trường positionSide: LONG/SHORT
+                pos_side = str(info.get("positionSide") or "").upper()
+                contracts = p.get("contracts")
+                amount = info.get("positionAmt") or p.get("amount")
+                val = None
+                if contracts is not None:
+                    try: val = float(contracts)
+                    except: val = None
+                if val is None and amount is not None:
+                    try: val = float(amount)
+                    except: val = None
+                if val is None:
+                    continue
+
+                if pos_side in ("LONG", "SHORT"):
+                    if pos_side == sf and abs(val) > 0:
+                        qty = abs(val)
+                        break
+                else:
+                    # one-way: không phân tách; chỉ match nếu dấu phù hợp
+                    if sf == "LONG" and val > 0:
+                        qty = abs(val); break
+                    if sf == "SHORT" and val < 0:
+                        qty = abs(val); break
+
+            return float(qty or 0.0)
+        except Exception:
+            return 0.0
+
     # ---------- order maintenance ----------
     async def fetch_open_orders(self, symbol: str):
         try:
@@ -624,7 +671,6 @@ class ExchangeClient:
         try:
             sym = self.normalize_symbol(symbol)
             fn = getattr(self.client, "cancel_all_orders", None) or getattr(self.client, "cancelAllOrders", None)
-        # noqa: E999
             if callable(fn):
                 try:
                     await self._io(fn, sym)
@@ -1019,6 +1065,87 @@ class ExchangeClient:
         except Exception as e:
             return OrderResult(False, f"close_percent failed: {e}")
 
+    async def close_percent_side(self, symbol: str, percent: float, side_filter: Optional[Literal["LONG", "SHORT"]]) -> OrderResult:
+        """
+        Đóng percent% theo side yêu cầu:
+        - Binance Hedge: đọc qty theo positionSide=LONG/SHORT và gắn param tương ứng khi close.
+        - One-way hoặc sàn không tách side: nếu side_filter không khớp vị thế hiện tại → báo 'Không có vị thế'.
+        """
+        try:
+            sf = (side_filter or "").upper()
+            if sf not in ("LONG", "SHORT"):
+                # không truyền side → về close_percent cũ
+                return await self.close_percent(symbol, percent)
+
+            sym = self.normalize_symbol(symbol)
+            mode = self._binance_position_mode or await self._detect_binance_position_mode()
+
+            # Lấy qty theo side yêu cầu
+            qty_side = await self._position_qty_by_side(sym, sf)
+            if qty_side <= 0:
+                return OrderResult(True, f"Không có vị thế {sf} để đóng.")
+
+            pct = max(0.0, min(100.0, float(percent)))
+            lot_step = float(os.getenv("LOT_STEP_FALLBACK", "0.001"))
+            close_qty = self._floor_step(qty_side * (pct / 100.0), lot_step)
+            if close_qty <= 0:
+                return OrderResult(True, "Không có khối lượng để đóng (sau khi fit step).")
+
+            # Hướng lệnh đóng theo side_filter
+            # Đóng LONG → sell ; đóng SHORT → buy
+            side = "sell" if sf == "LONG" else "buy"
+
+            # Params
+            params: Dict[str, Any] = {"reduceOnly": True}
+            if self.exchange_id == "binanceusdm" and mode == "hedge":
+                params["positionSide"] = sf
+
+            # Place order + retries nếu cần
+            try:
+                await self._io(self.client.create_order, sym, "market", side, close_qty, None, params)
+            except Exception as e:
+                if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                    try:
+                        if "positionSide" in params:
+                            # thử bỏ positionSide (có thể đang oneway)
+                            params2 = {"reduceOnly": True}
+                            await self._io(self.client.create_order, sym, "market", side, close_qty, None, params2)
+                        else:
+                            # thử thêm positionSide (có thể đang hedge)
+                            params2 = {"reduceOnly": True, "positionSide": sf}
+                            await self._io(self.client.create_order, sym, "market", side, close_qty, None, params2)
+                    except Exception as e2:
+                        if self._should_shrink_on_error(e2):
+                            q = close_qty
+                            for _ in range(2):
+                                q = max(self._floor_step(q * 0.7, lot_step), 0.0)
+                                if q <= 0:
+                                    break
+                                try:
+                                    await self._io(self.client.create_order, sym, "market", side, q, None, params if "positionSide" in params else {"reduceOnly": True})
+                                    return OrderResult(True, f"Closed ~{pct:.0f}% {sf} (partial).")
+                                except Exception:
+                                    continue
+                        return OrderResult(False, f"close_percent failed: {e2}")
+                elif self._should_shrink_on_error(e):
+                    q = close_qty
+                    for _ in range(2):
+                        q = max(self._floor_step(q * 0.7, lot_step), 0.0)
+                        if q <= 0:
+                            break
+                        try:
+                            await self._io(self.client.create_order, sym, "market", side, q, None, params)
+                            return OrderResult(True, f"Closed ~{pct:.0f}% {sf} (partial).")
+                        except Exception:
+                            continue
+                    return OrderResult(False, f"close_percent failed: {e}")
+                else:
+                    return OrderResult(False, f"close_percent failed: {e}")
+
+            return OrderResult(True, f"Closed {pct:.0f}% {sf}.")
+        except Exception as e:
+            return OrderResult(False, f"close_percent failed: {e}")
+
 
 # ===================== Multi-account / close helpers =====================
 def _load_all_accounts() -> List[dict]:
@@ -1079,12 +1206,15 @@ def _find_account_by_name_or_exchange(name: str) -> Optional[dict]:
     return None
 
 
-async def close_position_on_account(account_name: str, pair: str, percent: float) -> Dict[str, Any]:
+async def close_position_on_account(account_name: str, pair: str, percent: float, *, side_filter: Optional[Literal["LONG", "SHORT"]] = None) -> Dict[str, Any]:
     """
     Đóng vị thế trên 1 account (theo tên/hoặc exchange).
     - Tìm account trong SINGLE_ACCOUNT/ACCOUNTS/ACCOUNTS_JSON theo 'name' (ưu tiên) hoặc 'exchange'.
     - Nếu không thấy -> fallback về ENV default như cũ.
     - Khi percent >= 100: hủy TP/SL và toàn bộ lệnh chờ của symbol trước/sau khi close để đảm bảo sạch.
+    - Nếu 'side_filter' được truyền:
+        * Binance hedge → đóng đúng side.
+        * Oneway/không hỗ trợ tách side → sẽ báo _note_no_side_support=true để UI biết.
     ENV:
       - CLOSE_CANCEL_ALL_ON_100=true/false (default: true)
       - CLOSE_CANCEL_TP_SL_ON_PARTIAL=true/false (default: false)
@@ -1123,7 +1253,24 @@ async def close_position_on_account(account_name: str, pair: str, percent: float
             r0 = await cli.cancel_tp_sl_orders(sym_pair)
             cancelled_msgs.append(r0.message)
 
-        res = await cli.close_percent(sym_pair, pct)
+        # Close
+        note_no_side_support = False
+        if side_filter:
+            # kiểm tra hỗ trợ side cụ thể
+            mode = await cli._detect_binance_position_mode()
+            if cli.exchange_id == "binanceusdm" and mode == "hedge":
+                res = await cli.close_percent_side(sym_pair, pct, side_filter)
+            else:
+                # one-way hoặc non-binance: thử close theo side → nếu không đúng side hiện có thì coi như không có vị thế
+                qty_sf = await cli._position_qty_by_side(sym_pair, side_filter.upper())
+                if qty_sf <= 0:
+                    res = OrderResult(True, f"Không có vị thế {side_filter} để đóng.")
+                else:
+                    # one-way không gắn positionSide; đóng net (sẽ trùng side hiện có)
+                    res = await cli.close_percent(sym_pair, pct)
+                note_no_side_support = True
+        else:
+            res = await cli.close_percent(sym_pair, pct)
 
         if pct >= 99.9 and cancel_on_100:
             r3 = await cli.cancel_tp_sl_orders(sym_pair)
@@ -1133,21 +1280,25 @@ async def close_position_on_account(account_name: str, pair: str, percent: float
         if cancelled_msgs:
             msg += " | " + " / ".join([m for m in cancelled_msgs if m])
 
-        return {"ok": bool(res.ok), "message": msg}
+        out = {"ok": bool(res.ok), "message": msg}
+        if side_filter and note_no_side_support:
+            out["_note_no_side_support"] = True
+        return out
     except Exception as e:
         return {"ok": False, "message": f"{account_name or 'default'} | {e}"}
 
 
-async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any]]:
+async def close_position_on_all(pair: str, percent: float, *, side_filter: Optional[Literal["LONG", "SHORT"]] = None) -> List[Dict[str, Any]]:
     """
     Đóng vị thế trên tất cả account biết tới (SINGLE_ACCOUNT + ACCOUNTS + ACCOUNTS_JSON).
     - Tái sử dụng close_position_on_account để đảm bảo cùng chính sách cancel orders.
+    - Hỗ trợ side_filter (LONG/SHORT) như close_position_on_account.
     """
     results: List[Dict[str, Any]] = []
     accs = _load_all_accounts()
 
     if not accs:
-        r = await close_position_on_account("default", pair, percent)
+        r = await close_position_on_account("default", pair, percent, side_filter=side_filter)
         results.append(r)
         return results
 
@@ -1164,7 +1315,7 @@ async def close_position_on_all(pair: str, percent: float) -> List[Dict[str, Any
 
     for acc in uniq:
         name = acc.get("name") or acc.get("exchange") or "default"
-        r = await close_position_on_account(name, acc.get("pair", pair or "BTC/USDT"), percent)
+        r = await close_position_on_account(name, acc.get("pair", pair or "BTC/USDT"), percent, side_filter=side_filter)
         results.append(r)
 
     return results
