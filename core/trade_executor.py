@@ -406,17 +406,35 @@ class ExchangeClient:
 
     async def ticker_price(self, symbol: str) -> float:
         """
-        Lấy giá gần nhất cho futures/swap (đã robust cho Binance USDM):
+        Lấy giá gần nhất cho futures/swap (đặc biệt robust cho Binance USDM):
+
+        Thứ tự:
         1) fetch_ticker (last/close)
-        2) fetch_ohlcv 1m (close)
-        3) [Binance USDM] fapiPublic_get_premiumindex (markPrice)
-        4) fetch_order_book (mid price)
-        Trả 0.0 nếu bất khả kháng.
+        2) [Binance USDM] /fapi/v1/ticker/price (price)
+        3) [Binance USDM] /fapi/v1/ticker/24hr (lastPrice/weightedAvgPrice/prevClosePrice/close)
+        4) fetch_ohlcv 1m (close)
+        5) [Binance USDM] /fapi/v1/premiumIndex (markPrice)
+        6) fetch_order_book (mid price)
+
+        Trả 0.0 nếu tất cả đều bất khả kháng.
         """
         try:
             await self._ensure_markets()
             sym = self.normalize_symbol(symbol)
 
+            def _mk_sym_id() -> str:
+                try:
+                    mkt = self.client.market(sym)
+                    mid = (mkt.get("id") or "").upper() if isinstance(mkt, dict) else ""
+                except Exception:
+                    mid = ""
+                if not mid:
+                    mid = symbol.upper().replace("/", "")
+                    if mid.endswith(":USDT"):
+                        mid = mid.replace(":USDT", "")
+                return mid
+
+            # 1) CCXT ticker
             try:
                 t = await self._io(self.client.fetch_ticker, sym)
                 p = t.get("last") or t.get("close")
@@ -427,6 +445,37 @@ class ExchangeClient:
             except Exception:
                 pass
 
+            # 2 & 3) Endpoint futures chuyên biệt cho Binance USDM
+            if self.exchange_id == "binanceusdm":
+                sym_id = _mk_sym_id()
+
+                # 2) /fapi/v1/ticker/price
+                for _ in range(2):  # retry ngắn
+                    try:
+                        fn = getattr(self.client, "fapiPublic_get_ticker_price", None) or getattr(self.client, "fapiPublicGetTickerPrice", None)
+                        if callable(fn):
+                            data = await self._io(fn, {"symbol": sym_id})
+                            obj = data[0] if isinstance(data, list) and data else data
+                            p = float((obj or {}).get("price") or 0.0)
+                            if p > 0:
+                                return p
+                    except Exception:
+                        pass
+
+                # 3) /fapi/v1/ticker/24hr
+                try:
+                    fn24 = getattr(self.client, "fapiPublic_get_ticker_24hr", None) or getattr(self.client, "fapiPublicGetTicker24hr", None)
+                    if callable(fn24):
+                        data24 = await self._io(fn24, {"symbol": sym_id})
+                        obj24 = data24[0] if isinstance(data24, list) and data24 else data24
+                        for k in ("lastPrice", "weightedAvgPrice", "prevClosePrice", "close"):
+                            v = _force_float((obj24 or {}).get(k), None)
+                            if v and v > 0:
+                                return float(v)
+                except Exception:
+                    pass
+
+            # 4) OHLCV 1m
             try:
                 ohlcv = await self._io(self.client.fetch_ohlcv, sym, timeframe="1m", limit=1)
                 if ohlcv and len(ohlcv) > 0:
@@ -436,17 +485,13 @@ class ExchangeClient:
             except Exception:
                 pass
 
+            # 5) Binance markPrice (premium index)
             if self.exchange_id == "binanceusdm":
                 try:
-                    mkt = self.client.market(sym)
-                    sym_id = (mkt.get("id") or "").upper() if isinstance(mkt, dict) else ""
-                    if not sym_id:
-                        sym_id = symbol.upper().replace("/", "")
-                        if sym_id.endswith(":USDT"):
-                            sym_id = sym_id.replace(":USDT", "")
-                    fn = getattr(self.client, "fapiPublic_get_premiumindex", None) or getattr(self.client, "fapiPublicGetPremiumIndex", None)
-                    if callable(fn):
-                        data = await self._io(fn, {"symbol": sym_id})
+                    sym_id = _mk_sym_id()
+                    fnpi = getattr(self.client, "fapiPublic_get_premiumindex", None) or getattr(self.client, "fapiPublicGetPremiumIndex", None)
+                    if callable(fnpi):
+                        data = await self._io(fnpi, {"symbol": sym_id})
                         obj = data[0] if isinstance(data, list) and data else data
                         mp = float((obj or {}).get("markPrice") or 0.0)
                         if mp > 0:
@@ -454,6 +499,7 @@ class ExchangeClient:
                 except Exception:
                     pass
 
+            # 6) Orderbook mid
             try:
                 ob = await self._io(self.client.fetch_order_book, sym, limit=5)
                 bid = float(ob["bids"][0][0]) if ob.get("bids") else 0.0
@@ -578,6 +624,7 @@ class ExchangeClient:
         try:
             sym = self.normalize_symbol(symbol)
             fn = getattr(self.client, "cancel_all_orders", None) or getattr(self.client, "cancelAllOrders", None)
+        # noqa: E999
             if callable(fn):
                 try:
                     await self._io(fn, sym)
@@ -926,7 +973,6 @@ class ExchangeClient:
             return OrderResult(True, f"Closed {pct:.0f}% position.")
         except Exception as e:
             return OrderResult(False, f"close_percent failed: {e}")
-
 
 # ===================== Multi-account / close helpers =====================
 def _load_all_accounts() -> List[dict]:
