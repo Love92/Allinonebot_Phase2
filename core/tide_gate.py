@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, Iterable
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
 from strategy.signal_generator import tide_window_now
@@ -105,11 +105,6 @@ def _center_from_window(twin: Tuple[datetime, datetime]) -> datetime:
     return s + (e - s) / 2
 
 
-def _contains(twin: Tuple[datetime, datetime], ts: datetime) -> bool:
-    s, e = twin
-    return _to_vn(s) <= _to_vn(ts) <= _to_vn(e)
-
-
 def _fmt_hhmm(dt: datetime) -> str:
     return _to_vn(dt).strftime("%H:%M")
 
@@ -118,66 +113,33 @@ def _fmt_day(dt: datetime) -> str:
     return _to_vn(dt).strftime("%Y-%m-%d")
 
 
-def _probe_offsets(hours: float) -> Iterable[float]:
-    """
-    Các độ lệch (giờ) để thử lại khi tide_window_now(None) trả None.
-    Ưu tiên ±hours (ví dụ ±2.5h), rồi ±2*hours để chắc qua nửa đêm.
-    """
-    h = float(hours)
-    base = [0.0, -h, +h, -2*h, +2*h]
-    # Loại bỏ trùng & giữ thứ tự
-    out = []
-    seen = set()
-    for x in base:
-        k = round(x, 4)
-        if k not in seen:
-            out.append(x)
-            seen.add(k)
-    return out
-
-
-def _smart_locate_window(now_local: datetime, hours: float) -> Optional[Tuple[datetime, datetime]]:
-    """
-    Thử gọi tide_window_now tại now_local và các mốc lệch giờ xung quanh
-    để bắt được khung vắt qua nửa đêm. Chỉ chấp nhận khung bao trùm 'now_local'.
-    """
-    for off in _probe_offsets(hours):
-        try_ts = now_local + timedelta(hours=off)
-        try:
-            twin = tide_window_now(try_ts, hours=float(hours))
-        except Exception:
-            twin = None
-        if twin and _contains(twin, now_local):
-            # Bảo đảm trả về (start,end) đều là VN_TZ
-            s, e = twin
-            return (_to_vn(s), _to_vn(e))
-    return None
-
-
 # =========================
 # Core: TideGate check
 # =========================
 
 async def tide_gate_check(*, now: datetime, storage, cfg: TideGateConfig, scope_uid: Optional[int] = None) -> TGateResult:
     """
-    Kiểm tra quota 2/khung & 8/ngày và các ràng buộc khác (late-band).
-    - Chuẩn hoá 'now' về VN_TZ trước khi tính khung.
-    - Khắc phục case vắt qua nửa đêm: thử tìm khung bằng các mốc lệch giờ
-      và chỉ nhận khung bao trùm 'now'.
-    - Nếu thiếu dữ liệu và ALLOW_NO_TIDE_DATA=true: fallback ±hours quanh 'now'.
+    Kiểm tra quota 2/khung & 8/ngày + late-band, dùng CHÍNH XÁC cách xác định khung như /report:
+      - Chuẩn hoá 'now' → VN_TZ
+      - Gọi đúng 1 lần: tide_window_now(now_local, hours=cfg.tide_window_hours)
+      - Nếu None: trả NO_TIDE_DATA (trừ khi ALLOW_NO_TIDE_DATA=true → fallback ±hours quanh 'now_local')
     """
     # 1) Chuẩn hoá thời điểm hiện tại (VN)
     now_local = _to_vn(now)
 
-    # 2) Lấy khung thuỷ triều “thông minh”
-    twin = _smart_locate_window(now_local, cfg.tide_window_hours)
-    reason_tag = "OK"
+    # 2) Lấy khung thuỷ triều đúng như /report
+    try:
+        twin = tide_window_now(now_local, hours=float(cfg.tide_window_hours))
+    except Exception:
+        twin = None
 
+    reason_tag = "OK"
     if twin is None:
-        # 2b) Fallback nếu được phép
+        # tôn trọng dữ liệu: không “đoán” khung, chỉ fallback khi được bật cờ
         allow_fb = str(os.getenv("ALLOW_NO_TIDE_DATA", "false")).strip().lower() in ("1", "true", "yes", "on", "y")
         if not allow_fb:
             return TGateResult(ok=False, reason="NO_TIDE_DATA", counters={})
+        # Fallback: ±hours quanh now_local
         h = float(cfg.tide_window_hours)
         start = now_local - timedelta(hours=h)
         end = now_local + timedelta(hours=h)
@@ -215,8 +177,8 @@ async def tide_gate_check(*, now: datetime, storage, cfg: TideGateConfig, scope_
 
     # 4) Keys & counters
     scope = str(scope_uid) if (cfg.counter_scope == "per_user" and scope_uid is not None) else "GLOBAL"
-    day_key = _fmt_day(center)               # theo ngày (VN)
-    win_key = f"{_fmt_day(center)} {_fmt_hhmm(center)}"  # khoá theo tâm khung (VN)
+    day_key = _fmt_day(center)                              # theo ngày (VN)
+    win_key = f"{_fmt_day(center)} {_fmt_hhmm(center)}"     # khoá theo tâm khung (VN)
 
     used_day = await _get_counter(storage, f"DAY:{scope}:{day_key}")
     used_win = await _get_counter(storage, f"TW:{scope}:{win_key}")
