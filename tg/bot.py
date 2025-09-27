@@ -1093,7 +1093,7 @@ async def order_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (T) TideGate check
     cfg = await _load_tidegate_config(storage_obj, uid)
     tgr = await tide_gate_check(
-        now=_ae_now_vn().astimezone(timezone.utc),
+        now=now_vn(),  # truyền thẳng giờ VN
         storage=storage_obj,
         cfg=cfg,
         scope_uid=(uid if cfg.counter_scope == "per_user" else None),
@@ -1362,7 +1362,7 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Re-check TideGate NGAY TẠI LÚC DUYỆT
     cfg = await _load_tidegate_config(storage_obj, _uid(update))
     tgr = await tide_gate_check(
-        now=_ae_now_vn().astimezone(timezone.utc),
+        now=now_vn(),  # truyền thẳng giờ VN
         storage=storage_obj,
         cfg=cfg,
         scope_uid=(_uid(update) if cfg.counter_scope == "per_user" else None),
