@@ -1667,82 +1667,121 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pid = args[1].strip()
     ok = mark_done(storage, pid, "REJECTED")
     await update.message.reply_text("❌ Đã REJECT." if ok else "⚠️ ID không hợp lệ hoặc đã xử lý.")
-
 # ==== /close (đa tài khoản: Binance/BingX/...) ====
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /close                -> đóng 100% trên tất cả account (SINGLE_ACCOUNT + ACCOUNTS/ACCOUNTS_JSON)
-    /close 50             -> đóng 50% tất cả account
-    /close bingx_test     -> đóng 100% riêng account 'bingx_test'
-    /close 25 bingx_test  -> đóng 25% riêng 'bingx_test' (hoặc: /close bingx_test 25)
+    /close                                  -> đóng 100% tất cả account (LONG+SHORT nếu có)
+    /close 50                               -> đóng 50% tất cả account (net/hoặc theo side nếu backend hỗ trợ)
+    /close bingx_test                       -> đóng 100% riêng account 'bingx_test'
+    /close 25 bingx_test                    -> đóng 25% riêng 'bingx_test'
+    /close long                             -> đóng 100% các vị thế LONG (nếu backend hỗ trợ lọc side)
+    /close short 30 binance_main            -> đóng 30% vị thế SHORT ở account binance_main
+    /close binance_main long 100            -> cú pháp linh hoạt: account + side + %
+    /close 100 short                        -> đóng 100% SHORT trên tất cả account
 
     Ghi chú:
-    - Khi percent>=100, backend sẽ tự hủy TP/SL và toàn bộ open orders của symbol trước/sau khi close (có thể cấu hình qua ENV).
+    - Nếu backend (core.trade_executor) đã nâng cấp: sẽ tôn trọng side_filter (LONG/SHORT).
+    - Nếu backend CHƯA nâng cấp: fallback về close net-position như cũ (không lọc side).
+    - Khi percent>=100, sẽ in thêm dòng đã hủy TP/SL & lệnh chờ (backend xử lý).
     """
     from core.trade_executor import close_position_on_account, close_position_on_all
 
     msg = update.effective_message
     uid = _uid(update)
 
-    # Lấy pair ưu tiên từ user settings, fallback ENV/DEFAULT
+    # Lấy pair mặc định của user
     try:
         st = storage.get_user(uid)
         pair = (getattr(st.settings, "pair", None) or os.getenv("PAIR") or "BTC/USDT")
     except Exception:
         pair = os.getenv("PAIR", "BTC/USDT")
 
-    # Parse args: chấp nhận cả "pct acc" lẫn "acc pct"
-    args = context.args if hasattr(context, "args") else []
+    args = [str(a).strip() for a in (context.args or [])]
+
+    # ---- Parse linh hoạt percent / account / side ----
     percent: float = 100.0
     account: Optional[str] = None
+    side_filter: Optional[str] = None  # "LONG" | "SHORT" | None
 
     def _is_percent(s: str) -> bool:
         try:
-            x = float(s); return 0.0 < x <= 100.0
+            x = float(s)
+            return 0.0 < x <= 100.0
         except Exception:
             return False
 
-    if args:
-        a0 = str(args[0]).strip()
-        if _is_percent(a0):
-            percent = float(a0)
-            if len(args) >= 2:
-                account = str(args[1]).strip()
-        else:
-            account = a0
-            if len(args) >= 2 and _is_percent(str(args[1]).strip()):
-                percent = float(args[1])
+    def _as_side(s: str) -> Optional[str]:
+        s2 = (s or "").lower()
+        if s2 in ("long", "l", "buy"):
+            return "LONG"
+        if s2 in ("short", "s", "sell"):
+            return "SHORT"
+        return None
 
-    # Chuẩn hoá percent
+    for tok in args:
+        if _is_percent(tok):
+            percent = float(tok)
+            continue
+        sd = _as_side(tok)
+        if sd:
+            side_filter = sd
+            continue
+        # còn lại coi như account name (vd: binance_main, bingx_test)
+        account = tok
+
+    # Chuẩn hóa percent
     try:
         percent = float(percent)
         percent = 100.0 if percent > 100.0 else (1.0 if percent <= 0 else percent)
     except Exception:
         percent = 100.0
 
+    # ---- Thực thi ----
     try:
         if account:
-            # Đóng riêng 1 account (backend sẽ tìm đúng account theo name/exchange)
-            res = await close_position_on_account(account, pair, percent)
+            # đóng riêng 1 account
+            try:
+                # Backend MỚI: có side_filter
+                res = await close_position_on_account(account, pair, percent, side_filter=side_filter)
+            except TypeError:
+                # Backend CŨ: không có side_filter -> fallback
+                res = await close_position_on_account(account, pair, percent)
+
+            status = "OK" if (isinstance(res, dict) and res.get("ok")) else "FAIL"
+            side_txt = f" | side={side_filter}" if side_filter else ""
             lines = [
-                f"🔧 Close {percent:.0f}% | {pair} | account: <b>{_esc(account)}</b>",
-                f"• {'OK' if res.get('ok') else 'FAIL'} {_esc(res.get('message',''))}"
+                f"🔧 Close {percent:.0f}% | {pair} | account: <b>{_esc(account)}</b>{_esc(side_txt)}",
+                f"• {status} {_esc((res or {}).get('message',''))}"
             ]
             if percent >= 100.0:
                 lines.append("🧹 TP/SL & lệnh chờ đã được xử lý.")
+            # Cảnh báo nếu backend cũ (không support side)
+            if side_filter and isinstance(res, dict) and res.get("_note_no_side_support"):
+                lines.append("⚠️ Backend chưa hỗ trợ lọc side — đã đóng theo vị thế hiện có (net).")
             await msg.reply_text("\n".join(lines), parse_mode="HTML")
         else:
-            # Đóng tất cả account
-            results = await close_position_on_all(pair, percent)  # list[dict]
-            lines = [f"🔧 Close {percent:.0f}% | {pair} | ALL accounts"]
+            # đóng tất cả account
+            try:
+                # Backend MỚI: có side_filter
+                results = await close_position_on_all(pair, percent, side_filter=side_filter)  # list[dict]
+            except TypeError:
+                # Backend CŨ
+                results = await close_position_on_all(pair, percent)
+
+            side_txt = f" | side={side_filter}" if side_filter else ""
+            lines = [f"🔧 Close {percent:.0f}% | {pair} | ALL accounts{_esc(side_txt)}"]
             for r in results or []:
-                lines.append(f"• { _esc(r.get('message','')) }")
+                # mỗi r kỳ vọng có 'message' đã format tên account + sàn
+                note = ""
+                if side_filter and r and r.get("_note_no_side_support"):
+                    note = " (no-side-support)"
+                lines.append(f"• {_esc(r.get('message',''))}{_esc(note)}")
             if percent >= 100.0:
                 lines.append("🧹 TP/SL & lệnh chờ đã được xử lý.")
             await msg.reply_text("\n".join(lines), parse_mode="HTML")
+
     except Exception as e:
         await msg.reply_text(f"❌ Lỗi /close: {_esc(str(e))}", parse_mode="HTML")
-   
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = _uid(update)
