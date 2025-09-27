@@ -209,18 +209,25 @@ class ExchangeClient:
             self._binance_position_mode = "oneway"
             return "oneway"
 
-        try:
-            # ccxt raw endpoint: GET /fapi/v1/positionSide/dual
-            # nhiều phiên bản ccxt dùng tên: fapiPrivate_get_positionside_dual
-            resp = await self._io(self.client.fapiPrivate_get_positionside_dual)
-            dual = (resp or {}).get("dualSidePosition")
-            mode = "hedge" if str(dual).lower() in ("true", "1") else "oneway"
-            self._binance_position_mode = mode
-            return mode
-        except Exception:
-            # nếu lỗi API, an toàn coi là oneway
-            self._binance_position_mode = "oneway"
-            return "oneway"
+        # thử nhiều tên raw method để tránh khác biệt phiên bản ccxt
+        try_methods = [
+            "fapiPrivate_get_positionside_dual",
+            "fapiPrivateGetPositionSideDual",
+        ]
+        for m in try_methods:
+            try:
+                fn = getattr(self.client, m)
+                resp = await self._io(fn)
+                dual = (resp or {}).get("dualSidePosition")
+                mode = "hedge" if str(dual).lower() in ("true", "1") else "oneway"
+                self._binance_position_mode = mode
+                return mode
+            except Exception:
+                continue
+
+        # nếu lỗi API, an toàn coi là oneway
+        self._binance_position_mode = "oneway"
+        return "oneway"
 
     # ---------- common helpers ----------
     @staticmethod
@@ -264,6 +271,12 @@ class ExchangeClient:
         except Exception:
             pass
         return False
+
+    # Helper: nhận diện -4061
+    @staticmethod
+    def _is_pos_side_mismatch(err: Exception) -> bool:
+        s = str(err).lower()
+        return ("-4061" in s) or ("position side does not match" in s)
 
     # ---------- limits / qty fit ----------
     async def _fit_qty(self, symbol: str, qty: float, price: float) -> Tuple[float, dict]:
@@ -364,11 +377,9 @@ class ExchangeClient:
         - Fallback: close của nến 1m (ổn định hơn trên một số sàn)
         """
         try:
-            # 1) đảm bảo đã load markets
             await self._ensure_markets()
             sym = self.normalize_symbol(symbol)
 
-            # 2) thử fetch_ticker
             try:
                 t = await self._io(self.client.fetch_ticker, sym)
                 p = t.get("last") or t.get("close")
@@ -379,7 +390,6 @@ class ExchangeClient:
             except Exception:
                 pass
 
-            # 3) fallback: lấy close của nến 1m
             try:
                 ohlcv = await self._io(self.client.fetch_ohlcv, sym, timeframe="1m", limit=1)
                 if ohlcv and len(ohlcv) > 0:
@@ -504,6 +514,7 @@ class ExchangeClient:
         try:
             sym = self.normalize_symbol(symbol)
             fn = getattr(self.client, "cancel_all_orders", None) or getattr(self.client, "cancelAllOrders", None)
+        # noqa: E722
             if callable(fn):
                 try:
                     await self._io(fn, sym)
@@ -537,6 +548,7 @@ class ExchangeClient:
         """
         Vào lệnh thị trường (side = LONG/SHORT). Tự fit qty + đặt SL reduceOnly nếu truyền.
         [MODIFIED] Tự phát hiện Hedge Mode của Binance & gắn positionSide phù hợp.
+        [NEW]     Nếu gặp -4061 → tự động chuyển chế độ cache (hedge↔oneway) và retry.
         """
         try:
             sym = self.normalize_symbol(symbol)
@@ -563,7 +575,21 @@ class ExchangeClient:
             if mode == "hedge" and self.exchange_id == "binanceusdm":
                 params_entry["positionSide"] = "LONG" if s == "LONG" else "SHORT"
 
-            entry = await self._place_market_with_retries(sym, order_side, q_fit, params=params_entry)
+            # ENTRY (with adaptive retry on -4061)
+            try:
+                entry = await self._place_market_with_retries(sym, order_side, q_fit, params=params_entry)
+            except Exception as e:
+                if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                    # Flip mode & retry
+                    if "positionSide" in params_entry:  # đang nghĩ là hedge nhưng thực tế one-way
+                        self._binance_position_mode = "oneway"
+                        entry = await self._place_market_with_retries(sym, order_side, q_fit, params={})
+                    else:  # đang nghĩ là oneway nhưng thực tế hedge
+                        self._binance_position_mode = "hedge"
+                        params_retry = {"positionSide": "LONG" if s == "LONG" else "SHORT"}
+                        entry = await self._place_market_with_retries(sym, order_side, q_fit, params=params_retry)
+                else:
+                    raise
 
             # SL (reduceOnly)
             if stop_loss is not None:
@@ -571,13 +597,31 @@ class ExchangeClient:
                 params = {"reduceOnly": True, "stopPrice": float(stop_loss)}
                 if self.exchange_id == "okx":
                     params["slTriggerPx"] = float(stop_loss)
-                # [ADD] giữ đúng side khi hedge
-                if mode == "hedge" and self.exchange_id == "binanceusdm":
+
+                # gắn positionSide nếu cache hiện tại là hedge
+                mode_now = self._binance_position_mode or mode
+                if mode_now == "hedge" and self.exchange_id == "binanceusdm":
                     params["positionSide"] = "LONG" if s == "LONG" else "SHORT"
+
                 try:
                     await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
                 except Exception as e:
-                    logging.warning("Create SL order failed: %s", e)
+                    # nếu mismatch, thử bỏ/hoặc thêm positionSide theo chiều ngược lại của cache
+                    if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                        try:
+                            if "positionSide" in params:
+                                params2 = {"reduceOnly": True, "stopPrice": float(stop_loss)}
+                                if self.exchange_id == "okx":
+                                    params2["slTriggerPx"] = float(stop_loss)
+                                await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
+                            else:
+                                params2 = {"reduceOnly": True, "stopPrice": float(stop_loss),
+                                           "positionSide": "LONG" if s == "LONG" else "SHORT"}
+                                await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
+                        except Exception as _:
+                            logging.warning("Create SL order failed after retry: %s", e)
+                    else:
+                        logging.warning("Create SL order failed: %s", e)
 
             return OrderResult(True, f"Live order placed: entry={entry.get('id')}", {"entry": entry})
         except Exception as e:
@@ -595,6 +639,7 @@ class ExchangeClient:
         Lệnh market + gắn SL/TP reduceOnly (nếu sàn hỗ trợ).
         'side_long' được chuẩn hoá: bool/str/int/float đều OK.
         [MODIFIED] Hỗ trợ Binance Hedge Mode với positionSide cho entry & SL/TP.
+        [NEW]     Nếu gặp -4061 → tự động chuyển chế độ cache (hedge↔oneway) và retry.
         """
         try:
             sym = self.normalize_symbol(symbol)
@@ -617,8 +662,20 @@ class ExchangeClient:
             if mode == "hedge" and self.exchange_id == "binanceusdm":
                 params_entry["positionSide"] = "LONG" if is_long else "SHORT"
 
-            # Vào lệnh
-            entry = await self._place_market_with_retries(sym, side, q_fit, params=params_entry)
+            # ENTRY (adaptive retry)
+            try:
+                entry = await self._place_market_with_retries(sym, side, q_fit, params=params_entry)
+            except Exception as e:
+                if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                    if "positionSide" in params_entry:
+                        self._binance_position_mode = "oneway"
+                        entry = await self._place_market_with_retries(sym, side, q_fit, params={})
+                    else:
+                        self._binance_position_mode = "hedge"
+                        params_retry = {"positionSide": "LONG" if is_long else "SHORT"}
+                        entry = await self._place_market_with_retries(sym, side, q_fit, params=params_retry)
+                else:
+                    raise
 
             # Đặt SL/TP reduceOnly
             opp = "sell" if side == "buy" else "buy"
@@ -629,22 +686,50 @@ class ExchangeClient:
                     params = {"reduceOnly": True, "stopPrice": sp}
                     if self.exchange_id == "okx":
                         params["slTriggerPx"] = sp
-                    if mode == "hedge" and self.exchange_id == "binanceusdm":
+                    mode_now = self._binance_position_mode or mode
+                    if mode_now == "hedge" and self.exchange_id == "binanceusdm":
                         params["positionSide"] = "LONG" if is_long else "SHORT"
                     await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params)
                 except Exception as e:
-                    logging.warning("Create SL order failed: %s", e)
+                    if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                        try:
+                            if "positionSide" in params:
+                                params2 = {"reduceOnly": True, "stopPrice": float(sp)}
+                                if self.exchange_id == "okx":
+                                    params2["slTriggerPx"] = float(sp)
+                                await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
+                            else:
+                                params2 = {"reduceOnly": True, "stopPrice": float(sp),
+                                           "positionSide": "LONG" if is_long else "SHORT"}
+                                await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
+                        except Exception as _:
+                            logging.warning("Create SL order failed after retry: %s", e)
+                    else:
+                        logging.warning("Create SL order failed: %s", e)
 
             if tp_price is not None:
                 try:
                     tp = float(tp_price)
                     params = {"reduceOnly": True, "stopPrice": tp}
-                    if mode == "hedge" and self.exchange_id == "binanceusdm":
+                    mode_now = self._binance_position_mode or mode
+                    if mode_now == "hedge" and self.exchange_id == "binanceusdm":
                         params["positionSide"] = "LONG" if is_long else "SHORT"
-                    tptype = "take_profit_market"  # vài sàn map nội bộ sang stop_market
+                    tptype = "take_profit_market"
                     await self._io(self.client.create_order, sym, tptype, opp, q_fit, None, params)
                 except Exception as e:
-                    logging.warning("Create TP order failed: %s", e)
+                    if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                        try:
+                            if "positionSide" in params:
+                                params2 = {"reduceOnly": True, "stopPrice": float(tp)}
+                                await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params2)
+                            else:
+                                params2 = {"reduceOnly": True, "stopPrice": float(tp),
+                                           "positionSide": "LONG" if is_long else "SHORT"}
+                                await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params2)
+                        except Exception as _:
+                            logging.warning("Create TP order failed after retry: %s", e)
+                    else:
+                        logging.warning("Create TP order failed: %s", e)
 
             eid = entry.get("id") if isinstance(entry, dict) else None
             return OrderResult(True, f"Live order placed: entry={eid}", {"entry": entry})
