@@ -320,19 +320,69 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
         # Không crash auto loop nếu thiếu biến — chỉ bỏ qua cập nhật
         pass
 
-async def _load_tidegate_config(storage, uid: Optional[int]) -> TideGateConfig:
-    return TideGateConfig(
-        tide_window_hours=float(os.getenv("TIDE_WINDOW_HOURS", "2.5")),
-        entry_late_only=_env_bool("ENTRY_LATE_ONLY", False),
-        entry_late_from=float(os.getenv("ENTRY_LATE_FROM_HRS", "1.0")),
-        entry_late_to=float(os.getenv("ENTRY_LATE_TO_HRS", "2.5")),
-        max_orders_per_day=int(os.getenv("MAX_ORDERS_PER_DAY", "8")),
-        max_orders_per_tide_window=int(os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", "2")),
-        counter_scope=os.getenv("COUNTER_SCOPE", "per_user") or "per_user",
-        lat=float(os.getenv("LAT", "32.7503")),
-        lon=float(os.getenv("LON", "129.8777")),
-    )
+async def _load_tidegate_config(storage, uid=None) -> TideGateConfig:
+    """
+    Nạp cấu hình TideGate từ ENV + (tuỳ) user settings nếu có.
+    Chuẩn hoá alias:
+      - MAX_ORDERS_PER_DAY           -> max_per_day
+      - MAX_ORDERS_PER_TIDE_WINDOW   -> max_per_tide_window
+      - TIDE_WINDOW_HOURS            -> tide_window_hours
+      - ENTRY_LATE_ONLY              -> entry_late_only
+      - ENTRY_LATE_FROM_HRS          -> entry_late_from
+      - ENTRY_LATE_TO_HRS            -> entry_late_to
+      - COUNTER_SCOPE ('per_user'|'global') -> counter_scope
+    """
+    def _as_bool(s: str, default=False) -> bool:
+        if s is None:
+            return default
+        return str(s).strip().lower() in ("1", "true", "yes", "on", "y")
 
+    def _as_float(s: str, default: float) -> float:
+        try:
+            return float(s)
+        except Exception:
+            return default
+
+    def _as_int(s: str, default: int) -> int:
+        try:
+            return int(float(s))
+        except Exception:
+            return default
+
+    # defaults
+    tide_window_hours   = _as_float(os.getenv("TIDE_WINDOW_HOURS", "2.5"), 2.5)
+    entry_late_only     = _as_bool(os.getenv("ENTRY_LATE_ONLY", "false"), False)
+    entry_late_from     = _as_float(os.getenv("ENTRY_LATE_FROM_HRS", "0.5"), 0.5)
+    entry_late_to       = _as_float(os.getenv("ENTRY_LATE_TO_HRS",   "2.5"), 2.5)
+
+    # quota (alias)
+    max_per_day         = _as_int(os.getenv("MAX_ORDERS_PER_DAY", "8"), 8)
+    max_per_tide_window = _as_int(os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", "2"), 2)
+
+    # scope
+    scope_raw           = (os.getenv("COUNTER_SCOPE", "per_user") or "per_user").strip().lower()
+    counter_scope       = "per_user" if scope_raw in ("user","per_user","u","p") else "global"
+
+    # nếu có storage + user settings muốn override tide_window_hours theo user:
+    try:
+        if storage is not None and uid is not None:
+            st = storage.get_user(uid)
+            if hasattr(st.settings, "tide_window_hours") and st.settings.tide_window_hours:
+                tide_window_hours = float(st.settings.tide_window_hours)
+    except Exception:
+        pass
+
+    # Khởi tạo đúng tên field dataclass
+    cfg = TideGateConfig(
+        tide_window_hours=tide_window_hours,
+        entry_late_only=entry_late_only,
+        entry_late_from=entry_late_from,
+        entry_late_to=entry_late_to,
+        max_per_day=max_per_day,
+        max_per_tide_window=max_per_tide_window,
+        counter_scope=counter_scope,
+    )
+    return cfg
 
 # ========= RISK-SENTINEL (Khoá AUTO nếu 2 SL liên tiếp ở 2 lần thủy triều khác nhau trong cùng ngày) =========
 AUTO_LOCK_ON_2_SL = (os.getenv("AUTO_LOCK_ON_2_SL", "true").strip().lower() in ("1","true","yes","on","y"))
