@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 from core.approval_flow import create_pending_v2, get_pending, mark_done
+from core.tide_gate import TideGateConfig, tide_gate_check, bump_counters_after_execute
+
 
 # ========= Imports đồng bộ với /report =========
 # Lấy KẾT QUẢ CHUẨN H4/M30/Moon từ strategy.signal_generator.evaluate_signal()
@@ -248,7 +250,9 @@ def _env_bool(key: str, default: str = "false") -> bool:
 
 M5_MAX_DELAY_SEC        = int(float(os.getenv("M5_MAX_DELAY_SEC", "60")))
 SCHEDULER_TICK_SEC      = int(float(os.getenv("SCHEDULER_TICK_SEC", "2")))
-MAX_TRADES_PER_WINDOW   = int(float(os.getenv("MAX_TRADES_PER_WINDOW", "2")))
+
+# ⚠️ DEPRECATED: quota/window cũ ở Gate A (đã chuyển sang TideGate T)
+# MAX_TRADES_PER_WINDOW   = int(float(os.getenv("MAX_TRADES_PER_WINDOW", "2")))
 
 ENTRY_LATE_ONLY         = _env_bool("ENTRY_LATE_ONLY", "false")
 ENTRY_LATE_FROM_HRS     = float(os.getenv("ENTRY_LATE_FROM_HRS", "1.0"))
@@ -264,11 +268,11 @@ ENFORCE_M5_MATCH_M30 = _env_bool("ENFORCE_M5_MATCH_M30", "true")
 
 # --- Defaults cho các guard bổ sung (để _apply_runtime_env có giá trị ban đầu) ---
 M30_FLIP_GUARD = True              # yêu cầu M30 không flip hướng quá nhanh
-M30_STABLE_MIN_SEC = 1800              # số giây tối thiểu M30 phải ổn định
-M30_NEED_CONSEC_N = 1               # số nến liên tiếp cần thoả điều kiện
+M30_STABLE_MIN_SEC = 1800          # số giây tối thiểu M30 phải ổn định
+M30_NEED_CONSEC_N = 1              # số nến liên tiếp cần thoả điều kiện
 
-M5_MIN_GAP_MIN = 15                  # phút tối thiểu giữa 2 lần vào lệnh (gap guard)
-M5_GAP_SCOPED_TO_WINDOW = True      # gap guard tính trong 1 cửa sổ tide hay toàn cục
+M5_MIN_GAP_MIN = 15                # phút tối thiểu giữa 2 lần vào lệnh (gap guard)
+M5_GAP_SCOPED_TO_WINDOW = True     # gap guard tính trong 1 cửa sổ tide hay toàn cục
 ALLOW_SECOND_ENTRY = True          # cho phép vào lệnh thứ 2 trong cùng cửa sổ
 M5_SECOND_ENTRY_MIN_RETRACE_PCT = 0.1 # % tối thiểu retrace để cho lệnh thứ 2
 
@@ -280,7 +284,7 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
     """
     global ENTRY_LATE_ONLY, ENTRY_LATE_FROM_HRS, ENTRY_LATE_TO_HRS
     global AUTO_DEBUG, AUTO_DEBUG_VERBOSE, AUTO_DEBUG_ONLY_WHEN_SKIP, AUTO_DEBUG_CHAT_ID
-    global ENFORCE_M5_MATCH_M30, MAX_TRADES_PER_WINDOW
+    global ENFORCE_M5_MATCH_M30
     # Guards / filters mới:
     global M30_FLIP_GUARD, M30_STABLE_MIN_SEC, M30_NEED_CONSEC_N
     global M5_MIN_GAP_MIN, M5_GAP_SCOPED_TO_WINDOW, ALLOW_SECOND_ENTRY, M5_SECOND_ENTRY_MIN_RETRACE_PCT
@@ -289,7 +293,7 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
         os.environ[k] = str(v)
 
     try:
-        # late-window
+        # late-window (⚠️ chỉ dùng để hiển thị; chặn thực tế đã gom vào TideGate)
         ENTRY_LATE_ONLY         = _env_bool("ENTRY_LATE_ONLY", "true" if ENTRY_LATE_ONLY else "false")
         ENTRY_LATE_FROM_HRS     = float(os.getenv("ENTRY_LATE_FROM_HRS", str(ENTRY_LATE_FROM_HRS)))
         ENTRY_LATE_TO_HRS       = float(os.getenv("ENTRY_LATE_TO_HRS", str(ENTRY_LATE_TO_HRS)))
@@ -303,10 +307,6 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
         # rules
         ENFORCE_M5_MATCH_M30    = _env_bool("ENFORCE_M5_MATCH_M30", "true" if ENFORCE_M5_MATCH_M30 else "false")
 
-        # quota theo cửa sổ thủy triều
-        MAX_TRADES_PER_WINDOW   = int(float(os.getenv("MAX_TRADES_PER_WINDOW",
-                                           os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", str(MAX_TRADES_PER_WINDOW)))))
-
         # guards M30/M5
         M30_FLIP_GUARD          = _env_bool("M30_FLIP_GUARD", "true" if M30_FLIP_GUARD else "false")
         M30_STABLE_MIN_SEC      = int(float(os.getenv("M30_STABLE_MIN_SEC", str(M30_STABLE_MIN_SEC))))
@@ -319,6 +319,19 @@ def _apply_runtime_env(kv: Dict[str, str]) -> None:
     except Exception:
         # Không crash auto loop nếu thiếu biến — chỉ bỏ qua cập nhật
         pass
+
+async def _load_tidegate_config(storage, uid: Optional[int]) -> TideGateConfig:
+    return TideGateConfig(
+        tide_window_hours=float(os.getenv("TIDE_WINDOW_HOURS", "2.5")),
+        entry_late_only=_env_bool("ENTRY_LATE_ONLY", False),
+        entry_late_from=float(os.getenv("ENTRY_LATE_FROM_HRS", "1.0")),
+        entry_late_to=float(os.getenv("ENTRY_LATE_TO_HRS", "2.5")),
+        max_orders_per_day=int(os.getenv("MAX_ORDERS_PER_DAY", "8")),
+        max_orders_per_tide_window=int(os.getenv("MAX_ORDERS_PER_TIDE_WINDOW", "2")),
+        counter_scope=os.getenv("COUNTER_SCOPE", "per_user") or "per_user",
+        lat=float(os.getenv("LAT", "32.7503")),
+        lon=float(os.getenv("LON", "129.8777")),
+    )
 
 
 # ========= RISK-SENTINEL (Khoá AUTO nếu 2 SL liên tiếp ở 2 lần thủy triều khác nhau trong cùng ngày) =========
@@ -461,7 +474,7 @@ def _current_tp_hours() -> float:
 _last_decision_text: Dict[int, str] = {}
 # Chống spam 1 tick trong cùng slot M5
 _last_m5_slot_sent: Dict[int, int] = {}
-# Đếm số lệnh trong một cửa sổ thủy triều (high/low) để giới hạn
+# [DEPRECATED] quota theo cửa sổ thủy triều — đã chuyển sang TideGate
 _user_tide_state: Dict[int, Dict[str, Any]] = {}
 # Vị thế đang mở (theo UID) để xử lý TP-by-time
 _open_pos: Dict[int, Dict[str, Any]] = {}
@@ -568,20 +581,16 @@ async def _auto_gate_decision(uid: int, app, storage) -> Optional[dict]:
     m30          = frames.get("M30", {}) or {}
     m5f          = frames.get("M5", {}) or {}
 
-    # 5) Late-window theo mốc thủy triều gần nhất
+    # 5) Late-window theo mốc thủy triều gần nhất (⚠️ chỉ để hiển thị; chặn sẽ do TideGate T)
     center = _nearest_tide_center(now)
     tau = None
     if isinstance(center, datetime):
         tau = (now - center).total_seconds() / 3600.0
     in_late = (tau is not None) and (ENTRY_LATE_FROM_HRS <= tau <= ENTRY_LATE_TO_HRS)
 
-    # Guard ENTRY_LATE_ONLY
-    if ENTRY_LATE_ONLY and not in_late:
-        msg = _one_line("SKIP", "late_only_block", now, f"tau={tau:.2f}h, need {ENTRY_LATE_FROM_HRS}–{ENTRY_LATE_TO_HRS}h")
-        _last_decision_text[uid] = msg + ("\n\n" + text_block if text_block else "")
-        if not AUTO_DEBUG_ONLY_WHEN_SKIP:
-            await _debug_send(app, uid, msg)
-        return {"ok": False, "reason": msg, "text_block": text_block}
+    # ⚠️ BỎ CHẶN ENTRY_LATE_ONLY Ở A — đã chuyển sang TideGate.
+    # if ENTRY_LATE_ONLY and not in_late:
+    #     ...
 
     # === M30 flip-guard & ổn định + consecutive-N ===
     side_m30 = str(m30.get("side", "NONE")).upper()
@@ -633,18 +642,18 @@ async def _auto_gate_decision(uid: int, app, storage) -> Optional[dict]:
                     await _debug_send(app, uid, msg)
                 return {"ok": False, "reason": msg, "text_block": text_block}
 
-    # Quota mỗi cửa sổ thủy triều
+    # ⚠️ BỎ QUOTA MỖI CỬA SỔ Ở A — đã chuyển sang TideGate.
+    # key_day = now.strftime("%Y-%m-%d")
+    # key_win = f"{center.strftime('%H:%M') if center else 'NA'}"
+    # st_user = _user_tide_state.setdefault(uid, {})
+    # st_day  = st_user.setdefault(key_day, {})
+    # st_key  = st_day.setdefault(key_win, {"trade_count": 0})
+    # if int(st_key.get("trade_count", 0)) >= MAX_TRADES_PER_WINDOW:
+    #     ...
+
     key_day = now.strftime("%Y-%m-%d")
     key_win = f"{center.strftime('%H:%M') if center else 'NA'}"
-    st_user = _user_tide_state.setdefault(uid, {})
-    st_day  = st_user.setdefault(key_day, {})
-    st_key  = st_day.setdefault(key_win, {"trade_count": 0})
-    if int(st_key.get("trade_count", 0)) >= MAX_TRADES_PER_WINDOW:
-        msg = _one_line("SKIP", "reach_trade_limit_window", now, f"win={key_win}")
-        _last_decision_text[uid] = msg + "\n\n" + text_block
-        if not AUTO_DEBUG_ONLY_WHEN_SKIP:
-            await _debug_send(app, uid, msg)
-        return {"ok": False, "reason": msg, "text_block": text_block}
+    st_key  = {"trade_count": 0}  # giữ cấu trúc để không phá C; đếm thực sẽ do TideGate (sau B)
 
     # 6) Skip theo /report
     if skip_report:
@@ -717,8 +726,8 @@ async def _auto_gate_decision(uid: int, app, storage) -> Optional[dict]:
                 await _debug_send(app, uid, note)
             return {"ok": False, "reason": note, "text_block": text_block}
 
-    # Second-entry trong cùng window (nếu đã có >=1 lệnh)
-    if under_scope and same_win and int(st_key.get("trade_count", 0)) >= 1:
+    # Second-entry trong cùng window (nếu đã có >=1 lệnh) — CHỈ phục vụ logic phụ (TideGate sẽ đếm quota chính)
+    if under_scope and same_win and int(last.get("order_seq", 0)) >= 1:
         if not allow_second:
             msg = _one_line("SKIP", "second_entry_disabled", now, f"win={key_win}")
             _last_decision_text[uid] = msg + "\n\n" + text_block
@@ -1107,10 +1116,10 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
         "tide_window_key": tide_window_key,
     }
 
-    # Chỉ tăng trade_count khi opened_real
+    # (Đếm hiển thị cũ) — giữ state nhẹ để phục vụ cooldown/second-entry; quota thật do TideGate đếm
+    order_seq = 0
     if opened_real:
-        st_key["trade_count"] = int(st_key.get("trade_count", 0)) + 1
-    order_seq = int(st_key.get("trade_count", 0))
+        order_seq = int(_last_entry_meta.get(uid, {}).get("order_seq", 0)) + 1
 
     # === Đồng bộ storage để /status (today.count, tide_window_trades) ===
     if opened_real:
@@ -1139,9 +1148,10 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
         px_close = float(m5f.get("close") or 0.0) if isinstance(m5f, dict) else 0.0
         _last_entry_meta[uid] = {
             "at": now if opened_real else _last_entry_meta.get(uid, {}).get("at", None),
-            "window": key_win,  # ✅ chuỗi HH:MM cửa sổ thủy triều (đã sửa)
+            "window": key_win,  # chuỗi HH:MM cửa sổ thủy triều
             "price": px_close if opened_real else _last_entry_meta.get(uid, {}).get("price", 0.0),
             "side": desired_side if opened_real else _last_entry_meta.get(uid, {}).get("side", desired_side),
+            "order_seq": order_seq if opened_real else _last_entry_meta.get(uid, {}).get("order_seq", 0),
         }
     except Exception:
         pass
@@ -1161,7 +1171,6 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
         f"TP-by-time: {tp_eta.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"➡️ EXECUTE {'OK' if opened_real else 'FAIL'} | {'counted' if opened_real else 'not-counted'}\n"
         f"{chr(10).join(per_account_logs) if per_account_logs else ''}\n"
-        f"{'📣 Opened trade #' + str(order_seq) + '/' + str(MAX_TRADES_PER_WINDOW) if opened_real else ''}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
     final_text = header + (text_block or "(no_report_block)")
@@ -1182,9 +1191,10 @@ async def _auto_broadcast_and_log(uid: int, app, storage, result: dict):
 #================= Mode Auto or Manual trong bot.mode_cmd ===========================
 async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     """
-    - AUTO  : A -> B -> C ngay
+    - AUTO  : A -> T -> B -> (bump counters) -> C
     - MANUAL: A -> tạo/kiểm tra pending bằng approval_flow v2;
-               nếu APPROVED thì B -> C; nếu REJECTED thì bỏ; nếu PENDING thì chờ.
+               nếu APPROVED thì (T -> B -> bump counters -> C);
+               nếu REJECTED thì bỏ; nếu PENDING thì chờ.
     """
     # 0) Lấy mode hiện tại
     try:
@@ -1198,10 +1208,30 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
     if not gate or not gate.get("ok"):
         return None if not gate else gate.get("reason")
 
-    # AUTO: chạy thẳng A -> B -> C
+    # ====== TIDE GATE (T) — Áp dụng cho AUTO ngay sau A ======
     if mode == "auto":
-        result = await _auto_execute_hub(uid, app, storage, gate)          # (B)
-        final_text = await _auto_broadcast_and_log(uid, app, storage, result)  # (C)
+        cfg = await _load_tidegate_config(storage, uid)
+        tgr = await tide_gate_check(
+            now=now_vn().astimezone(timezone.utc),
+            storage=storage,
+            cfg=cfg,
+            scope_uid=(uid if cfg.counter_scope == "per_user" else None),
+        )
+        if not tgr.ok:
+            if AUTO_DEBUG:
+                await _debug_send(app, uid, f"[TideGate BLOCKED] {tgr.reason} {tgr.counters}")
+            return f"TIDE_BLOCKED:{tgr.reason}"
+
+        # B
+        result = await _auto_execute_hub(uid, app, storage, gate)
+        # bump counters sau khi B khớp OK
+        try:
+            if result and result.get("opened_real"):
+                await bump_counters_after_execute(storage, tgr, uid if cfg.counter_scope == "per_user" else None)
+        except Exception:
+            pass
+        # C
+        final_text = await _auto_broadcast_and_log(uid, app, storage, result)
         return final_text
 
     # ===== MANUAL FLOW (dùng approval_flow v2) =====
@@ -1221,7 +1251,6 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         risk_cfg = {"risk_percent": float(g["risk_percent"]), "leverage": int(g["leverage"])}
         accounts_cfg = {"enabled": True}
 
-        # boardcard_ctx/gates có thể dùng formatter hiện có để m5report hiển thị đẹp
         boardcard_ctx = {
             "confidence": g["confidence"],
             "frames": g["frames"],
@@ -1233,10 +1262,8 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
         }
 
         return {
-            # bắt buộc theo approval_flow v2
-            "symbol": g["pair_disp"],                         # ví dụ: "BTC/USDT"
-            "suggested_side": g["desired_side"],              # "LONG"/"SHORT"
-            # tuỳ chọn (để m5report show)
+            "symbol": g["pair_disp"],
+            "suggested_side": g["desired_side"],
             "signal_frames": g["frames"],
             "boardcard_ctx": boardcard_ctx,
             "qty_cfg": qty_cfg,
@@ -1266,9 +1293,28 @@ async def decide_once_for_uid(uid: int, app, storage) -> Optional[str]:
                 storage.set(user_pid_key, None)
                 return f"MANUAL rejected id={rec.pid}"
             if status == "APPROVED":
-                # ĐÃ DUYỆT → chạy B -> C với gate hiện tại (hoặc có thể merge thông tin từ rec nếu cần)
-                result = await _auto_execute_hub(uid, app, storage, gate)          # (B)
-                final_text = await _auto_broadcast_and_log(uid, app, storage, result)  # (C)
+                # ĐÃ DUYỆT → trước khi chạy B phải re-check TideGate (T)
+                cfg = await _load_tidegate_config(storage, uid)
+                tgr = await tide_gate_check(
+                    now=now_vn().astimezone(timezone.utc),
+                    storage=storage,
+                    cfg=cfg,
+                    scope_uid=(uid if cfg.counter_scope == "per_user" else None),
+                )
+                if not tgr.ok:
+                    # không execute, clear pending
+                    mark_done(storage, rec.pid, "EXPIRED_TIDE")
+                    storage.set(user_pid_key, None)
+                    return f"TIDE_BLOCKED:{tgr.reason}"
+                # B
+                result = await _auto_execute_hub(uid, app, storage, gate)
+                if result and result.get("opened_real"):
+                    try:
+                        await bump_counters_after_execute(storage, tgr, uid if cfg.counter_scope == "per_user" else None)
+                    except Exception:
+                        pass
+                # C
+                final_text = await _auto_broadcast_and_log(uid, app, storage, result)
                 mark_done(storage, rec.pid, "APPROVED")
                 storage.set(user_pid_key, None)
                 return final_text
@@ -1426,4 +1472,3 @@ async def start_auto_loop(app, storage):
 
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 # ----------------------- /core/auto_trade_engine.py -----------------------
-
