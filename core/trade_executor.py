@@ -369,17 +369,20 @@ class ExchangeClient:
                 await self._io(self.client.set_leverage, int(lev), sym)
         except Exception as e:
             logging.warning("set_leverage failed: %s", e)
-
     async def ticker_price(self, symbol: str) -> float:
         """
-        Lấy giá gần nhất cho futures/swap:
-        - Ưu tiên fetch_ticker (last/close)
-        - Fallback: close của nến 1m (ổn định hơn trên một số sàn)
+        Lấy giá gần nhất cho futures/swap (đã robust cho Binance USDM):
+        1) fetch_ticker (last/close)
+        2) fetch_ohlcv 1m (close)
+        3) [Binance USDM] fapiPublic_get_premiumindex (markPrice)
+        4) fetch_order_book (mid price)
+        Trả 0.0 nếu bất khả kháng.
         """
         try:
             await self._ensure_markets()
             sym = self.normalize_symbol(symbol)
 
+            # 1) fetch_ticker
             try:
                 t = await self._io(self.client.fetch_ticker, sym)
                 p = t.get("last") or t.get("close")
@@ -390,6 +393,7 @@ class ExchangeClient:
             except Exception:
                 pass
 
+            # 2) fetch_ohlcv 1m
             try:
                 ohlcv = await self._io(self.client.fetch_ohlcv, sym, timeframe="1m", limit=1)
                 if ohlcv and len(ohlcv) > 0:
@@ -399,9 +403,45 @@ class ExchangeClient:
             except Exception:
                 pass
 
+            # 3) Binance USDM: lấy markPrice (premium index)
+            if self.exchange_id == "binanceusdm":
+                try:
+                    # Lấy market id (BTC/USDT -> BTCUSDT) nếu có
+                    mkt = self.client.market(sym)
+                    sym_id = (mkt.get("id") or "").upper() if isinstance(mkt, dict) else ""
+                    if not sym_id:
+                        # rơi vào trường hợp map lỗi, cố đoán nhanh
+                        sym_id = symbol.upper().replace("/", "")
+                        if sym_id.endswith(":USDT"):
+                            sym_id = sym_id.replace(":USDT", "")
+                    # raw API ccxt (tuỳ phiên bản hàm có thể là camelCase)
+                    fn = getattr(self.client, "fapiPublic_get_premiumindex", None) or getattr(self.client, "fapiPublicGetPremiumIndex", None)
+                    if callable(fn):
+                        data = await self._io(fn, {"symbol": sym_id})
+                        # API trả list hoặc object tuỳ query; xử lý cả hai
+                        obj = data[0] if isinstance(data, list) and data else data
+                        mp = float((obj or {}).get("markPrice") or 0.0)
+                        if mp > 0:
+                            return mp
+                except Exception:
+                    pass
+
+            # 4) fetch_order_book: lấy mid price
+            try:
+                ob = await self._io(self.client.fetch_order_book, sym, limit=5)
+                bid = float(ob["bids"][0][0]) if ob.get("bids") else 0.0
+                ask = float(ob["asks"][0][0]) if ob.get("asks") else 0.0
+                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask)
+                if mid and mid > 0:
+                    return mid
+            except Exception:
+                pass
+
         except Exception:
             pass
         return 0.0
+
+
 
 
     async def balance_usdt(self) -> float:
