@@ -944,7 +944,7 @@ class ExchangeClient:
         """
         Đóng percent% vị thế hiện có (reduceOnly).
         100% → close toàn bộ. Tự co size nếu vướng hạn mức.
-        GHI CHÚ: Ở Hedge Mode, hàm này đóng theo vị thế “net/được ccxt trả về”.
+        GHI CHÚ: Ở Hedge Mode (Binance), cần gắn positionSide tương ứng LONG/SHORT khi close.
         """
         try:
             pct = max(0.0, min(100.0, float(percent)))
@@ -959,20 +959,66 @@ class ExchangeClient:
             if close_qty <= 0:
                 return OrderResult(True, "Không có khối lượng để đóng (sau khi fit step).")
 
-            side = "sell" if side_long else "buy"
+            # Xác định hướng & tham số
+            side = "sell" if side_long else "buy"  # đóng LONG -> sell, đóng SHORT -> buy
+
+            # Base params: reduceOnly cho lệnh close
+            params = {"reduceOnly": True}
+
+            # Nếu là Binance USDM và đang ở Hedge → gắn positionSide
+            mode = self._binance_position_mode or await self._detect_binance_position_mode()
+            if self.exchange_id == "binanceusdm" and mode == "hedge":
+                params["positionSide"] = "LONG" if side_long else "SHORT"
+
+            # Thử khớp lệnh
             try:
-                await self._io(self.client.create_order, sym, "market", side, close_qty, None, {"reduceOnly": True})
+                await self._io(self.client.create_order, sym, "market", side, close_qty, None, params)
             except Exception as e:
-                if self._should_shrink_on_error(e):
-                    close_qty = max(self._floor_step(close_qty * 0.7, lot_step), 0.0)
-                    if close_qty > 0:
-                        await self._io(self.client.create_order, sym, "market", side, close_qty, None, {"reduceOnly": True})
+                # Nếu mismatch position side (-4061) → thử flip theo cache
+                if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
+                    try:
+                        if "positionSide" in params:
+                            # Đang nghĩ Hedge nhưng thực tế có thể One-way → thử bỏ positionSide
+                            params2 = {"reduceOnly": True}
+                            await self._io(self.client.create_order, sym, "market", side, close_qty, None, params2)
+                        else:
+                            # Đang nghĩ One-way nhưng thực tế Hedge → thêm positionSide và retry
+                            params2 = {"reduceOnly": True, "positionSide": "LONG" if side_long else "SHORT"}
+                            await self._io(self.client.create_order, sym, "market", side, close_qty, None, params2)
+                    except Exception as e2:
+                        # Nếu lỗi do hạn mức → co size và thử lại 1-2 lần
+                        if self._should_shrink_on_error(e2):
+                            q = close_qty
+                            for _ in range(2):
+                                q = max(self._floor_step(q * 0.7, lot_step), 0.0)
+                                if q <= 0:
+                                    break
+                                try:
+                                    await self._io(self.client.create_order, sym, "market", side, q, None, params if "positionSide" in params else {"reduceOnly": True})
+                                    return OrderResult(True, f"Closed ~{pct:.0f}% position (partial).")
+                                except Exception:
+                                    continue
+                        return OrderResult(False, f"close_percent failed: {e2}")
+                elif self._should_shrink_on_error(e):
+                    # Lỗi hạn mức khác → co size và thử lại
+                    q = close_qty
+                    for _ in range(2):
+                        q = max(self._floor_step(q * 0.7, lot_step), 0.0)
+                        if q <= 0:
+                            break
+                        try:
+                            await self._io(self.client.create_order, sym, "market", side, q, None, params)
+                            return OrderResult(True, f"Closed ~{pct:.0f}% position (partial).")
+                        except Exception:
+                            continue
+                    return OrderResult(False, f"close_percent failed: {e}")
                 else:
-                    raise
+                    return OrderResult(False, f"close_percent failed: {e}")
 
             return OrderResult(True, f"Closed {pct:.0f}% position.")
         except Exception as e:
             return OrderResult(False, f"close_percent failed: {e}")
+
 
 # ===================== Multi-account / close helpers =====================
 def _load_all_accounts() -> List[dict]:
