@@ -655,7 +655,7 @@ class ExchangeClient:
                 else:
                     raise
 
-            # SL (reduceOnly)
+            # SL (reduceOnly/workingType/positionSide)
             if stop_loss is not None:
                 opp = "sell" if order_side == "buy" else "buy"
 
@@ -664,16 +664,18 @@ class ExchangeClient:
                 favor = "down" if s == "LONG" else "up"
                 sp = self._fit_stop_price(sym, raw_sp, favor=favor)
 
-                params = {"reduceOnly": True, "stopPrice": sp}
-
-                if self.exchange_id == "okx":
-                    params["slTriggerPx"] = sp
-
+                # Build params: Binance bỏ reduceOnly; các sàn khác giữ reduceOnly
                 if self.exchange_id == "binanceusdm":
+                    params = {"stopPrice": sp}
                     wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
                     if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
                         wt = "MARK_PRICE"
                     params["workingType"] = wt
+                else:
+                    params = {"reduceOnly": True, "stopPrice": sp}
+
+                if self.exchange_id == "okx":
+                    params["slTriggerPx"] = sp
 
                 mode_now = self._binance_position_mode or mode
                 if mode_now == "hedge" and self.exchange_id == "binanceusdm":
@@ -685,7 +687,7 @@ class ExchangeClient:
                     if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
                         try:
                             if "positionSide" in params:
-                                params2 = {"reduceOnly": True, "stopPrice": sp}
+                                params2 = {"stopPrice": sp}
                                 if self.exchange_id == "okx":
                                     params2["slTriggerPx"] = sp
                                 if "workingType" in params:
@@ -693,14 +695,15 @@ class ExchangeClient:
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                             else:
                                 params2 = {
-                                    "reduceOnly": True,
                                     "stopPrice": sp,
                                     "positionSide": "LONG" if s == "LONG" else "SHORT",
                                 }
                                 if self.exchange_id == "okx":
                                     params2["slTriggerPx"] = sp
-                                if "workingType" in params:
-                                    params2["workingType"] = params["workingType"]
+                                wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
+                                if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
+                                    wt = "MARK_PRICE"
+                                params2["workingType"] = wt
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                         except Exception as _:
                             logging.warning("Create SL order failed after retry: %s", e)
@@ -774,16 +777,18 @@ class ExchangeClient:
                     favor_sl = "down" if is_long else "up"
                     sp = self._fit_stop_price(sym, raw_sp, favor=favor_sl)
 
-                    params = {"reduceOnly": True, "stopPrice": sp}
-
-                    if self.exchange_id == "okx":
-                        params["slTriggerPx"] = sp
-
+                    # Build params: Binance bỏ reduceOnly; sàn khác giữ reduceOnly
                     if self.exchange_id == "binanceusdm":
+                        params = {"stopPrice": sp}
                         wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
                         if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
                             wt = "MARK_PRICE"
                         params["workingType"] = wt
+                    else:
+                        params = {"reduceOnly": True, "stopPrice": sp}
+
+                    if self.exchange_id == "okx":
+                        params["slTriggerPx"] = sp
 
                     mode_now = self._binance_position_mode or mode
                     if mode_now == "hedge" and self.exchange_id == "binanceusdm":
@@ -795,7 +800,7 @@ class ExchangeClient:
                     if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
                         try:
                             if "positionSide" in params:
-                                params2 = {"reduceOnly": True, "stopPrice": sp}
+                                params2 = {"stopPrice": sp}
                                 if self.exchange_id == "okx":
                                     params2["slTriggerPx"] = sp
                                 if "workingType" in params:
@@ -803,14 +808,15 @@ class ExchangeClient:
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                             else:
                                 params2 = {
-                                    "reduceOnly": True,
                                     "stopPrice": sp,
                                     "positionSide": "LONG" if is_long else "SHORT",
                                 }
                                 if self.exchange_id == "okx":
                                     params2["slTriggerPx"] = sp
-                                if "workingType" in params:
-                                    params2["workingType"] = params["workingType"]
+                                wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
+                                if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
+                                    wt = "MARK_PRICE"
+                                params2["workingType"] = wt
                                 await self._io(self.client.create_order, sym, "stop_market", opp, q_fit, None, params2)
                         except Exception as _:
                             logging.warning("Create SL order failed after retry: %s", e)
@@ -831,13 +837,15 @@ class ExchangeClient:
                     favor_tp = "up" if is_long else "down"
                     tp = self._fit_stop_price(sym, raw_tp, favor=favor_tp)
 
-                    params = {"reduceOnly": True, "stopPrice": tp}
-
+                    # Build params: Binance bỏ reduceOnly; sàn khác giữ reduceOnly
                     if self.exchange_id == "binanceusdm":
+                        params = {"stopPrice": tp}
                         wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
                         if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
                             wt = "MARK_PRICE"
                         params["workingType"] = wt
+                    else:
+                        params = {"reduceOnly": True, "stopPrice": tp}
 
                     mode_now = self._binance_position_mode or mode
                     if mode_now == "hedge" and self.exchange_id == "binanceusdm":
@@ -850,18 +858,19 @@ class ExchangeClient:
                     if self._is_pos_side_mismatch(e) and self.exchange_id == "binanceusdm":
                         try:
                             if "positionSide" in params:
-                                params2 = {"reduceOnly": True, "stopPrice": tp}
+                                params2 = {"stopPrice": tp}
                                 if "workingType" in params:
                                     params2["workingType"] = params["workingType"]
                                 await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params2)
                             else:
                                 params2 = {
-                                    "reduceOnly": True,
                                     "stopPrice": tp,
                                     "positionSide": "LONG" if is_long else "SHORT",
                                 }
-                                if "workingType" in params:
-                                    params2["workingType"] = params["workingType"]
+                                wt = (os.getenv("BINANCE_WORKING_TYPE") or "MARK_PRICE").strip().upper()
+                                if wt not in ("MARK_PRICE", "CONTRACT_PRICE", "LAST_PRICE"):
+                                    wt = "MARK_PRICE"
+                                params2["workingType"] = wt
                                 await self._io(self.client.create_order, sym, "take_profit_market", opp, q_fit, None, params2)
                         except Exception as _:
                             logging.warning("Create TP order failed after retry: %s", e)
